@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+mod app_contract;
 mod automations;
 mod bootstrap;
 mod comfyui;
@@ -179,6 +180,16 @@ enum Command {
     InternalStatus,
     #[command(name = "bridge-snapshot", hide = true)]
     InternalBridgeSnapshot {
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Emit the versioned app-facing snapshot consumed by ROCm App.
+    ///
+    /// Hidden: this is a machine contract between the CLI and the desktop app,
+    /// not a user-facing command. `rocm examine --json` remains the documented
+    /// diagnostic surface and is unchanged.
+    #[command(name = "app-snapshot", hide = true)]
+    InternalAppSnapshot {
         #[arg(long)]
         pretty: bool,
     },
@@ -1383,6 +1394,18 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::InternalBridgeSnapshot { pretty }) => {
             let paths = AppPaths::discover()?;
             let snapshot = build_codex_bridge_snapshot(&paths)?;
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!("{}", serde_json::to_string(&snapshot)?);
+            }
+            Ok(())
+        }
+        Some(Command::InternalAppSnapshot { pretty }) => {
+            let paths = AppPaths::discover()?;
+            let config = RocmCliConfig::load(&paths)?;
+            let snapshot =
+                app_contract::build_snapshot(app_contract::gather_inputs(&paths, &config)?);
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
@@ -16228,6 +16251,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "status",
         "completions",
         "bridge-snapshot",
+        "app-snapshot",
         "sandbox-run",
         "mcp-call",
         "__engine-serve-http",
@@ -16282,6 +16306,26 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `treat_as_natural_language`'s `STRUCTURED` list is a second, hand-kept
+    /// copy of the clap subcommand names. When they drift, the missing verb is
+    /// not rejected — it is silently swallowed by the natural-language planner
+    /// and answered with a "no action selected" plan, which reads like the
+    /// command ran and did nothing. Adding `app-snapshot` hit exactly that, so
+    /// the two lists are now pinned together.
+    #[test]
+    fn app_contract_structured_list_covers_every_subcommand() {
+        let unlisted: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .filter(|name| treat_as_natural_language(std::slice::from_ref(name)))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "these clap subcommands are routed to the natural-language planner \
+             instead of being dispatched; add them to STRUCTURED: {unlisted:?}"
+        );
     }
 
     #[test]
