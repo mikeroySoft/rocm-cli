@@ -49,6 +49,67 @@ pub(crate) struct CliRange {
     pub max: String,
 }
 
+/// The package format of a downloadable asset.
+///
+/// `os` and `arch` alone cannot separate a `.deb` from an `.rpm`: both are
+/// `linux`/`x86_64`, so a manifest that offers both has no way to say which
+/// one a given host can actually install. Handing a Debian machine an rpm is
+/// the failure this field exists to prevent.
+///
+/// Compatibility runs **one way only**. `#[serde(default)]` on the field lets
+/// a manifest written before `format` existed parse here, because
+/// `deny_unknown_fields` rejects *unknown* keys, not absent optional ones.
+/// The reverse does not hold: an older CLI reading a manifest that carries
+/// `format` rejects the whole manifest under `deny_unknown_fields`. That is
+/// acceptable only because nothing is released yet — once a build is in the
+/// wild, adding a field to a manifest struct is a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AssetFormat {
+    Deb,
+    Rpm,
+    Nsis,
+    /// A manifest written before `format` existed. Selectable only as a last
+    /// resort, so old manifests keep installing.
+    #[default]
+    Unspecified,
+}
+
+impl AssetFormat {
+    const ALL: [Self; 4] = [Self::Deb, Self::Rpm, Self::Nsis, Self::Unspecified];
+
+    /// The wire spelling, for error messages that have to name a format.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Deb => "deb",
+            Self::Rpm => "rpm",
+            Self::Nsis => "nsis",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
+/// Deserialized by hand rather than derived.
+///
+/// The derive rejects an out-of-vocabulary value with `unknown variant \`msi\``
+/// and never says *where* it was found. A manifest has several string fields
+/// with small vocabularies, so an error that does not name `format` sends the
+/// reader hunting through the file.
+impl<'de> Deserialize<'de> for AssetFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::ALL
+            .into_iter()
+            .find(|format| format.label() == raw)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown asset `format` {raw:?}; expected one of {}",
+                    join_formats(&Self::ALL)
+                ))
+            })
+    }
+}
+
 /// One downloadable installer for a specific target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -57,6 +118,10 @@ pub(crate) struct AppAsset {
     pub os: String,
     /// `x86_64`. Other architectures are out of scope for v1.
     pub arch: String,
+    /// How the asset installs. Absent in pre-`format` manifests, which
+    /// deserialize as [`AssetFormat::Unspecified`].
+    #[serde(default)]
+    pub format: AssetFormat,
     pub url: String,
     pub file_name: String,
     pub size_bytes: u64,
@@ -230,9 +295,27 @@ pub(crate) fn parse_manifest(raw: &str) -> Result<AppReleaseManifest> {
                 asset.os
             );
         }
+        if !matches!(asset.arch.as_str(), "x86_64") {
+            bail!(
+                "app release manifest contains an unsupported target arch: {}",
+                asset.arch
+            );
+        }
         if asset.sha256.len() != 64 || !asset.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!(
                 "app release manifest asset {} has a malformed sha256",
+                asset.file_name
+            );
+        }
+        // Lowercase is required here even though `verify_asset_bytes` compares
+        // case-insensitively. A manifest is emitted by a release tool, so mixed
+        // case means the file was hand-edited — worth refusing loudly on an
+        // install path. The comparison stays case-insensitive so a correct
+        // manifest is never rejected on a technicality.
+        if asset.sha256.chars().any(|c| c.is_ascii_uppercase()) {
+            bail!(
+                "app release manifest asset {} has an uppercase sha256; \
+                 digests must be lowercase hex",
                 asset.file_name
             );
         }
@@ -258,21 +341,96 @@ pub(crate) fn parse_manifest(raw: &str) -> Result<AppReleaseManifest> {
     Ok(manifest)
 }
 
+/// Package formats this host can actually install, in preference order.
+///
+/// Probed from what is present on the machine rather than compiled in: the
+/// same `linux`/`x86_64` binary runs on Debian and on Fedora, and a guess
+/// picks the wrong package half the time.
+pub(crate) fn host_package_formats(os: &str) -> &'static [AssetFormat] {
+    match os {
+        "windows" => &[AssetFormat::Nsis],
+        "linux" => linux_formats_from(
+            Path::new("/usr/bin/dpkg").exists() || Path::new("/etc/debian_version").exists(),
+            Path::new("/usr/bin/rpm").exists() || Path::new("/etc/redhat-release").exists(),
+        ),
+        _ => &[],
+    }
+}
+
+/// Linux formats in preference order, given the probe results.
+///
+/// Takes the two probes as parameters so the order is testable without a
+/// machine that happens to have (or lack) each tool.
+///
+/// deb wins when both are present: a host carrying `dpkg` *and* `rpm` is
+/// almost always a Debian derivative with `rpm` installed as a conversion
+/// tool, and installing the rpm there leaves the app invisible to `apt`.
+pub(crate) const fn linux_formats_from(has_dpkg: bool, has_rpm: bool) -> &'static [AssetFormat] {
+    match (has_dpkg, has_rpm) {
+        (true, true) => &[AssetFormat::Deb, AssetFormat::Rpm],
+        (true, false) => &[AssetFormat::Deb],
+        (false, true) => &[AssetFormat::Rpm],
+        (false, false) => &[],
+    }
+}
+
 /// Select the asset for a host, or explain why none matches.
 pub(crate) fn select_asset(manifest: &AppReleaseManifest, host: &TargetHost) -> Result<AppAsset> {
-    manifest
-        .assets
+    select_asset_for_formats(manifest, host, host_package_formats(&host.os))
+}
+
+/// The selection rule, with the host's installable formats supplied.
+///
+/// Split from [`select_asset`] so the preference order can be tested against
+/// every host shape instead of only the machine running the suite.
+pub(crate) fn select_asset_for_formats(
+    manifest: &AppReleaseManifest,
+    host: &TargetHost,
+    installable: &[AssetFormat],
+) -> Result<AppAsset> {
+    let matching = || {
+        manifest
+            .assets
+            .iter()
+            .filter(|asset| asset.os == host.os && asset.arch == host.arch)
+    };
+    if matching().next().is_none() {
+        bail!(
+            "no ROCm App asset published for {}-{} in release {}",
+            host.os,
+            host.arch,
+            manifest.app_version
+        );
+    }
+
+    // `Unspecified` is tried after every real format: a manifest written
+    // before `format` existed still installs, but a host that can name what it
+    // installs never gets the untyped asset in preference to a typed one.
+    for wanted in installable.iter().chain(&[AssetFormat::Unspecified]) {
+        if let Some(asset) = matching().find(|asset| asset.format == *wanted) {
+            return Ok(asset.clone());
+        }
+    }
+
+    // Naming both sets matters. "No asset" would be a lie for a machine that
+    // has an asset published and merely cannot install that package format.
+    bail!(
+        "no installable ROCm App asset for {}-{} in release {}: \
+         the release offers [{}], this host can install [{}]",
+        host.os,
+        host.arch,
+        manifest.app_version,
+        join_formats(&matching().map(|asset| asset.format).collect::<Vec<_>>()),
+        join_formats(installable)
+    )
+}
+
+fn join_formats(formats: &[AssetFormat]) -> String {
+    formats
         .iter()
-        .find(|asset| asset.os == host.os && asset.arch == host.arch)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no ROCm App asset published for {}-{} in release {}",
-                host.os,
-                host.arch,
-                manifest.app_version
-            )
-        })
+        .map(|format| format.label())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Build a reviewable plan. Performs no download and no mutation.

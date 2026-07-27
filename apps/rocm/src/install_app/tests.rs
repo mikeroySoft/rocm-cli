@@ -804,3 +804,205 @@ fn install_app_base64_round_trips() {
     }
     assert!(base64_decode("###").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Package format selection
+// ---------------------------------------------------------------------------
+
+/// A manifest offering three formats, two of which share `linux`/`x86_64`.
+///
+/// The rpm is listed **first** so a test that passes only because "the deb
+/// happens to come first" cannot pass here.
+fn multi_format_manifest_json(payload: &[u8]) -> String {
+    format!(
+        r#"{{
+  "schemaVersion": 1,
+  "appVersion": "0.1.0",
+  "compatibleCli": {{ "min": "0.1.0", "max": "0.2.0" }},
+  "publishedAtUnixMs": 1767225600000,
+  "releaseNotesUrl": "https://github.com/mikeroysoft/rocm-app/releases/tag/v0.1.0",
+  "assets": [
+    {{
+      "os": "linux",
+      "arch": "x86_64",
+      "format": "rpm",
+      "url": "https://example.invalid/rocm-app-0.1.0-1.x86_64.rpm",
+      "fileName": "rocm-app-0.1.0-1.x86_64.rpm",
+      "sizeBytes": {len},
+      "sha256": "{sha}",
+      "signatureB64": "AA=="
+    }},
+    {{
+      "os": "linux",
+      "arch": "x86_64",
+      "format": "deb",
+      "url": "https://example.invalid/rocm-app_0.1.0_amd64.deb",
+      "fileName": "rocm-app_0.1.0_amd64.deb",
+      "sizeBytes": {len},
+      "sha256": "{sha}",
+      "signatureB64": "AA=="
+    }},
+    {{
+      "os": "windows",
+      "arch": "x86_64",
+      "format": "nsis",
+      "url": "https://example.invalid/rocm-app_0.1.0_x64-setup.exe",
+      "fileName": "rocm-app_0.1.0_x64-setup.exe",
+      "sizeBytes": {len},
+      "sha256": "{sha}",
+      "signatureB64": "AA=="
+    }}
+  ]
+}}"#,
+        len = payload.len(),
+        sha = sha256_hex(payload),
+    )
+}
+
+fn multi_format_manifest() -> AppReleaseManifest {
+    parse_manifest(&multi_format_manifest_json(&asset_bytes()))
+        .expect("multi-format fixture manifest parses")
+}
+
+/// A manifest published before `format` existed must still install.
+#[test]
+fn install_app_manifest_without_a_format_field_still_selects() {
+    let (manifest, _, _) = signed_fixture();
+    assert!(
+        manifest
+            .assets
+            .iter()
+            .all(|asset| asset.format == AssetFormat::Unspecified),
+        "a missing format key must deserialize as Unspecified, not fail"
+    );
+    let asset = select_asset(&manifest, &linux_host()).expect("pre-format manifest still selects");
+    assert_eq!(asset.file_name, "rocm-app_0.1.0_amd64.deb");
+}
+
+#[test]
+fn install_app_selects_the_format_the_host_can_install() {
+    let manifest = multi_format_manifest();
+
+    let deb = select_asset_for_formats(&manifest, &linux_host(), &[AssetFormat::Deb])
+        .expect("a dpkg host has a deb");
+    assert_eq!(deb.format, AssetFormat::Deb);
+    assert_eq!(deb.file_name, "rocm-app_0.1.0_amd64.deb");
+
+    let rpm = select_asset_for_formats(&manifest, &linux_host(), &[AssetFormat::Rpm])
+        .expect("an rpm host has an rpm");
+    assert_eq!(rpm.format, AssetFormat::Rpm);
+    assert_eq!(rpm.file_name, "rocm-app-0.1.0-1.x86_64.rpm");
+
+    // Windows goes through the real entry point: its format list is fixed, so
+    // this is deterministic on whatever machine runs the suite.
+    let nsis = select_asset(&manifest, &windows_host()).expect("a windows host has an nsis");
+    assert_eq!(nsis.format, AssetFormat::Nsis);
+
+    // And once through the live detector on whatever this machine is: the
+    // format chosen must be one the machine was actually found able to
+    // install, which is the property the wiring exists for.
+    let detected = host_package_formats("linux");
+    if !detected.is_empty() {
+        let chosen = select_asset(&manifest, &linux_host()).expect("this host installs something");
+        assert!(
+            detected.contains(&chosen.format),
+            "selected {:?} but this host can install {detected:?}",
+            chosen.format
+        );
+    }
+}
+
+/// The preference order is pinned, not incidental.
+#[test]
+fn install_app_prefers_deb_when_a_host_has_both_dpkg_and_rpm() {
+    assert_eq!(
+        linux_formats_from(true, true),
+        [AssetFormat::Deb, AssetFormat::Rpm]
+    );
+    assert_eq!(linux_formats_from(true, false), [AssetFormat::Deb]);
+    assert_eq!(linux_formats_from(false, true), [AssetFormat::Rpm]);
+    assert!(linux_formats_from(false, false).is_empty());
+
+    let chosen = select_asset_for_formats(
+        &multi_format_manifest(),
+        &linux_host(),
+        linux_formats_from(true, true),
+    )
+    .expect("dual-tooling host");
+    assert_eq!(chosen.format, AssetFormat::Deb);
+}
+
+/// "No asset" would be a lie for a host that has one and merely cannot install
+/// that package format, so the error names both sets.
+#[test]
+fn install_app_reports_an_asset_it_cannot_install() {
+    let error = select_asset_for_formats(
+        &multi_format_manifest(),
+        &linux_host(),
+        linux_formats_from(false, false),
+    )
+    .expect_err("neither dpkg nor rpm is present");
+    let text = error.to_string();
+    assert!(text.contains("offers [rpm, deb]"), "{text}");
+    assert!(text.contains("this host can install []"), "{text}");
+}
+
+/// A manifest comes out of a release tool, so mixed case means someone edited
+/// it by hand.
+#[test]
+fn install_app_rejects_an_uppercase_sha256() {
+    let (_, payload, _) = signed_fixture();
+    let digest = sha256_hex(&payload);
+    let raw = manifest_json(&payload, "AA==").replace(&digest, &digest.to_ascii_uppercase());
+    let error = parse_manifest(&raw).expect_err("an uppercase digest must be refused");
+    assert!(error.to_string().contains("uppercase sha256"), "{error}");
+
+    // The comparison itself stays case-insensitive, so a correct manifest is
+    // never rejected on a technicality.
+    let mut asset = signed_fixture().0.assets.remove(0);
+    asset.sha256 = digest.to_ascii_uppercase();
+    let policy = AppTrustPolicy {
+        require_signature: false,
+        public_key_pem: None,
+    };
+    verify_asset_bytes(&asset, &payload, &policy).expect("digest compare ignores case");
+}
+
+#[test]
+fn install_app_rejects_an_unsupported_arch() {
+    let (_, payload, _) = signed_fixture();
+    let raw = manifest_json(&payload, "AA==").replacen(
+        "\"arch\": \"x86_64\"",
+        "\"arch\": \"aarch64\"",
+        1,
+    );
+    let error = parse_manifest(&raw).expect_err("arch is validated at parse time");
+    assert!(
+        error.to_string().contains("unsupported target arch"),
+        "{error}"
+    );
+}
+
+/// The format vocabulary is closed, so serde rejects anything outside it.
+#[test]
+fn install_app_rejects_an_unknown_format_value() {
+    let (_, payload, _) = signed_fixture();
+    let raw = manifest_json(&payload, "AA==").replacen(
+        "\"arch\": \"x86_64\",",
+        "\"arch\": \"x86_64\",\n      \"format\": \"msi\",",
+        1,
+    );
+    let error = parse_manifest(&raw).expect_err("msi is not a format this CLI installs");
+    let text = format!("{error:#}");
+    assert!(text.contains("`format`"), "{text}");
+    assert!(text.contains("msi"), "{text}");
+
+    // The hand-written reader and the derived writer must agree on the wire
+    // spelling, or a manifest this CLI emits is a manifest it cannot read.
+    for format in AssetFormat::ALL {
+        assert_eq!(
+            serde_json::to_string(&format).expect("serialize format"),
+            format!("\"{}\"", format.label())
+        );
+    }
+}

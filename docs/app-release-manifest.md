@@ -29,8 +29,29 @@ install path.
     {
       "os": "linux",
       "arch": "x86_64",
+      "format": "deb",
       "url": "https://example.invalid/rocm-app_0.1.0_amd64.deb",
       "fileName": "rocm-app_0.1.0_amd64.deb",
+      "sizeBytes": 26,
+      "sha256": "53f63fd1…",
+      "signatureB64": "…"
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "format": "rpm",
+      "url": "https://example.invalid/rocm-app-0.1.0-1.x86_64.rpm",
+      "fileName": "rocm-app-0.1.0-1.x86_64.rpm",
+      "sizeBytes": 26,
+      "sha256": "53f63fd1…",
+      "signatureB64": "…"
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "format": "nsis",
+      "url": "https://example.invalid/rocm-app_0.1.0_x64-setup.exe",
+      "fileName": "rocm-app_0.1.0_x64-setup.exe",
       "sizeBytes": 26,
       "sha256": "53f63fd1…",
       "signatureB64": "…"
@@ -45,11 +66,54 @@ install path.
 | `appVersion` | Non-empty. |
 | `compatibleCli` | Inclusive CLI version range this app build pairs with. |
 | `assets[].os` | `windows` or `linux`. Anything else is rejected at parse time. |
-| `assets[].arch` | `x86_64`. Other architectures are out of scope for v1. |
+| `assets[].arch` | `x86_64`. Anything else is rejected at parse time. |
+| `assets[].format` | `deb`, `rpm`, `nsis`, or `unspecified`. Optional; defaults to `unspecified`. Any other value is rejected at parse time. |
 | `assets[].fileName` | A plain file name. No `/`, `\`, or `..` — it is joined onto a temporary directory. |
 | `assets[].sizeBytes` | Non-zero, and must match the download exactly. |
-| `assets[].sha256` | 64 lowercase hex characters. |
+| `assets[].sha256` | Exactly 64 **lowercase** hex characters. Uppercase is rejected at parse time. |
 | `assets[].signatureB64` | Base64 RSASSA-PKCS#1 v1.5 SHA-256 over the asset bytes. |
+
+The digest is required lowercase because a manifest is emitted by a release
+tool; mixed case means the file was hand-edited, which is worth refusing on an
+install path. The comparison against the downloaded bytes stays
+case-insensitive, so a correct manifest is never rejected on a technicality.
+
+## Asset selection
+
+`os` and `arch` alone cannot separate a `.deb` from an `.rpm` — both are
+`linux`/`x86_64` — so `format` is what makes a release able to ship both.
+
+Selection filters the assets to those matching the host's `os` and `arch`, then
+takes the first whose `format` the host can actually install:
+
+| Host | Formats tried, in order |
+|---|---|
+| Windows | `nsis`, then `unspecified` |
+| Linux with `dpkg` (`/usr/bin/dpkg` or `/etc/debian_version`) | `deb`, then `unspecified` |
+| Linux with `rpm` (`/usr/bin/rpm` or `/etc/redhat-release`) | `rpm`, then `unspecified` |
+| Linux with both | `deb`, `rpm`, then `unspecified` |
+| Linux with neither | `unspecified` |
+
+deb wins on a host that has both tools: such a host is almost always a Debian
+derivative with `rpm` installed as a conversion utility, and installing the rpm
+there leaves the app invisible to `apt`.
+
+`unspecified` is always tried last, so a manifest written before `format`
+existed still installs, while a typed asset always beats an untyped one.
+
+When os+arch matches exist but none is installable, the failure names both the
+formats the release offers and the formats this host can install. Reporting a
+bare "no asset published" for a machine that *has* an asset it merely cannot
+install is the failure mode this avoids.
+
+### Compatibility runs one way
+
+`format` is optional, so a manifest written before the field existed parses
+here: `deny_unknown_fields` rejects *unknown* keys, not absent optional ones.
+The reverse is **not** true — an older CLI reading a manifest that carries
+`format` rejects the whole manifest. That is acceptable only because nothing is
+released yet; once a build is in the wild, adding a field to the manifest is a
+breaking change.
 
 ## Verification order
 
