@@ -1004,19 +1004,26 @@ mod tests {
         }
     }
 
+    /// A host that has been examined: system ROCm present, PyTorch present.
+    fn examined_host() -> rocm_core::Examination {
+        rocm_core::Examination {
+            rocm_version: "6.4.0".to_owned(),
+            framework: "pytorch".to_owned(),
+            framework_version: "2.9.0".to_owned(),
+            ..Default::default()
+        }
+    }
+
     fn healthy_inputs() -> SnapshotInputs {
         SnapshotInputs {
             observed_at_unix_ms: 1_767_225_600_000,
             platform: supported_platform(),
             gpu: known_gpu(),
             runtimes: vec![ready_runtime()],
-            components: vec![ComponentReport {
-                kind: ComponentKind::Cli,
-                name: "rocm".to_owned(),
-                state: ComponentState::Installed {
-                    version: "0.1.0".to_owned(),
-                },
-            }],
+            // Built by the real `component_reports`, not hand-typed: a golden
+            // whose inventory is one invented row lets a consumer's screen
+            // look fine while the actual producer emits five.
+            components: component_reports(&examined_host(), &[ready_runtime()]),
             driver: DriverReport {
                 installed: DriverVersionState::DetectedWithoutVersion {
                     detail: "amdgpu kernel module is loaded".to_owned(),
