@@ -729,29 +729,103 @@ pub(crate) fn gather_inputs(paths: &AppPaths, config: &RocmCliConfig) -> Result<
         ),
         components: component_reports(&examination, &runtimes),
         driver: driver_report(&examination),
-        // A live update check performs network I/O and belongs to the explicit
-        // update flow, not to every snapshot read. Reporting `Stale`/`NotApplicable`
-        // here is honest; claiming `NoUpdate` without checking would not be.
-        update: UpdateReport {
-            state: if runtimes.is_empty() {
-                UpdateState::NotApplicable
-            } else {
-                UpdateState::Stale {
-                    installed: runtimes
-                        .iter()
-                        .find(|r| r.active)
-                        .map_or_else(|| runtimes[0].version.clone(), |r| r.version.clone()),
-                    checked_at_unix_ms: 0,
-                }
-            },
-            checked_at_unix_ms: None,
-            trust: SourceTrust::Untrusted {
-                reason: "no update check performed for this snapshot".to_owned(),
-            },
-        },
+        update: update_report(paths, &runtimes),
         runtimes,
         probe_failures,
     })
+}
+
+/// The update section of a snapshot.
+///
+/// Reads the bounded startup check's **cached** answer; it never performs
+/// network I/O, because a snapshot is taken every time the app window opens
+/// and an offline machine must still get a full, honest report.
+///
+/// Before this consumed the cache, the snapshot reported `Stale` with a zero
+/// timestamp and `Untrusted { "no update check performed" }` on every machine,
+/// which meant no consumer could ever distinguish "up to date" from "a newer
+/// version is waiting" — the five states below were all declared and none were
+/// reachable.
+fn update_report(paths: &AppPaths, runtimes: &[RuntimeRecord]) -> UpdateReport {
+    let trust = if therock::metadata_signatures_are_verified() {
+        SourceTrust::Signed {
+            key_source: "configured metadata public key".to_owned(),
+        }
+    } else {
+        // Honest, and deliberately not `Signed`: no trust root is published
+        // yet, so the index was accepted without a signature check.
+        SourceTrust::UnsignedAllowed
+    };
+
+    if runtimes.is_empty() {
+        return UpdateReport {
+            state: UpdateState::NotApplicable,
+            checked_at_unix_ms: None,
+            trust,
+        };
+    }
+
+    let installed = runtimes
+        .iter()
+        .find(|r| r.active)
+        .map_or_else(|| runtimes[0].version.clone(), |r| r.version.clone());
+    let active_key = runtimes.iter().find(|r| r.active).map(|r| r.key.as_str());
+
+    let now = unix_time_millis();
+    let record = therock::cached_startup_update_check(paths).filter(|record| {
+        // An answer about a different runtime is not an answer about this one.
+        active_key.is_none_or(|key| record.runtime_key == key)
+    });
+    let Some(record) = record else {
+        return UpdateReport {
+            state: UpdateState::Stale {
+                installed,
+                checked_at_unix_ms: 0,
+            },
+            checked_at_unix_ms: None,
+            trust,
+        };
+    };
+
+    let checked_at = u64::try_from(record.checked_at_unix_ms).unwrap_or(u64::MAX);
+    if !therock::startup_update_check_is_current(record.checked_at_unix_ms, now) {
+        return UpdateReport {
+            state: UpdateState::Stale {
+                installed,
+                checked_at_unix_ms: checked_at,
+            },
+            checked_at_unix_ms: Some(checked_at),
+            trust,
+        };
+    }
+
+    let latest = record.latest_version.clone();
+    let state = match (record.status.as_str(), latest) {
+        ("up_to_date", _) => UpdateState::NoUpdate { installed },
+        ("update_available", Some(latest)) => UpdateState::Available { installed, latest },
+        ("ahead_of_index", Some(latest)) => UpdateState::AheadOfIndex { installed, latest },
+        // A resolver failure is reported as unreachable rather than as "no
+        // update": the one thing the check did not establish is that the
+        // installed version is current.
+        ("error", _) => UpdateState::Offline {
+            detail: record
+                .message
+                .clone()
+                .unwrap_or_else(|| "the update check did not complete".to_owned()),
+        },
+        // A status this build does not know, or a version-bearing status with
+        // no version, is not something to guess at.
+        _ => UpdateState::Stale {
+            installed,
+            checked_at_unix_ms: checked_at,
+        },
+    };
+
+    UpdateReport {
+        state,
+        checked_at_unix_ms: Some(checked_at),
+        trust,
+    }
 }
 
 fn platform_report(examination: &rocm_core::Examination) -> PlatformReport {
@@ -1004,6 +1078,22 @@ mod tests {
         }
     }
 
+    /// The version the machine would fall back to.
+    ///
+    /// A golden with exactly one runtime can never exercise activation,
+    /// removal, or the previous-marker rules — every consumer screen that
+    /// depends on a second installed version renders against nothing.
+    fn previous_runtime() -> RuntimeRecord {
+        RuntimeRecord {
+            key: "nightly-wheel-gfx120x-all-7-13-0".to_owned(),
+            version: "7.13.0".to_owned(),
+            active: false,
+            previous: true,
+            install_root: PathBuf::from("/tmp/rocm/runtime-7-13-0"),
+            ..ready_runtime()
+        }
+    }
+
     /// A host that has been examined: system ROCm present, PyTorch present.
     fn examined_host() -> rocm_core::Examination {
         rocm_core::Examination {
@@ -1019,7 +1109,7 @@ mod tests {
             observed_at_unix_ms: 1_767_225_600_000,
             platform: supported_platform(),
             gpu: known_gpu(),
-            runtimes: vec![ready_runtime()],
+            runtimes: vec![ready_runtime(), previous_runtime()],
             // Built by the real `component_reports`, not hand-typed: a golden
             // whose inventory is one invented row lets a consumer's screen
             // look fine while the actual producer emits five.
@@ -1223,7 +1313,11 @@ mod tests {
         adopted.install_source = InstallSource::Adopted {
             path: PathBuf::from("/opt/existing"),
         };
-        inputs.runtimes.push(adopted);
+        // Only the active runtime and the read-only one: `RemoveRuntime` is
+        // offered when *any* runtime is removable, so a third removable
+        // runtime in the list would satisfy the flag for reasons unrelated to
+        // the read-only rule this test is about.
+        inputs.runtimes = vec![ready_runtime(), adopted];
         let snapshot = build_snapshot(inputs);
 
         assert!(
@@ -1660,5 +1754,217 @@ mod tests {
             std::fs::write(dir.join(format!("{name}.json")), format!("{json}\n"))
                 .expect("write golden");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Update report policy
+    // -----------------------------------------------------------------------
+
+    /// An isolated state root, so a test never reads the developer's own
+    /// update cache and two tests never share one.
+    fn policy_paths(name: &str) -> (PathBuf, AppPaths) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("app-contract")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+        (
+            root.clone(),
+            AppPaths {
+                config_dir: root.join("config"),
+                data_dir: root.join("data"),
+                cache_dir: root.join("cache"),
+            },
+        )
+    }
+
+    /// Write a startup update-check record exactly as `therock` persists one.
+    fn write_check(
+        paths: &AppPaths,
+        runtime_key: &str,
+        status: &str,
+        latest: Option<&str>,
+        checked_at_unix_ms: u128,
+    ) {
+        let dir = paths.cache_dir.join("therock");
+        std::fs::create_dir_all(&dir).expect("cache dir");
+        let record = serde_json::json!({
+            "runtime_key": runtime_key,
+            "runtime_id": "therock-nightly:gfx120X-all",
+            "channel": "nightly",
+            "format": "wheel",
+            "family": "gfx120X-all",
+            "installed_version": "7.14.0",
+            "latest_version": latest,
+            "status": status,
+            "message": "resolver could not reach the index",
+            "checked_at_unix_ms": checked_at_unix_ms,
+        });
+        std::fs::write(
+            dir.join("startup-update-check.json"),
+            serde_json::to_vec_pretty(&record).expect("serialize"),
+        )
+        .expect("write record");
+    }
+
+    fn installed() -> Vec<RuntimeRecord> {
+        vec![ready_runtime()]
+    }
+
+    /// The five states the app must be able to tell apart, from one cache.
+    #[test]
+    fn update_report_policy_maps_every_cached_status_to_its_own_state() {
+        let now = unix_time_millis();
+        let key = ready_runtime().key;
+
+        let cases: [(&str, Option<&str>, UpdateState); 3] = [
+            (
+                "up_to_date",
+                None,
+                UpdateState::NoUpdate {
+                    installed: "7.14.0".to_owned(),
+                },
+            ),
+            (
+                "update_available",
+                Some("7.15.0"),
+                UpdateState::Available {
+                    installed: "7.14.0".to_owned(),
+                    latest: "7.15.0".to_owned(),
+                },
+            ),
+            (
+                "ahead_of_index",
+                Some("7.13.0"),
+                UpdateState::AheadOfIndex {
+                    installed: "7.14.0".to_owned(),
+                    latest: "7.13.0".to_owned(),
+                },
+            ),
+        ];
+
+        for (status, latest, expected) in cases {
+            let (root, paths) = policy_paths("update-policy-status");
+            write_check(&paths, &key, status, latest, now);
+            let report = update_report(&paths, &installed());
+            assert_eq!(report.state, expected, "status {status}");
+            assert!(report.checked_at_unix_ms.is_some());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// A resolver failure is "could not check", never "nothing to do".
+    #[test]
+    fn update_report_policy_treats_a_failed_check_as_offline() {
+        let (root, paths) = policy_paths("update-policy-error");
+        write_check(
+            &paths,
+            &ready_runtime().key,
+            "error",
+            None,
+            unix_time_millis(),
+        );
+
+        let report = update_report(&paths, &installed());
+        let UpdateState::Offline { detail } = report.state else {
+            panic!("expected offline, got {:?}", report.state);
+        };
+        assert!(!detail.trim().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An answer older than the bounded check interval is stale, whatever it
+    /// said at the time.
+    #[test]
+    fn update_report_policy_marks_an_expired_answer_stale() {
+        let (root, paths) = policy_paths("update-policy-expired");
+        let long_ago = unix_time_millis().saturating_sub(13 * 60 * 60 * 1_000);
+        write_check(
+            &paths,
+            &ready_runtime().key,
+            "update_available",
+            Some("7.15.0"),
+            long_ago,
+        );
+
+        let report = update_report(&paths, &installed());
+        assert!(
+            matches!(report.state, UpdateState::Stale { .. }),
+            "a twelve-hour-old answer must not still claim an update: {:?}",
+            report.state
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An answer about a different runtime says nothing about this one.
+    #[test]
+    fn update_report_policy_ignores_an_answer_about_another_runtime() {
+        let (root, paths) = policy_paths("update-policy-other-runtime");
+        write_check(
+            &paths,
+            "some-other-runtime-key",
+            "up_to_date",
+            None,
+            unix_time_millis(),
+        );
+
+        let report = update_report(&paths, &installed());
+        assert!(
+            matches!(report.state, UpdateState::Stale { .. }),
+            "{:?}",
+            report.state
+        );
+        assert_eq!(report.checked_at_unix_ms, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// With no cache at all, the snapshot says "not checked" and touches
+    /// nothing: it performs no network I/O and writes no file.
+    #[test]
+    fn update_report_policy_needs_no_network_and_writes_nothing() {
+        let (root, paths) = policy_paths("update-policy-cold");
+
+        let report = update_report(&paths, &installed());
+        assert!(matches!(report.state, UpdateState::Stale { .. }));
+        assert!(
+            !paths.cache_dir.join("therock").exists(),
+            "reading a snapshot created an update cache"
+        );
+
+        // And with nothing installed there is nothing to update.
+        assert_eq!(update_report(&paths, &[]).state, UpdateState::NotApplicable);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Trust must describe what actually happened.
+    ///
+    /// No metadata trust root is published yet, so the index is accepted
+    /// unsigned. Reporting `Signed` here would tell the app a signature was
+    /// verified when none was.
+    #[test]
+    fn update_report_policy_never_claims_signed_without_a_verified_signature() {
+        let (root, paths) = policy_paths("update-policy-trust");
+        write_check(
+            &paths,
+            &ready_runtime().key,
+            "up_to_date",
+            None,
+            unix_time_millis(),
+        );
+
+        let report = update_report(&paths, &installed());
+        assert_eq!(
+            report.trust,
+            SourceTrust::UnsignedAllowed,
+            "claimed a trust level nothing established"
+        );
+        assert!(!therock::metadata_signatures_are_verified());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

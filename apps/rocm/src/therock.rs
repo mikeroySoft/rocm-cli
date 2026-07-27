@@ -211,6 +211,37 @@ pub(crate) struct StartupUpdateCheckRecord {
     pub checked_at_unix_ms: u128,
 }
 
+/// The cached startup update answer, without touching the network.
+///
+/// The app snapshot is read on every window open and must stay offline-safe,
+/// so it consumes whatever the bounded 12-hour startup check already wrote
+/// rather than performing its own fetch. `None` means no check has run yet, or
+/// the cache could not be read — both of which the caller reports as "not
+/// checked", never as "up to date".
+pub(crate) fn cached_startup_update_check(paths: &AppPaths) -> Option<StartupUpdateCheckRecord> {
+    load_startup_update_check(paths).ok().flatten()
+}
+
+/// Whether a cached answer of this age is still current.
+#[must_use]
+pub(crate) const fn startup_update_check_is_current(
+    checked_at_unix_ms: u128,
+    now_unix_ms: u128,
+) -> bool {
+    !startup_update_check_due(checked_at_unix_ms, now_unix_ms)
+}
+
+/// Whether index metadata signatures are actually being verified.
+///
+/// False by default today: `PINNED_METADATA_PUBLIC_KEY_PEM` is still empty, so
+/// verification is opt-in through the environment. Reporting that honestly is
+/// the point — a snapshot claiming "signed" when nothing verified a signature
+/// is worse than one that says the index was accepted unsigned.
+pub(crate) fn metadata_signatures_are_verified() -> bool {
+    let policy = MetadataSignaturePolicy::from_env();
+    policy.required && (policy.public_key_path.is_some() || policy.public_key_pem.is_some())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeUpdatePlan {
     pub latest_version: String,

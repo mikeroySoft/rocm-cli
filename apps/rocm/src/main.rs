@@ -6057,6 +6057,13 @@ fn uninstall_runtime(
                 )
             })?;
         }
+    } else {
+        // The marker is only deleted when the runtime being removed is the
+        // *active* one. Removing the runtime the marker names as `previous`
+        // left the config field cleared above and the marker still pointing at
+        // a runtime that no longer exists — a rollback target that would fail
+        // the moment anyone used it.
+        clear_previous_runtime_marker(paths, &manifest.runtime_key)?;
     }
 
     Ok(RuntimeUninstallResult {
@@ -6096,10 +6103,45 @@ fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) 
         && paths_equivalent(&local.install_root, &manifest.install_root))
 }
 
+/// Drop a stale `previous` pointer from the active-runtime marker.
+///
+/// A no-op unless the marker names exactly this runtime as its previous, so
+/// an unreadable or absent marker is left alone rather than rewritten.
+fn clear_previous_runtime_marker(paths: &AppPaths, runtime_key: &str) -> Result<()> {
+    let marker_path = active_runtime_marker_path(paths);
+    if !marker_path.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(&marker_path)
+        .with_context(|| format!("failed to read {}", marker_path.display()))?;
+    let mut marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
+    if !marker
+        .previous_runtime_key
+        .as_deref()
+        .is_some_and(|key| key.eq_ignore_ascii_case(runtime_key))
+    {
+        return Ok(());
+    }
+    marker.previous_runtime_id = None;
+    marker.previous_runtime_key = None;
+    write_active_runtime_marker(paths, marker)
+}
+
 fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
         bail!(
             "refusing to remove unsafe runtime folder {}",
+            path.display()
+        );
+    }
+    // `rocm_core` already owns the list of locations nothing may recursively
+    // delete — `/`, `/usr`, `/opt`, `C:\Windows`, and the rest. It was written
+    // for exactly this check and was simply not wired to it, so a manifest
+    // pointing at a system directory reached `remove_dir_all` unchallenged.
+    if rocm_core::runtime_install_root_is_protected(path) {
+        bail!(
+            "refusing to remove protected system folder {}",
             path.display()
         );
     }
@@ -6984,11 +7026,21 @@ fn select_runtime_manifest<'a>(
         bail!("runtime selector must not be empty");
     }
 
-    if let Some(manifest) = manifests
+    // Exact keys are matched first, and duplicates are refused rather than
+    // resolved to whichever manifest happened to sort first. Two registry
+    // entries claiming one key means something already went wrong; picking one
+    // at random compounds it, and the caller may be about to delete it.
+    let exact = manifests
         .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-    {
-        return Ok(manifest);
+        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [manifest] => return Ok(manifest),
+        [] => {}
+        _ => bail!(
+            "runtime_key `{selector}` matches {} installed runtimes; the runtime registry has duplicate entries and must be repaired before this runtime can be changed",
+            exact.len()
+        ),
     }
 
     let matches = manifests
@@ -22259,6 +22311,154 @@ ID_LIKE="suse opensuse"
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// The config write is atomic: an interrupted save must leave the previous
+    /// selection readable, not a truncated file.
+    ///
+    /// Proven structurally rather than by killing a process mid-write: the
+    /// save writes a sibling temp file and renames it, so at no instant does
+    /// `config.json` exist in a partial state. The test asserts the invariant
+    /// the rename provides — the destination is either the old content or the
+    /// new one — and that no temp file is left behind.
+    #[test]
+    fn runtime_activation_config_write_is_atomic() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-atomic");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+
+        let saved = RocmCliConfig::load(&paths)?;
+        assert_eq!(
+            saved.active_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        let leftovers = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        // A second save replaces the file wholesale rather than appending or
+        // partially overwriting: the parse below fails on any leftover tail.
+        config.previous_runtime_key = Some("release-pip-gfx120x-all-7-12-0".to_owned());
+        config.save(&paths)?;
+        let reloaded = RocmCliConfig::load(&paths)?;
+        assert_eq!(
+            reloaded.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Removing the runtime the marker names as `previous` must not leave the
+    /// marker pointing at something that is gone.
+    ///
+    /// Uninstall cleared the config field but only deleted the marker when the
+    /// *active* runtime was removed, so the rollback target on disk outlived
+    /// the runtime it named.
+    #[test]
+    fn runtime_activation_previous_marker_is_repaired_when_that_runtime_is_removed() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-stale-previous");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-13-0")?;
+
+        let before: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(
+            before.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        uninstall_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+
+        assert_eq!(config.previous_runtime_key, None, "config field cleared");
+        let after: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(after.runtime_key, "release-pip-gfx120x-all-7-13-0");
+        assert_eq!(
+            after.previous_runtime_key, None,
+            "marker still names a runtime that no longer exists"
+        );
+        assert_eq!(after.previous_runtime_id, None);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Two registry entries claiming one key is a repair job, not a coin toss.
+    #[test]
+    fn runtime_activation_rejects_a_duplicated_exact_key() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-duplicate-key");
+        let first = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        // A second registry file with the same runtime_key: the loader accepts
+        // every parseable manifest and does not enforce uniqueness.
+        let duplicate = paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join("duplicate.json");
+        fs::write(&duplicate, serde_json::to_vec_pretty(&first)?)?;
+
+        let error = activate_runtime(&paths, &mut RocmCliConfig::default(), &first.runtime_key)
+            .expect_err("a duplicated key must be refused");
+        let text = error.to_string();
+        assert!(text.contains("duplicate"), "unhelpful refusal: {text}");
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A manifest pointing at a system directory must never reach
+    /// `remove_dir_all`.
+    #[test]
+    fn runtime_activation_uninstall_refuses_a_protected_install_root() {
+        for protected in ["/", "/usr", "/usr/lib", "/opt"] {
+            let Err(error) = ensure_runtime_install_root_is_safe_to_remove(Path::new(protected))
+            else {
+                panic!("{protected} was accepted for deletion");
+            };
+            assert!(
+                error.to_string().contains("protected") || error.to_string().contains("unsafe"),
+                "unhelpful refusal for {protected}: {error}"
+            );
+        }
     }
 
     #[test]
