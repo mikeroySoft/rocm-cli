@@ -81,7 +81,7 @@ pub(crate) struct ProducerIdentity {
 }
 
 impl ProducerIdentity {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             name: "rocm-cli".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 mod app_contract;
+mod app_logs;
 mod automations;
 mod bootstrap;
 mod comfyui;
@@ -193,6 +194,53 @@ enum Command {
     InternalAppSnapshot {
         #[arg(long)]
         pretty: bool,
+    },
+    /// Emit bounded, redacted log records for ROCm App.
+    ///
+    /// Hidden: a machine contract, like `app-snapshot`. `rocm logs` remains the
+    /// documented human surface and is unchanged. `--json` selects the compact
+    /// form the app parses; without it the same payload is printed pretty, for
+    /// a human checking why the app and the CLI disagree.
+    #[command(name = "app-logs", hide = true)]
+    InternalAppLogs {
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        #[arg(long)]
+        severity: Option<String>,
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        page: usize,
+        #[arg(long)]
+        page_size: Option<usize>,
+        #[arg(long)]
+        reveal_locations: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Emit the app-facing diagnosis, without the fix commands.
+    ///
+    /// Hidden: a machine contract. `rocm diagnose` is the documented surface and
+    /// keeps its `commands` field; this one omits it, because the app plans by
+    /// fix id and must never hold argv.
+    #[command(name = "app-diagnose", hide = true)]
+    InternalAppDiagnose {
+        #[arg(long)]
+        symptom: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a redacted support bundle and print its manifest.
+    #[command(name = "app-support-bundle", hide = true)]
+    InternalAppSupportBundle {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        symptom: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     #[command(name = "sandbox-run", hide = true)]
     InternalSandboxRun {
@@ -910,18 +958,41 @@ impl PermissionsModeArg {
     }
 }
 
+/// Read-only, machine-readable probes that ROCm App runs on a schedule.
+///
+/// They are exempt from file logging for two reasons that both matter. A first
+/// run must be able to report "nothing has run yet" without *creating* the data
+/// directory it is reporting on, and a monitor polling every minute must not
+/// fill the log a user opens with the act of opening it.
+const APP_PROBE_COMMANDS: [&str; 4] = [
+    "app-snapshot",
+    "app-logs",
+    "app-diagnose",
+    "app-support-bundle",
+];
+
+fn is_app_probe(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|first| APP_PROBE_COMMANDS.contains(&first.as_str()))
+}
+
 fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
     // Held for the whole process lifetime: dropping it flushes and stops the
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let _log_guard = AppPaths::discover()
-        .ok()
-        .and_then(|paths| logging::init(&paths));
+    let _log_guard = if is_app_probe(&raw_args) {
+        None
+    } else {
+        AppPaths::discover()
+            .ok()
+            .and_then(|paths| logging::init(&paths))
+    };
 
     maybe_migrate_legacy_dashboard_config();
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
     }
@@ -1433,6 +1504,61 @@ fn dispatch(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string(&snapshot)?);
             }
             Ok(())
+        }
+        Some(Command::InternalAppLogs {
+            sources,
+            severity,
+            since_unix_ms,
+            search,
+            page,
+            page_size,
+            reveal_locations,
+            json,
+        }) => {
+            let paths = AppPaths::discover()?;
+            let query = app_logs::LogsQuery {
+                sources: sources
+                    .iter()
+                    .map(|value| {
+                        app_logs::SourceId::parse(value)
+                            .with_context(|| format!("unknown log source: {value}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                min_severity: severity
+                    .as_deref()
+                    .map(|value| {
+                        app_logs::Severity::from_token(value)
+                            .with_context(|| format!("unknown severity: {value}"))
+                    })
+                    .transpose()?,
+                since_unix_ms,
+                search,
+                page,
+                page_size,
+                reveal_locations,
+            };
+            let redactor = rocm_core::Redactor::from_host();
+            let inputs = app_logs::gather_logs(&paths, &redactor);
+            app_logs::print_json(&app_logs::build_logs(inputs, &query), json)
+        }
+        Some(Command::InternalAppDiagnose { symptom, json }) => {
+            let redactor = rocm_core::Redactor::from_host();
+            let (_, diagnosis) =
+                app_logs::diagnose_host(symptom.as_deref().unwrap_or_default(), &redactor);
+            app_logs::print_json(&diagnosis, json)
+        }
+        Some(Command::InternalAppSupportBundle { out, symptom, json }) => {
+            let paths = AppPaths::discover()?;
+            let config = RocmCliConfig::load(&paths)?;
+            let redactor = rocm_core::Redactor::from_host();
+            let response = app_logs::write_support_bundle(
+                &paths,
+                &config,
+                &out,
+                symptom.as_deref().unwrap_or_default(),
+                &redactor,
+            )?;
+            app_logs::print_json(&response, json)
         }
         Some(Command::InternalSandboxRun {
             tool,
@@ -16423,6 +16549,9 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "completions",
         "bridge-snapshot",
         "app-snapshot",
+        "app-logs",
+        "app-diagnose",
+        "app-support-bundle",
         "sandbox-run",
         "mcp-call",
         "__engine-serve-http",
@@ -16497,6 +16626,50 @@ mod tests {
             "these clap subcommands are routed to the natural-language planner \
              instead of being dispatched; add them to STRUCTURED: {unlisted:?}"
         );
+    }
+
+    /// Found by running the built binary against an empty root, not by a unit
+    /// test: `main` initialised the rotating file log before dispatching, so
+    /// `app-logs` created the very data directory a first run is supposed to
+    /// report as absent, and then reported its own log file as an available
+    /// source. The producer's own tests passed throughout — they exercise the
+    /// builder, not the process.
+    #[test]
+    fn app_probe_commands_are_exempt_from_creating_a_logs_directory() {
+        for probe in APP_PROBE_COMMANDS {
+            assert!(
+                is_app_probe(&[probe.to_owned()]),
+                "{probe} would initialise file logging"
+            );
+            assert!(
+                is_app_probe(&[probe.to_owned(), "--json".to_owned()]),
+                "{probe} with flags"
+            );
+        }
+        // Everything else still logs. A monitor polling every minute is the
+        // exception; a user running a command is exactly what the log is for.
+        for ordinary in ["examine", "diagnose", "install", "runtimes", "logs", "fix"] {
+            assert!(!is_app_probe(&[ordinary.to_owned()]), "{ordinary}");
+        }
+        assert!(!is_app_probe(&[]));
+        // A probe name appearing later in argv is an argument, not the command.
+        assert!(!is_app_probe(&["chat".to_owned(), "app-logs".to_owned()]));
+    }
+
+    /// Every probe exempted from logging must still be a real subcommand, or
+    /// the exemption silently covers nothing.
+    #[test]
+    fn app_probe_commands_are_all_real_subcommands() {
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .collect();
+        for probe in APP_PROBE_COMMANDS {
+            assert!(
+                names.iter().any(|n| n == probe),
+                "{probe} is not a subcommand"
+            );
+        }
     }
 
     #[test]

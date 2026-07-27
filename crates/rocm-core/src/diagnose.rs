@@ -70,11 +70,69 @@ pub struct DiagnoseReport {
     pub out_of_scope: Option<String>,
 }
 
+/// What the catalog concluded, as one closed value.
+///
+/// The three outcomes were previously only derivable by combining
+/// `out_of_scope.is_some()`, `has_match()`, and a score comparison — three
+/// reads a consumer had to get right and in the right order. A consumer that
+/// checked `matched.is_empty()` first would report "nothing wrong" on a WSL
+/// host, which is the one answer that is never true there. Naming the outcome
+/// makes the mistake unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum MatchState {
+    /// This host is not what the catalog is about, so it was not run.
+    OutOfScope { reason: String },
+    /// At least one entry cleared [`MIN_SCORE_FOR_MATCH`].
+    Matched {
+        /// The highest-scoring diagnosis' id, so a caller need not re-sort.
+        top: String,
+        score: i32,
+        /// At/above [`HIGH_CONFIDENCE`]: a fix may be proposed straight away.
+        high_confidence: bool,
+        /// How many entries cleared the threshold.
+        count: usize,
+    },
+    /// The catalog ran and recognised nothing. Route upstream.
+    NoMatch,
+}
+
 impl DiagnoseReport {
     /// Whether at least one diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
     #[must_use]
     pub fn has_match(&self) -> bool {
         self.matched.iter().any(|d| d.score >= MIN_SCORE_FOR_MATCH)
+    }
+
+    /// The report's outcome, as one value.
+    ///
+    /// Out of scope wins over everything: when the catalog was skipped, a
+    /// low-scoring leftover is not evidence of anything.
+    #[must_use]
+    pub fn match_state(&self) -> MatchState {
+        if let Some(reason) = &self.out_of_scope {
+            return MatchState::OutOfScope {
+                reason: reason.clone(),
+            };
+        }
+        let cleared: Vec<&Diagnosis> = self
+            .matched
+            .iter()
+            .filter(|d| d.score >= self.min_score_for_match)
+            .collect();
+        match cleared.first() {
+            None => MatchState::NoMatch,
+            Some(top) => MatchState::Matched {
+                top: top.id.clone(),
+                score: top.score,
+                high_confidence: top.score >= self.high_confidence_threshold,
+                count: cleared.len(),
+            },
+        }
     }
 }
 
@@ -1657,5 +1715,89 @@ mod tests {
         }
         assert_eq!(v["min_score_for_match"], 50);
         assert_eq!(v["high_confidence_threshold"], 75);
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured outcome
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diagnose_match_state_names_the_top_result_and_its_confidence() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        // 45 alone is below the match threshold; the symptom lifts it over.
+        let report = diagnose(&e, "unable to open /dev/kfd permission denied");
+        match report.match_state() {
+            MatchState::Matched {
+                top,
+                score,
+                high_confidence,
+                count,
+            } => {
+                assert_eq!(top, "fix-4-render-group");
+                assert_eq!(score, report.matched[0].score);
+                assert_eq!(high_confidence, score >= report.high_confidence_threshold);
+                assert!(count >= 1);
+            }
+            other => panic!("expected a match, got {other:?}"),
+        }
+    }
+
+    /// A diagnosis that scored but did not clear the threshold is not a match.
+    /// The old three-read derivation made this easy to get wrong, because
+    /// `matched` is non-empty in exactly this case.
+    #[test]
+    fn diagnose_match_state_is_no_match_below_the_threshold() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "");
+        assert!(!report.matched.is_empty(), "something scored");
+        assert!(report.matched[0].score < report.min_score_for_match);
+        assert_eq!(report.match_state(), MatchState::NoMatch);
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn diagnose_match_state_is_no_match_when_nothing_scored() {
+        let report = diagnose(&linux_base(), "");
+        assert_eq!(report.match_state(), MatchState::NoMatch);
+    }
+
+    /// Out of scope wins. A consumer that read `matched.is_empty()` first would
+    /// tell a WSL user nothing is wrong, which is the one answer never true
+    /// there.
+    #[test]
+    fn diagnose_match_state_out_of_scope_wins_over_everything() {
+        let mut e = linux_base();
+        e.is_wsl = true;
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "unable to open /dev/kfd permission denied");
+        match report.match_state() {
+            MatchState::OutOfScope { reason } => {
+                assert!(reason.contains("WSL2"), "{reason}");
+                assert!(reason.contains("http"), "the reason must route somewhere");
+            }
+            other => panic!("expected out of scope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnose_match_state_serializes_as_a_tagged_state() {
+        let no_match =
+            serde_json::to_value(diagnose(&linux_base(), "").match_state()).expect("serialize");
+        assert_eq!(no_match["state"], "no-match");
+
+        let mut wsl = linux_base();
+        wsl.is_wsl = true;
+        let out = serde_json::to_value(diagnose(&wsl, "").match_state()).expect("serialize");
+        assert_eq!(out["state"], "out-of-scope");
+        assert!(out["reason"].is_string());
+
+        // Round-trips, because the app decodes this.
+        let decoded: MatchState = serde_json::from_value(out).expect("round trip");
+        assert!(matches!(decoded, MatchState::OutOfScope { .. }));
     }
 }

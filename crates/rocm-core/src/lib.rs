@@ -31,10 +31,11 @@ pub mod examine;
 pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod redact;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, MatchState, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
@@ -43,6 +44,7 @@ pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
 };
+pub use redact::{Redactor, env_is_exportable, key_is_sensitive};
 use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
