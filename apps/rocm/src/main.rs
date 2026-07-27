@@ -9,6 +9,7 @@ mod comfyui;
 mod dash;
 mod dash_seam;
 mod endpoint_keys;
+mod install_app;
 mod logging;
 mod provider_keys;
 mod providers;
@@ -546,6 +547,26 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Check and repair driver setup where supported.
         #[arg(long)]
         reconcile: bool,
+    },
+    /// Install ROCm App, the desktop tray application.
+    ///
+    /// This is the only command that installs ROCm App. Installing the CLI on
+    /// its own never installs it.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm install app --dry-run\n  \
+rocm install app --yes\n\n\
+Installing ROCm App also installs a matching rocm command-line tool.\n\
+No driver is installed, updated, or modified.")]
+    App {
+        /// Show the exact plan without downloading or installing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking. Required when stdin is not a terminal.
+        #[arg(long)]
+        yes: bool,
+        /// Read the release manifest from a local file instead of the network.
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<std::path::PathBuf>,
     },
 }
 
@@ -2204,7 +2225,105 @@ fn install(target: InstallTarget) -> Result<()> {
                 }
             }
         }
+        InstallTarget::App {
+            dry_run,
+            yes,
+            manifest,
+        } => {
+            install_app_command(&paths, dry_run, yes, manifest.as_deref())?;
+        }
     }
+    Ok(())
+}
+
+/// `rocm install app`.
+///
+/// Dry-run and apply render the **same** plan text, so what a user reviews is
+/// exactly what they approve. Apply additionally requires confirmation:
+/// interactively a typed `yes`, non-interactively the explicit `--yes` flag —
+/// the same convention every other mutating command in this CLI uses.
+fn install_app_command(
+    paths: &AppPaths,
+    dry_run: bool,
+    yes: bool,
+    manifest_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let host = install_app::TargetHost::detect();
+    // Before any network access: an unsupported host should not announce
+    // itself to a download server just to be refused.
+    host.ensure_supported()?;
+
+    let policy = install_app::AppTrustPolicy::from_env();
+    let raw = match manifest_path {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("could not read app release manifest {}", path.display()))?,
+        None => bail!(
+            "no app release manifest source is configured.\n\
+             Pass --manifest <path> with a signed release manifest, or set \
+             ROCM_CLI_APP_MANIFEST_URL once release hosting is published."
+        ),
+    };
+
+    let manifest = install_app::parse_manifest(&raw)?;
+    let plan = install_app::build_plan(
+        &manifest,
+        &host,
+        &policy,
+        install_app::default_install_root(paths),
+    )?;
+
+    print!("{}", plan.render());
+    if dry_run {
+        println!("  result: dry run, nothing was downloaded or installed");
+        return Ok(());
+    }
+
+    if !yes {
+        if !rocm_core::interactive_terminal() {
+            bail!("`rocm install app` needs approval. Re-run with --yes to apply without asking.");
+        }
+        print!("Install ROCm App with the plan above? [y/N]: ");
+        io::stdout()
+            .flush()
+            .context("failed to flush install prompt")?;
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .context("failed to read install confirmation")?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("  result: cancelled, nothing was downloaded or installed");
+            return Ok(());
+        }
+    }
+
+    let launcher = install_app::ProcessLauncher { os: host.os };
+    let fetch = |url: &str| -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        ureq::get(url)
+            .call()
+            .with_context(|| format!("could not download {url}"))?
+            .into_reader()
+            .read_to_end(&mut buffer)?;
+        Ok(buffer)
+    };
+
+    let executed = install_app::apply(&install_app::ApplyInputs {
+        plan: &plan,
+        policy: &policy,
+        fetch: &fetch,
+        launcher: &launcher,
+        scratch_parent: &paths.cache_dir,
+    })?;
+
+    println!("  result: installed from {}", executed.display());
+    record_cli_audit_event(
+        paths,
+        "app",
+        "install_app",
+        "info",
+        format!("ROCm App {} installed", plan.app_version),
+        None,
+    );
     Ok(())
 }
 
