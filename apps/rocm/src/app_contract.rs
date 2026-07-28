@@ -879,13 +879,66 @@ fn gpu_identity(
             .name
             .clone()
             .or_else(|| probed.map(|g| g.name.clone()))
-            .filter(|n| !n.is_empty()),
+            .filter(|n| !n.is_empty())
+            .and_then(|n| tidy_gpu_name(&n)),
         therock_family: host.therock_family.clone().or_else(|| {
             gfx_target
                 .as_deref()
                 .and_then(rocm_core::normalize_therock_family)
         }),
         gfx_target,
+    }
+}
+
+/// Normalize an lspci-style device string into a product name for display.
+///
+/// This contract feeds a desktop app's primary UI, where the GPU name is
+/// shown verbatim. On Linux the merged name usually comes from lspci, which
+/// is an inventory label, not a product name:
+/// `Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)`.
+/// This trims the vendor boilerplate and revision, prefers the bracketed
+/// marketing name over the die codename, and prefixes `AMD` so the result
+/// reads as a product: `AMD Radeon AI PRO R9700`. Tidying lives here — not in
+/// the renderer, and not in rocm-core — because `rocm examine` deliberately
+/// keeps the raw string as a diagnostic fact.
+///
+/// Returns `None` when the input tidies to nothing; idempotent on
+/// already-clean names (the Windows inventory path supplies those).
+fn tidy_gpu_name(raw: &str) -> Option<String> {
+    let mut s = raw.trim();
+
+    // Trailing parenthesised revision: "(rev c0)", "(rev 01)".
+    if s.ends_with(')')
+        && let Some(open) = s.rfind('(')
+        && s[open..].starts_with("(rev")
+    {
+        s = s[..open].trim_end();
+    }
+
+    // Leading vendor boilerplate, with or without the "[AMD/ATI]" tag.
+    for prefix in ["Advanced Micro Devices, Inc.", "[AMD/ATI]"] {
+        s = s.strip_prefix(prefix).unwrap_or(s).trim_start();
+    }
+
+    // A trailing bracket holds the marketing name; the text before it is the
+    // die codename ("Navi 48 [Radeon AI PRO R9700]"). Prefer the former.
+    if s.ends_with(']')
+        && let Some(open) = s.rfind('[')
+    {
+        s = s[open + 1..s.len() - 1].trim();
+    }
+
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("amd"))
+    {
+        Some(collapsed)
+    } else {
+        Some(format!("AMD {collapsed}"))
     }
 }
 
@@ -1506,6 +1559,55 @@ mod tests {
         let unknown = gpu_identity(&blank, &examination);
         assert!(unknown.gfx_target.is_none());
         assert!(unknown.therock_family.is_none());
+    }
+
+    /// lspci strings are inventory labels; the contract must hand the desktop
+    /// app a product name.
+    #[test]
+    fn app_contract_tidy_gpu_name_normalizes_lspci_strings() {
+        let cases = [
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)",
+                "AMD Radeon AI PRO R9700",
+            ),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700]",
+                "AMD Radeon AI PRO R9700",
+            ),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Device 7550",
+                "AMD Device 7550",
+            ),
+            ("AMD Radeon AI PRO R9700", "AMD Radeon AI PRO R9700"),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Raphael (rev cb)",
+                "AMD Raphael",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(tidy_gpu_name(raw).as_deref(), Some(want), "input: {raw}");
+        }
+        assert_eq!(tidy_gpu_name("   "), None);
+
+        // Idempotence: the Windows inventory path supplies already-clean
+        // names, which must pass through byte-identical.
+        let once = tidy_gpu_name("AMD Radeon AI PRO R9700").unwrap();
+        assert_eq!(tidy_gpu_name(&once).as_deref(), Some(once.as_str()));
+    }
+
+    /// The tidy is applied at the merge point, so both name sources (KFD/lspci
+    /// host summary and the Examination probe) get it.
+    #[test]
+    fn app_contract_gpu_identity_tidies_lspci_name() {
+        let host = rocm_core::HostGpuSummary {
+            name: Some(
+                "Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        let identity = gpu_identity(&host, &rocm_core::Examination::default());
+        assert_eq!(identity.name.as_deref(), Some("AMD Radeon AI PRO R9700"));
     }
 
     #[test]
