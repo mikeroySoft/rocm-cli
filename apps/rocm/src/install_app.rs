@@ -14,10 +14,11 @@
 //!
 //! # Verification order
 //!
-//! Platform → manifest schema → target match → download → size → digest →
-//! signature → execute. Every check that can be made without touching the
-//! network happens first, so an unsupported host or a malformed manifest costs
-//! nothing and leaks nothing. Nothing is executed until all of them pass.
+//! Platform → manifest schema → freshness → CLI compatibility → target match
+//! → download → size → digest → signature → execute. Every check that can be
+//! made without touching the network happens first, so an unsupported host or
+//! a malformed manifest costs nothing and leaks nothing. Nothing is executed
+//! until all of them pass.
 
 use std::path::{Path, PathBuf};
 
@@ -224,6 +225,10 @@ pub(crate) struct AppInstallPlan {
     pub release_notes_url: String,
     pub signature_required: bool,
     pub install_root: PathBuf,
+    /// Non-fatal findings the user explicitly overrode (a stale manifest
+    /// allowed by `--allow-stale-manifest`). Carried on the plan so the
+    /// override is visible in the very text the user approves.
+    pub warnings: Vec<String>,
 }
 
 impl AppInstallPlan {
@@ -235,7 +240,7 @@ impl AppInstallPlan {
         } else {
             "optional (policy allows unsigned)"
         };
-        format!(
+        let mut rendered = format!(
             "rocm install app\n\
              \x20 app_version: {version}\n\
              \x20 compatible_cli: {cli_min} to {cli_max}\n\
@@ -266,7 +271,12 @@ impl AppInstallPlan {
             sha = self.asset.sha256,
             notes = self.release_notes_url,
             root = self.install_root.display(),
-        )
+        );
+        for warning in &self.warnings {
+            use std::fmt::Write as _;
+            let _ = writeln!(rendered, "  warning: {warning}");
+        }
+        rendered
     }
 }
 
@@ -299,6 +309,17 @@ pub(crate) fn parse_manifest(raw: &str) -> Result<AppReleaseManifest> {
             bail!(
                 "app release manifest contains an unsupported target arch: {}",
                 asset.arch
+            );
+        }
+        // https only. The digest and signature checks are the last line of
+        // defence, not the only one: a plain-http fetch lets an on-path peer
+        // both observe what is being installed and serve endless garbage that
+        // costs bandwidth before verification can refuse it.
+        if !asset.url.starts_with("https://") {
+            bail!(
+                "app release manifest asset {} must be served over https, got: {}",
+                asset.file_name,
+                asset.url
             );
         }
         if asset.sha256.len() != 64 || !asset.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -433,14 +454,138 @@ fn join_formats(formats: &[AssetFormat]) -> String {
         .join(", ")
 }
 
+/// Oldest manifest accepted without `--allow-stale-manifest`.
+///
+/// A release manifest is a pointer to "the current build". One that has not
+/// been re-published for 90 days is more likely a frozen or replayed mirror
+/// serving an outdated — possibly known-vulnerable — release than the real
+/// current one.
+pub(crate) const MANIFEST_MAX_AGE_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// How far in the future a manifest's publication date may lie.
+///
+/// Generous enough for real clock skew across time zones, small enough that
+/// a manifest forged with a far-future date (to outlive the staleness check
+/// forever) is refused.
+pub(crate) const MANIFEST_MAX_FUTURE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Milliseconds since the Unix epoch. Saturates instead of panicking on a
+/// pre-1970 clock; freshness enforcement then refuses the manifest as
+/// future-dated, which is the right verdict for a broken clock.
+pub(crate) fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Enforce the manifest's publication window against the wall clock.
+///
+/// Returns the warning to attach to the plan when a stale manifest is
+/// explicitly allowed. A future-dated manifest has no override: it is either
+/// a broken local clock the user must fix anyway, or a date forged to defeat
+/// the staleness check for good.
+pub(crate) fn enforce_manifest_freshness(
+    published_at_unix_ms: u64,
+    now_unix_ms: u64,
+    allow_stale: bool,
+) -> Result<Option<String>> {
+    if published_at_unix_ms > now_unix_ms.saturating_add(MANIFEST_MAX_FUTURE_MS) {
+        let hours = (published_at_unix_ms - now_unix_ms) / (60 * 60 * 1000);
+        bail!(
+            "app release manifest claims a publication date {hours} hours in the future; \
+             that means a broken clock on this machine or a forged manifest. \
+             Fix the clock, or fetch a corrected manifest."
+        );
+    }
+    let age_ms = now_unix_ms.saturating_sub(published_at_unix_ms);
+    if age_ms <= MANIFEST_MAX_AGE_MS {
+        return Ok(None);
+    }
+    let age_days = age_ms / (24 * 60 * 60 * 1000);
+    if allow_stale {
+        return Ok(Some(format!(
+            "manifest is {age_days} days old (limit 90); proceeding because \
+             --allow-stale-manifest is set"
+        )));
+    }
+    bail!(
+        "app release manifest was published {age_days} days ago; manifests older than 90 days \
+         are refused because a stale manifest usually means a frozen or replayed mirror serving \
+         an outdated build.\n\
+         Re-run with --allow-stale-manifest to install it anyway."
+    );
+}
+
+/// Refuse to install when the running CLI falls outside the manifest's
+/// inclusive `compatibleCli` range.
+///
+/// Fails closed: a range this code cannot compare is refused, because
+/// guessing compatibility on an install path is how a mismatched app/CLI
+/// pair ships.
+pub(crate) fn enforce_cli_compatibility(range: &CliRange, cli_version: &str) -> Result<()> {
+    let min = crate::therock::parse_version(&range.min).with_context(|| {
+        format!(
+            "app release manifest compatibleCli.min `{}` is not a version this CLI can parse; \
+             refusing to guess compatibility",
+            range.min
+        )
+    })?;
+    let max = crate::therock::parse_version(&range.max).with_context(|| {
+        format!(
+            "app release manifest compatibleCli.max `{}` is not a version this CLI can parse; \
+             refusing to guess compatibility",
+            range.max
+        )
+    })?;
+    let cli = crate::therock::parse_version(cli_version).with_context(|| {
+        format!(
+            "this CLI reports version `{cli_version}`, which cannot be compared to the \
+             manifest's compatibleCli range"
+        )
+    })?;
+    if cli < min {
+        bail!(
+            "this CLI is version {cli_version}, older than the {} this ROCm App release \
+             requires (compatible range: {} to {}). Update the rocm CLI first, then re-run \
+             `rocm install app`.",
+            range.min,
+            range.min,
+            range.max
+        );
+    }
+    if cli > max {
+        bail!(
+            "this CLI is version {cli_version}, newer than the {} this ROCm App release \
+             supports (compatible range: {} to {}). Fetch a newer app release manifest \
+             instead.",
+            range.max,
+            range.min,
+            range.max
+        );
+    }
+    Ok(())
+}
+
 /// Build a reviewable plan. Performs no download and no mutation.
 pub(crate) fn build_plan(
     manifest: &AppReleaseManifest,
     host: &TargetHost,
     policy: &AppTrustPolicy,
     install_root: PathBuf,
+    allow_stale_manifest: bool,
 ) -> Result<AppInstallPlan> {
     host.ensure_supported()?;
+    // Freshness and CLI compatibility run before asset selection: both are
+    // manifest-level verdicts, and "your manifest is stale" is more useful
+    // than "no asset matches" from the same stale file.
+    let stale_warning = enforce_manifest_freshness(
+        manifest.published_at_unix_ms,
+        now_unix_ms(),
+        allow_stale_manifest,
+    )?;
+    enforce_cli_compatibility(&manifest.compatible_cli, env!("CARGO_PKG_VERSION"))?;
     let asset = select_asset(manifest, host)?;
     Ok(AppInstallPlan {
         app_version: manifest.app_version.clone(),
@@ -449,7 +594,27 @@ pub(crate) fn build_plan(
         release_notes_url: manifest.release_notes_url.clone(),
         signature_required: policy.require_signature,
         install_root,
+        warnings: stale_warning.into_iter().collect(),
     })
+}
+
+/// Read a download stream, capped at one byte past the declared size.
+///
+/// The manifest states the asset's exact size, so anything beyond it is
+/// already a verification failure. Reading one extra byte turns an endless
+/// or oversized response body into the size mismatch `verify_asset_bytes`
+/// reports, instead of an unbounded `read_to_end` exhausting memory before
+/// any verification runs.
+pub(crate) fn read_capped(
+    reader: impl std::io::Read,
+    declared_size_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buffer = Vec::new();
+    reader
+        .take(declared_size_bytes.saturating_add(1))
+        .read_to_end(&mut buffer)?;
+    Ok(buffer)
 }
 
 /// Verify downloaded bytes against the manifest and the trust policy.

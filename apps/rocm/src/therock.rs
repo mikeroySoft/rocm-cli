@@ -452,7 +452,7 @@ struct TarballIndexFile {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct ParsedVersion {
+pub(crate) struct ParsedVersion {
     major: u32,
     minor: u32,
     patch: u32,
@@ -2980,7 +2980,7 @@ fn compare_version_strings(left: &str, right: &str) -> Ordering {
     }
 }
 
-fn parse_version(value: &str) -> Option<ParsedVersion> {
+pub(crate) fn parse_version(value: &str) -> Option<ParsedVersion> {
     let value = value.split('+').next().unwrap_or(value);
     let mut parts = value.splitn(3, '.');
     let major = parts.next()?.parse().ok()?;

@@ -615,6 +615,10 @@ No driver is installed, updated, or modified.")]
         /// Read the release manifest from a local file instead of the network.
         #[arg(long, value_name = "PATH")]
         manifest: Option<std::path::PathBuf>,
+        /// Accept a release manifest older than 90 days. The staleness
+        /// refusal becomes a warning shown with the install plan.
+        #[arg(long)]
+        allow_stale_manifest: bool,
     },
 }
 
@@ -2355,8 +2359,15 @@ fn install(target: InstallTarget) -> Result<()> {
             dry_run,
             yes,
             manifest,
+            allow_stale_manifest,
         } => {
-            install_app_command(&paths, dry_run, yes, manifest.as_deref())?;
+            install_app_command(
+                &paths,
+                dry_run,
+                yes,
+                manifest.as_deref(),
+                allow_stale_manifest,
+            )?;
         }
     }
     Ok(())
@@ -2373,6 +2384,7 @@ fn install_app_command(
     dry_run: bool,
     yes: bool,
     manifest_path: Option<&std::path::Path>,
+    allow_stale_manifest: bool,
 ) -> Result<()> {
     let host = install_app::TargetHost::detect();
     // Before any network access: an unsupported host should not announce
@@ -2396,6 +2408,7 @@ fn install_app_command(
         &host,
         &policy,
         install_app::default_install_root(paths),
+        allow_stale_manifest,
     )?;
 
     print!("{}", plan.render());
@@ -2423,14 +2436,18 @@ fn install_app_command(
     }
 
     let launcher = install_app::ProcessLauncher { os: host.os };
+    let declared_size_bytes = plan.asset.size_bytes;
     let fetch = |url: &str| -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
-        ureq::get(url)
+        let response = ureq::get(url)
             .call()
-            .with_context(|| format!("could not download {url}"))?
-            .into_reader()
-            .read_to_end(&mut buffer)?;
-        Ok(buffer)
+            .with_context(|| format!("could not download {url}"))?;
+        // Capped at the manifest's declared size plus one byte: an endless
+        // response body must become a size mismatch reported by
+        // verify_asset_bytes, not memory exhaustion before verification.
+        Ok(install_app::read_capped(
+            response.into_reader(),
+            declared_size_bytes,
+        )?)
     };
 
     let executed = install_app::apply(&install_app::ApplyInputs {

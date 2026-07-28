@@ -295,11 +295,7 @@ impl Redactor {
             .or_else(|_| std::env::var("LOGNAME"))
             .or_else(|_| std::env::var("USERNAME"))
             .ok();
-        let host = std::env::var("HOSTNAME")
-            .ok()
-            .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
-            .map(|h| h.trim().to_owned())
-            .filter(|h| !h.is_empty());
+        let host = hostname_from(|name| std::env::var(name).ok());
         let roots: Vec<&str> = home.as_deref().into_iter().collect();
         Self::with(&roots, user.as_deref(), host.as_deref())
     }
@@ -389,6 +385,21 @@ impl Redactor {
         self.json(&mut json);
         Ok(json)
     }
+}
+
+/// Resolve this machine's name from an environment lookup, falling back to
+/// the Linux kernel file.
+///
+/// `COMPUTERNAME` is in the chain because native Windows sets neither
+/// `HOSTNAME` nor `/proc/sys/kernel/hostname`; without it every Windows
+/// support bundle leaked the machine name. The lookup is a parameter so the
+/// Windows path is testable without mutating process-global environment.
+fn hostname_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env("HOSTNAME")
+        .or_else(|| env("COMPUTERNAME"))
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
 }
 
 /// Replace `needle` only where it is a whole token.
@@ -718,6 +729,30 @@ mod tests {
     fn redact_rewrites_the_longest_home_root_first() {
         let redactor = Redactor::with(&["/home/alice", "/home/alice/work"], None, None);
         assert_eq!(redactor.text("/home/alice/work/x"), "~/x");
+    }
+
+    /// Native Windows sets `COMPUTERNAME`, not `HOSTNAME` and not
+    /// `/proc/sys/kernel/hostname` — before the fallback existed, every
+    /// Windows support bundle leaked the machine name.
+    #[test]
+    fn redact_resolves_a_windows_computername_and_rewrites_it() {
+        let host =
+            hostname_from(|name| (name == "COMPUTERNAME").then(|| "WIN-SUPPORT7".to_owned()));
+        assert_eq!(host.as_deref(), Some("WIN-SUPPORT7"));
+
+        let redactor = Redactor::with(&[], None, host.as_deref());
+        assert_eq!(
+            redactor.text("bundle exported from WIN-SUPPORT7 by operator"),
+            "bundle exported from [host] by operator"
+        );
+
+        // HOSTNAME still wins where both are set (a POSIX shell on Windows).
+        let both = hostname_from(|name| match name {
+            "HOSTNAME" => Some("penguin".to_owned()),
+            "COMPUTERNAME" => Some("WIN-SUPPORT7".to_owned()),
+            _ => None,
+        });
+        assert_eq!(both.as_deref(), Some("penguin"));
     }
 
     // -----------------------------------------------------------------------

@@ -69,7 +69,7 @@ fn manifest_json(payload: &[u8], signature_b64: &str) -> String {
   "schemaVersion": 1,
   "appVersion": "0.1.0",
   "compatibleCli": {{ "min": "0.1.0", "max": "0.2.0" }},
-  "publishedAtUnixMs": 1767225600000,
+  "publishedAtUnixMs": {published},
   "releaseNotesUrl": "https://github.com/mikeroysoft/rocm-app/releases/tag/v0.1.0",
   "assets": [
     {{
@@ -94,6 +94,7 @@ fn manifest_json(payload: &[u8], signature_b64: &str) -> String {
 }}"#,
         len = payload.len(),
         sha = sha256_hex(payload),
+        published = now_unix_ms(),
     )
 }
 
@@ -152,6 +153,7 @@ fn install_app_dry_run_reports_the_exact_plan_for_linux() {
         &linux_host(),
         &policy,
         PathBuf::from("/home/user/.rocm/app"),
+        false,
     )
     .expect("plan");
     let rendered = plan.render();
@@ -183,6 +185,7 @@ fn install_app_dry_run_reports_the_exact_plan_for_windows() {
         &windows_host(),
         &policy,
         PathBuf::from("C:/Users/user/AppData/Roaming/rocm/app"),
+        false,
     )
     .expect("plan");
     let rendered = plan.render();
@@ -219,7 +222,7 @@ fn install_app_dry_run_performs_no_download() {
         return;
     }
 
-    crate::install_app_command(&paths, true, false, Some(&manifest_path))
+    crate::install_app_command(&paths, true, false, Some(&manifest_path), false)
         .expect("dry run succeeds without network");
 
     let leftovers: Vec<_> = std::fs::read_dir(&paths.cache_dir)
@@ -287,7 +290,7 @@ fn install_app_plan_fails_for_an_unsupported_host_before_asset_selection() {
         arch: "x86_64".to_owned(),
         is_wsl: true,
     };
-    assert!(build_plan(&manifest, &wsl, &policy, PathBuf::from("/tmp/app")).is_err());
+    assert!(build_plan(&manifest, &wsl, &policy, PathBuf::from("/tmp/app"), false).is_err());
 }
 
 #[test]
@@ -351,6 +354,182 @@ fn install_app_rejects_malformed_asset_metadata() {
             "manifest with {reason} was accepted"
         );
     }
+}
+
+#[test]
+fn install_app_rejects_a_plain_http_asset_url_at_parse_time() {
+    let (_, payload, _) = signed_fixture();
+    let raw = manifest_json(&payload, "AA==").replacen(
+        "https://example.invalid/rocm-app_0.1.0_amd64.deb",
+        "http://example.invalid/rocm-app_0.1.0_amd64.deb",
+        1,
+    );
+    let error = parse_manifest(&raw).expect_err("http url must be refused before any network");
+    assert!(error.to_string().contains("https"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Manifest freshness and CLI compatibility — enforced before approval
+// ---------------------------------------------------------------------------
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[test]
+fn install_app_refuses_a_manifest_older_than_90_days() {
+    let (mut manifest, _, policy) = signed_fixture();
+    manifest.published_at_unix_ms = now_unix_ms() - 91 * DAY_MS;
+    let error = build_plan(
+        &manifest,
+        &linux_host(),
+        &policy,
+        PathBuf::from("/tmp/app"),
+        false,
+    )
+    .expect_err("stale manifest must be refused");
+    let text = format!("{error:#}");
+    assert!(text.contains("90 days"), "{text}");
+    assert!(text.contains("--allow-stale-manifest"), "{text}");
+}
+
+/// The override proceeds, but the plan the user approves says why it needed
+/// overriding.
+#[test]
+fn install_app_allows_a_stale_manifest_with_the_override_and_warns() {
+    let (mut manifest, _, policy) = signed_fixture();
+    manifest.published_at_unix_ms = now_unix_ms() - 91 * DAY_MS;
+    let plan = build_plan(
+        &manifest,
+        &linux_host(),
+        &policy,
+        PathBuf::from("/tmp/app"),
+        true,
+    )
+    .expect("--allow-stale-manifest proceeds");
+    let rendered = plan.render();
+    assert!(rendered.contains("warning:"), "{rendered}");
+    assert!(rendered.contains("days old"), "{rendered}");
+}
+
+/// A future date is a broken clock or a forgery meant to outlive the
+/// staleness check; even the stale override does not bypass it.
+#[test]
+fn install_app_refuses_a_future_dated_manifest_with_no_override() {
+    let (mut manifest, _, policy) = signed_fixture();
+    manifest.published_at_unix_ms = now_unix_ms() + 25 * 60 * 60 * 1000;
+    let error = build_plan(
+        &manifest,
+        &linux_host(),
+        &policy,
+        PathBuf::from("/tmp/app"),
+        true,
+    )
+    .expect_err("future-dated manifest must be refused");
+    assert!(format!("{error:#}").contains("future"), "{error:#}");
+}
+
+/// The window boundaries are pinned: exactly 90 days old and exactly 24 hours
+/// ahead both pass; one millisecond beyond either does not.
+#[test]
+fn install_app_freshness_window_boundaries_are_exact() {
+    let now = 1_000 * DAY_MS;
+    assert!(
+        enforce_manifest_freshness(now - 90 * DAY_MS, now, false)
+            .expect("at the age limit")
+            .is_none()
+    );
+    assert!(enforce_manifest_freshness(now - 90 * DAY_MS - 1, now, false).is_err());
+    assert!(enforce_manifest_freshness(now + DAY_MS, now, false).is_ok());
+    assert!(enforce_manifest_freshness(now + DAY_MS + 1, now, false).is_err());
+}
+
+#[test]
+fn install_app_refuses_a_cli_outside_the_compatible_range() {
+    let (mut manifest, _, policy) = signed_fixture();
+    manifest.compatible_cli = CliRange {
+        min: "99.0.0".to_owned(),
+        max: "99.9.9".to_owned(),
+    };
+    let error = build_plan(
+        &manifest,
+        &linux_host(),
+        &policy,
+        PathBuf::from("/tmp/app"),
+        false,
+    )
+    .expect_err("incompatible CLI must be refused");
+    assert!(
+        format!("{error:#}").contains("Update the rocm CLI first"),
+        "{error:#}"
+    );
+}
+
+/// Inclusive at both ends, and each direction gets the right advice: an old
+/// CLI is told to update, a too-new CLI is told to fetch a newer manifest.
+#[test]
+fn install_app_compatible_cli_range_is_inclusive_and_directional() {
+    let range = |min: &str, max: &str| CliRange {
+        min: min.to_owned(),
+        max: max.to_owned(),
+    };
+    assert!(enforce_cli_compatibility(&range("1.0.0", "2.0.0"), "1.0.0").is_ok());
+    assert!(enforce_cli_compatibility(&range("1.0.0", "2.0.0"), "2.0.0").is_ok());
+    let old = enforce_cli_compatibility(&range("1.0.1", "2.0.0"), "1.0.0")
+        .expect_err("below min refused");
+    assert!(
+        old.to_string().contains("Update the rocm CLI first"),
+        "{old}"
+    );
+    let new = enforce_cli_compatibility(&range("1.0.0", "2.0.0"), "2.0.1")
+        .expect_err("above max refused");
+    assert!(new.to_string().contains("newer"), "{new}");
+    // The running CLI must accept the fixture range every other test uses.
+    assert!(enforce_cli_compatibility(&range("0.1.0", "0.2.0"), env!("CARGO_PKG_VERSION")).is_ok());
+}
+
+/// Fail closed: a range this CLI cannot compare is refused, never guessed.
+#[test]
+fn install_app_refuses_an_unparseable_compatible_cli_range() {
+    let (mut manifest, _, policy) = signed_fixture();
+    manifest.compatible_cli = CliRange {
+        min: "banana".to_owned(),
+        max: "0.2.0".to_owned(),
+    };
+    let error = build_plan(
+        &manifest,
+        &linux_host(),
+        &policy,
+        PathBuf::from("/tmp/app"),
+        false,
+    )
+    .expect_err("unparseable range must fail closed");
+    assert!(
+        format!("{error:#}").contains("refusing to guess"),
+        "{error:#}"
+    );
+}
+
+/// An endless (or merely oversized) response body must not be read to
+/// exhaustion. The cap hands `verify_asset_bytes` one byte too many and the
+/// existing size check refuses it; `main.rs` wires this into its fetch
+/// closure, which is network glue and untestable here.
+#[test]
+fn install_app_caps_the_download_at_the_declared_size() {
+    let (manifest, payload, policy) = signed_fixture();
+    let asset = manifest.assets[0].clone();
+
+    // std::io::repeat never ends; without the cap this read never returns.
+    let capped = read_capped(std::io::repeat(0x41), asset.size_bytes).expect("capped read");
+    assert_eq!(
+        capped.len(),
+        usize::try_from(asset.size_bytes).expect("fits") + 1
+    );
+    let error = verify_asset_bytes(&asset, &capped, &policy).expect_err("size mismatch");
+    assert!(error.to_string().contains("manifest declares"), "{error}");
+
+    // A well-behaved body of exactly the declared size passes through intact.
+    let exact = read_capped(payload.as_slice(), asset.size_bytes).expect("exact read");
+    assert_eq!(exact, payload);
+    verify_asset_bytes(&asset, &exact, &policy).expect("verified");
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +645,8 @@ fn install_app_trust_policy_requires_signatures_by_default() {
 fn install_app_apply_verifies_before_executing_and_cleans_up() {
     let (manifest, payload, policy) = signed_fixture();
     let root = scratch_root("apply-ok");
-    let plan = build_plan(&manifest, &linux_host(), &policy, root.join("app")).expect("plan");
+    let plan =
+        build_plan(&manifest, &linux_host(), &policy, root.join("app"), false).expect("plan");
     let launcher = RecordingLauncher::default();
     let fetch = |_: &str| Ok(payload.clone());
 
@@ -501,7 +681,8 @@ fn install_app_apply_verifies_before_executing_and_cleans_up() {
 fn install_app_apply_never_executes_an_unverified_asset() {
     let (manifest, payload, policy) = signed_fixture();
     let root = scratch_root("apply-tampered");
-    let plan = build_plan(&manifest, &linux_host(), &policy, root.join("app")).expect("plan");
+    let plan =
+        build_plan(&manifest, &linux_host(), &policy, root.join("app"), false).expect("plan");
     let launcher = RecordingLauncher::default();
 
     // Same length so the size check passes and the digest is what rejects it.
@@ -531,7 +712,8 @@ fn install_app_apply_never_executes_an_unverified_asset() {
 fn install_app_apply_cleans_up_after_a_download_failure() {
     let (manifest, _, policy) = signed_fixture();
     let root = scratch_root("apply-download-fail");
-    let plan = build_plan(&manifest, &linux_host(), &policy, root.join("app")).expect("plan");
+    let plan =
+        build_plan(&manifest, &linux_host(), &policy, root.join("app"), false).expect("plan");
     let launcher = RecordingLauncher::default();
     let fetch = |_: &str| -> Result<Vec<u8>> { bail!("network unreachable") };
 
@@ -819,7 +1001,7 @@ fn multi_format_manifest_json(payload: &[u8]) -> String {
   "schemaVersion": 1,
   "appVersion": "0.1.0",
   "compatibleCli": {{ "min": "0.1.0", "max": "0.2.0" }},
-  "publishedAtUnixMs": 1767225600000,
+  "publishedAtUnixMs": {published},
   "releaseNotesUrl": "https://github.com/mikeroysoft/rocm-app/releases/tag/v0.1.0",
   "assets": [
     {{
@@ -856,6 +1038,7 @@ fn multi_format_manifest_json(payload: &[u8]) -> String {
 }}"#,
         len = payload.len(),
         sha = sha256_hex(payload),
+        published = now_unix_ms(),
     )
 }
 

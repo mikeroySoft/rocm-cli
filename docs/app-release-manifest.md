@@ -64,12 +64,14 @@ install path.
 |---|---|
 | `schemaVersion` | Must equal 1. A newer manifest is refused, not best-effort parsed. |
 | `appVersion` | Non-empty. |
-| `compatibleCli` | Inclusive CLI version range this app build pairs with. |
+| `compatibleCli` | Inclusive CLI version range this app build pairs with. **Enforced**: a CLI below `min` is told to update the CLI first; one above `max` is told to fetch a newer manifest. A range the CLI cannot parse is refused — compatibility is never guessed. |
+| `publishedAtUnixMs` | Must be at most 90 days old; `--allow-stale-manifest` downgrades that refusal to a warning shown with the install plan. A date more than 24 hours in the future is refused with no override: it is either a broken local clock or a date forged to outlive the staleness check. |
 | `assets[].os` | `windows` or `linux`. Anything else is rejected at parse time. |
 | `assets[].arch` | `x86_64`. Anything else is rejected at parse time. |
 | `assets[].format` | `deb`, `rpm`, `nsis`, or `unspecified`. Optional; defaults to `unspecified`. Any other value is rejected at parse time. |
+| `assets[].url` | Must start with `https://`. Plain http is rejected at parse time, before any network access. |
 | `assets[].fileName` | A plain file name. No `/`, `\`, or `..` — it is joined onto a temporary directory. |
-| `assets[].sizeBytes` | Non-zero, and must match the download exactly. |
+| `assets[].sizeBytes` | Non-zero, and must match the download exactly. The download reads at most one byte past this size, so an endless response body becomes a size mismatch instead of exhausting memory. |
 | `assets[].sha256` | Exactly 64 **lowercase** hex characters. Uppercase is rejected at parse time. |
 | `assets[].signatureB64` | Base64 RSASSA-PKCS#1 v1.5 SHA-256 over the asset bytes. |
 
@@ -117,8 +119,8 @@ breaking change.
 
 ## Verification order
 
-Platform → manifest schema → target match → download → size → digest →
-signature → execute.
+Platform → manifest schema → freshness → CLI compatibility → target match →
+download → size → digest → signature → execute.
 
 Every check that needs no network runs first, so an unsupported host or a
 malformed manifest costs nothing and reveals nothing to a download server.
