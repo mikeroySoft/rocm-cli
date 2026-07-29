@@ -31,6 +31,7 @@ const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
+const STARTUP_UPDATE_CHECK_RETRY_INTERVAL_MS: u128 = 5 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
@@ -214,10 +215,11 @@ pub(crate) struct StartupUpdateCheckRecord {
 /// The cached startup update answer, without touching the network.
 ///
 /// The app snapshot is read on every window open and must stay offline-safe,
-/// so it consumes whatever the bounded 12-hour startup check already wrote
-/// rather than performing its own fetch. `None` means no check has run yet, or
-/// the cache could not be read — both of which the caller reports as "not
-/// checked", never as "up to date".
+/// so it consumes whatever the bounded startup check already wrote rather than
+/// performing its own fetch. Successful answers last 12 hours; failed checks
+/// retry after five minutes. `None` means no check has run yet, or the cache
+/// could not be read — both of which the caller reports as "not checked",
+/// never as "up to date".
 pub(crate) fn cached_startup_update_check(paths: &AppPaths) -> Option<StartupUpdateCheckRecord> {
     load_startup_update_check(paths).ok().flatten()
 }
@@ -677,7 +679,7 @@ fn maybe_refresh_startup_update_check_at(
 
     if let Some(previous) = load_startup_update_check(paths)?
         && previous.runtime_key == manifest.runtime_key
-        && !startup_update_check_due(previous.checked_at_unix_ms, now_unix_ms)
+        && !startup_update_check_refresh_due(&previous, now_unix_ms)
     {
         return Ok(Some(previous));
     }
@@ -698,6 +700,13 @@ fn startup_update_check_disabled() -> bool {
 
 const fn startup_update_check_due(previous_unix_ms: u128, now_unix_ms: u128) -> bool {
     now_unix_ms.saturating_sub(previous_unix_ms) >= STARTUP_UPDATE_CHECK_INTERVAL_MS
+}
+
+fn startup_update_check_refresh_due(record: &StartupUpdateCheckRecord, now_unix_ms: u128) -> bool {
+    record.status == "error"
+        && now_unix_ms.saturating_sub(record.checked_at_unix_ms)
+            >= STARTUP_UPDATE_CHECK_RETRY_INTERVAL_MS
+        || startup_update_check_due(record.checked_at_unix_ms, now_unix_ms)
 }
 
 fn select_startup_update_manifest<'a>(
@@ -4013,6 +4022,37 @@ echo Python 3.12.10
             1_000,
             1_000 + STARTUP_UPDATE_CHECK_INTERVAL_MS
         ));
+    }
+    #[test]
+    fn startup_update_check_retries_errors_before_success_interval() -> Result<()> {
+        let (root, paths) = test_paths("startup-retry-error");
+        let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        manifest.format = "unsupported".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+        save_startup_update_check(
+            &paths,
+            &StartupUpdateCheckRecord {
+                runtime_key: manifest.runtime_key.clone(),
+                runtime_id: manifest.runtime_id.clone(),
+                channel: manifest.channel.clone(),
+                format: manifest.format.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: None,
+                status: "error".to_owned(),
+                message: Some("temporary DNS failure".to_owned()),
+                checked_at_unix_ms: 2_000,
+            },
+        )?;
+
+        let retry_at = 2_000 + 5 * 60 * 1_000;
+        let record = maybe_refresh_startup_update_check_at(&paths, Some("active"), retry_at)?
+            .expect("failed checks should be retried");
+
+        assert_eq!(record.status, "error");
+        assert_eq!(record.checked_at_unix_ms, retry_at);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
