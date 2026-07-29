@@ -65,6 +65,9 @@ pub(crate) struct AppSnapshot {
     pub runtimes: Vec<RuntimeRecord>,
     pub driver: DriverReport,
     pub update: UpdateReport,
+    /// Pickable versions from the bounded, cached catalog refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_versions: Option<AvailableVersions>,
     /// Mutations this host may be offered. Empty on any unsupported platform.
     pub eligible_actions: Vec<EligibleAction>,
 }
@@ -468,6 +471,39 @@ pub(crate) struct UpdateReport {
     pub trust: SourceTrust,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AvailableVersionsState {
+    Fresh,
+    Stale,
+    Offline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VersionTier {
+    Stable,
+    Beta,
+    Nightly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableVersionEntry {
+    pub tier: VersionTier,
+    pub version: String,
+    pub channel: String,
+    pub index_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableVersions {
+    pub state: AvailableVersionsState,
+    pub checked_at_unix_ms: u64,
+    pub entries: Vec<AvailableVersionEntry>,
+}
+
 // ---------------------------------------------------------------------------
 // Eligible actions
 // ---------------------------------------------------------------------------
@@ -505,6 +541,7 @@ pub(crate) struct SnapshotInputs {
     pub components: Vec<ComponentReport>,
     pub driver: DriverReport,
     pub update: UpdateReport,
+    pub available_versions: Option<AvailableVersions>,
     /// Probes that did not complete. Non-empty yields `ProbeIncomplete`.
     pub probe_failures: Vec<String>,
 }
@@ -542,6 +579,7 @@ pub(crate) fn build_snapshot(inputs: SnapshotInputs) -> AppSnapshot {
         runtimes: inputs.runtimes,
         driver: inputs.driver,
         update: inputs.update,
+        available_versions: inputs.available_versions,
         eligible_actions,
     }
 }
@@ -730,6 +768,7 @@ pub(crate) fn gather_inputs(paths: &AppPaths, config: &RocmCliConfig) -> Result<
         components: component_reports(&examination, &runtimes),
         driver: driver_report(&examination),
         update: update_report(paths, &runtimes),
+        available_versions: available_versions_report(paths),
         runtimes,
         probe_failures,
     })
@@ -826,6 +865,53 @@ fn update_report(paths: &AppPaths, runtimes: &[RuntimeRecord]) -> UpdateReport {
         checked_at_unix_ms: Some(checked_at),
         trust,
     }
+}
+
+fn available_versions_report(paths: &AppPaths) -> Option<AvailableVersions> {
+    let record = therock::cached_available_versions(paths)?;
+    let state = if record.status == "ok" {
+        let fetched_at = if record.fetched_at_unix_ms == 0 {
+            record.checked_at_unix_ms
+        } else {
+            record.fetched_at_unix_ms
+        };
+        if therock::startup_update_check_is_current(fetched_at, unix_time_millis()) {
+            AvailableVersionsState::Fresh
+        } else {
+            AvailableVersionsState::Stale
+        }
+    } else {
+        AvailableVersionsState::Offline
+    };
+    let entries = record
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            let tier = match entry.tier.as_str() {
+                "stable" => VersionTier::Stable,
+                "beta" => VersionTier::Beta,
+                "nightly" => VersionTier::Nightly,
+                _ => return None,
+            };
+            if !matches!(entry.channel.as_str(), "release" | "nightly")
+                || entry.version.trim().is_empty()
+                || entry.index_url.trim().is_empty()
+            {
+                return None;
+            }
+            Some(AvailableVersionEntry {
+                tier,
+                version: entry.version,
+                channel: entry.channel,
+                index_url: entry.index_url,
+            })
+        })
+        .collect();
+    Some(AvailableVersions {
+        state,
+        checked_at_unix_ms: u64::try_from(record.checked_at_unix_ms).unwrap_or(u64::MAX),
+        entries,
+    })
 }
 
 fn platform_report(examination: &rocm_core::Examination) -> PlatformReport {
@@ -1183,6 +1269,7 @@ mod tests {
                     key_source: "pinned".to_owned(),
                 },
             },
+            available_versions: None,
             probe_failures: vec![],
         }
     }
@@ -1917,6 +2004,52 @@ mod tests {
 
     fn installed() -> Vec<RuntimeRecord> {
         vec![ready_runtime()]
+    }
+
+    #[test]
+    fn app_contract_emits_cached_installable_versions() {
+        let (root, paths) = policy_paths("available-versions");
+        let dir = paths.cache_dir.join("therock");
+        std::fs::create_dir_all(&dir).expect("cache dir");
+        let now = unix_time_millis();
+        let record = serde_json::json!({
+            "entries": [
+                {
+                    "tier": "stable",
+                    "version": "7.13.0",
+                    "channel": "release",
+                    "indexUrl": "https://repo.amd.com/rocm/whl/gfx120X-all"
+                },
+                {
+                    "tier": "nightly",
+                    "version": "7.14.0a20260611",
+                    "channel": "nightly",
+                    "indexUrl": "https://rocm.nightlies.amd.com/v2/gfx120X-all"
+                }
+            ],
+            "status": "ok",
+            "message": null,
+            "checkedAtUnixMs": now,
+            "fetchedAtUnixMs": now,
+            "family": "gfx120X-all"
+        });
+        std::fs::write(
+            dir.join("available-versions.json"),
+            serde_json::to_vec_pretty(&record).expect("serialize"),
+        )
+        .expect("write catalog");
+
+        let available = available_versions_report(&paths).expect("catalog");
+        assert_eq!(available.state, AvailableVersionsState::Fresh);
+        assert_eq!(available.entries.len(), 2);
+        let mut inputs = healthy_inputs();
+        inputs.available_versions = Some(available);
+        let json = serde_json::to_value(build_snapshot(inputs)).expect("snapshot");
+        assert_eq!(
+            json["availableVersions"]["entries"][1]["version"],
+            "7.14.0a20260611"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The five states the app must be able to tell apart, from one cache.

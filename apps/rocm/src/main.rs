@@ -673,6 +673,11 @@ enum RuntimesCommand {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
+    /// Check that a ROCm install is usable without changing it.
+    Validate {
+        /// Runtime key or friendly runtime selector.
+        runtime: String,
+    },
     /// Switch back to the previously selected ROCm install.
     Rollback,
     /// Remove a ROCm install from ROCm CLI.
@@ -680,6 +685,9 @@ enum RuntimesCommand {
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Confirm removal for callers that review mutations before execution.
+        #[arg(long)]
+        yes: bool,
     },
     /// Add a ROCm install from a saved manifest file.
     Import {
@@ -1931,6 +1939,7 @@ fn refresh_startup_update_check_quietly() {
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let _ =
         therock::maybe_refresh_startup_update_check(&paths, config.active_runtime_key.as_deref());
+    let _ = therock::maybe_refresh_available_versions(&paths, config.active_runtime_key.as_deref());
 }
 
 fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -5729,6 +5738,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
+        RuntimesCommand::Validate { runtime } => {
+            let manifest = check_runtime(&paths, &runtime)?;
+            println!("runtime check passed");
+            println!("  runtime_id: {}", manifest.runtime_id);
+            println!("  runtime_key: {}", manifest.runtime_key);
+            println!("  version: {}", manifest.version);
+        }
         RuntimesCommand::Rollback => {
             let result = rollback_runtime(&paths, &mut config)?;
             println!("runtime rolled back");
@@ -5755,7 +5771,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall { runtime } => {
+        RuntimesCommand::Uninstall { runtime, yes: _ } => {
             let result = uninstall_runtime(&paths, &mut config, &runtime)?;
             println!("runtime removed");
             println!("  runtime_id: {}", result.runtime_id);
@@ -7204,6 +7220,21 @@ fn select_runtime_manifest<'a>(
             );
         }
     }
+}
+
+fn check_runtime(paths: &AppPaths, selector: &str) -> Result<therock::InstalledRuntimeManifest> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, selector)?;
+    validate_runtime_manifest_for_activation(manifest)?;
+    if manifest.format == "wheel" {
+        let python = manifest
+            .python_executable
+            .as_deref()
+            .context("pip runtime manifest is missing python_executable")?;
+        let probe = therock::probe_rocm_sdk_runtime(Path::new(python))?;
+        therock::validate_rocm_sdk_runtime_probe(&probe)?;
+    }
+    Ok(manifest.clone())
 }
 
 pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManifest) -> String {
@@ -20722,6 +20753,13 @@ install therock";
             "gfx110X-all",
         ])
         .expect("install sdk should accept a TheRock family override");
+    }
+    #[test]
+    fn app_runtime_commands_parse() {
+        Cli::try_parse_from(["rocm", "runtimes", "validate", "runtime-key"])
+            .expect("runtime validation should be a real command");
+        Cli::try_parse_from(["rocm", "runtimes", "uninstall", "runtime-key", "--yes"])
+            .expect("reviewed runtime removal should accept --yes");
     }
 
     #[test]

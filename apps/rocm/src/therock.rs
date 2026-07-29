@@ -212,6 +212,29 @@ pub(crate) struct StartupUpdateCheckRecord {
     pub checked_at_unix_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableVersionCacheEntry {
+    pub tier: String,
+    pub version: String,
+    pub channel: String,
+    pub index_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AvailableVersionsCache {
+    pub entries: Vec<AvailableVersionCacheEntry>,
+    pub status: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(alias = "checkedAtUnixMs")]
+    pub checked_at_unix_ms: u128,
+    #[serde(default, alias = "fetchedAtUnixMs")]
+    pub fetched_at_unix_ms: u128,
+    #[serde(default)]
+    pub family: String,
+}
+
 /// The cached startup update answer, without touching the network.
 ///
 /// The app snapshot is read on every window open and must stay offline-safe,
@@ -222,6 +245,11 @@ pub(crate) struct StartupUpdateCheckRecord {
 /// never as "up to date".
 pub(crate) fn cached_startup_update_check(paths: &AppPaths) -> Option<StartupUpdateCheckRecord> {
     load_startup_update_check(paths).ok().flatten()
+}
+
+/// The last version catalog answer, without touching the network.
+pub(crate) fn cached_available_versions(paths: &AppPaths) -> Option<AvailableVersionsCache> {
+    load_available_versions(paths).ok().flatten()
 }
 
 /// Whether a cached answer of this age is still current.
@@ -694,6 +722,90 @@ fn maybe_refresh_startup_update_check_at(
     Ok(Some(record))
 }
 
+pub(crate) fn maybe_refresh_available_versions(
+    paths: &AppPaths,
+    active_runtime_key: Option<&str>,
+) -> Result<Option<AvailableVersionsCache>> {
+    if startup_update_check_disabled() {
+        return Ok(cached_available_versions(paths));
+    }
+
+    let now_unix_ms = unix_time_millis();
+    let previous = load_available_versions(paths)?;
+    let manifests = load_runtime_manifests(paths)?;
+    let Some(manifest) = select_startup_update_manifest(&manifests, active_runtime_key) else {
+        return Ok(previous);
+    };
+    if let Some(record) = previous.as_ref()
+        && record.family == manifest.family
+        && !available_versions_refresh_due(record, now_unix_ms)
+    {
+        return Ok(previous);
+    }
+
+    let record = build_available_versions_cache(paths, manifest, previous.as_ref(), now_unix_ms);
+    save_available_versions(paths, &record)?;
+    Ok(Some(record))
+}
+
+fn available_versions_refresh_due(record: &AvailableVersionsCache, now_unix_ms: u128) -> bool {
+    let interval = if record.status == "ok" {
+        STARTUP_UPDATE_CHECK_INTERVAL_MS
+    } else {
+        STARTUP_UPDATE_CHECK_RETRY_INTERVAL_MS
+    };
+    now_unix_ms.saturating_sub(record.checked_at_unix_ms) >= interval
+}
+
+fn build_available_versions_cache(
+    paths: &AppPaths,
+    manifest: &InstalledRuntimeManifest,
+    previous: Option<&AvailableVersionsCache>,
+    now_unix_ms: u128,
+) -> AvailableVersionsCache {
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    for (tier, channel) in [
+        ("stable", TheRockChannel::Release),
+        ("nightly", TheRockChannel::Nightly),
+    ] {
+        let mut candidate = manifest.clone();
+        candidate.channel = channel.as_str().to_owned();
+        candidate.format = "wheel".to_owned();
+        match resolve_latest_for_manifest(
+            paths,
+            &candidate,
+            Some(STARTUP_UPDATE_CHECK_TIMEOUT_SECS),
+        ) {
+            Ok((version, index_url, _)) => entries.push(AvailableVersionCacheEntry {
+                tier: tier.to_owned(),
+                version,
+                channel: channel.as_str().to_owned(),
+                index_url,
+            }),
+            Err(error) => errors.push(format!("{}: {error}", channel.as_str())),
+        }
+    }
+
+    let success = !entries.is_empty();
+    let fetched_at_unix_ms = if success {
+        now_unix_ms
+    } else if let Some(record) = previous.filter(|record| record.family == manifest.family) {
+        entries = record.entries.clone();
+        record.fetched_at_unix_ms
+    } else {
+        0
+    };
+    AvailableVersionsCache {
+        entries,
+        status: if success { "ok" } else { "error" }.to_owned(),
+        message: (!errors.is_empty()).then(|| errors.join("\n")),
+        checked_at_unix_ms: now_unix_ms,
+        fetched_at_unix_ms,
+        family: manifest.family.clone(),
+    }
+}
+
 fn startup_update_check_disabled() -> bool {
     std::env::var_os("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK").is_some()
 }
@@ -791,6 +903,38 @@ fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord
         &path,
         serde_json::to_vec_pretty(record)
             .context("failed to serialize startup update check record")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn available_versions_path(paths: &AppPaths) -> PathBuf {
+    paths
+        .cache_dir
+        .join("therock")
+        .join("available-versions.json")
+}
+
+fn load_available_versions(paths: &AppPaths) -> Result<Option<AvailableVersionsCache>> {
+    let path = available_versions_path(paths);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let record = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(record))
+}
+
+fn save_available_versions(paths: &AppPaths, record: &AvailableVersionsCache) -> Result<()> {
+    let path = available_versions_path(paths);
+    let parent = path
+        .parent()
+        .context("available versions path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(record).context("failed to serialize available versions")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
@@ -4022,6 +4166,22 @@ echo Python 3.12.10
             1_000,
             1_000 + STARTUP_UPDATE_CHECK_INTERVAL_MS
         ));
+    }
+
+    #[test]
+    fn version_catalog_retries_errors_before_successes() {
+        let mut record = AvailableVersionsCache {
+            entries: Vec::new(),
+            status: "ok".to_owned(),
+            message: None,
+            checked_at_unix_ms: 2_000,
+            fetched_at_unix_ms: 2_000,
+            family: "gfx120X-all".to_owned(),
+        };
+        let retry_at = 2_000 + STARTUP_UPDATE_CHECK_RETRY_INTERVAL_MS;
+        assert!(!available_versions_refresh_due(&record, retry_at));
+        record.status = "error".to_owned();
+        assert!(available_versions_refresh_due(&record, retry_at));
     }
     #[test]
     fn startup_update_check_retries_errors_before_success_interval() -> Result<()> {
