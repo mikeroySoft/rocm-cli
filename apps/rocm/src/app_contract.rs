@@ -1029,13 +1029,17 @@ fn tidy_gpu_name(raw: &str) -> Option<String> {
 }
 
 fn driver_report(examination: &rocm_core::Examination) -> DriverReport {
-    // Windows exposes a numeric Adrenalin version; Linux exposes only module
-    // presence. Reporting "unknown" on Linux is accurate — inventing a version
-    // from the ROCm install would be a different fact wearing this label.
+    // Windows exposes a numeric Adrenalin version. Linux's in-tree amdgpu
+    // module has no independent version, so identify the exact kernel that
+    // supplied it instead of borrowing an unrelated ROCm package version.
     let installed = if examination.adrenalin_version.is_empty() {
         match examination.amdgpu_loaded {
             Some(true) => DriverVersionState::DetectedWithoutVersion {
-                detail: "amdgpu kernel module is loaded".to_owned(),
+                detail: if examination.kernel_release.is_empty() {
+                    "amdgpu kernel module is loaded".to_owned()
+                } else {
+                    format!("amdgpu from Linux kernel {}", examination.kernel_release)
+                },
             },
             Some(false) => DriverVersionState::NotDetected {
                 detail: "amdgpu kernel module is not loaded".to_owned(),
@@ -1255,7 +1259,7 @@ mod tests {
             components: component_reports(&examined_host(), &[ready_runtime()]),
             driver: DriverReport {
                 installed: DriverVersionState::DetectedWithoutVersion {
-                    detail: "amdgpu kernel module is loaded".to_owned(),
+                    detail: "amdgpu from Linux kernel 6.8.0-test".to_owned(),
                 },
                 latest_known: None,
                 support_links: vec![],
@@ -1511,6 +1515,20 @@ mod tests {
         assert_eq!(tags.len(), states.len(), "every state needs its own tag");
         assert!(tags.contains("not-installed"));
         assert!(tags.contains("unknown"));
+    }
+
+    #[test]
+    fn app_contract_linux_driver_identifies_its_kernel_source() {
+        let mut examination = examined_host();
+        examination.amdgpu_loaded = Some(true);
+        examination.kernel_release = "7.0.0-28-generic".to_owned();
+
+        assert_eq!(
+            driver_report(&examination).installed,
+            DriverVersionState::DetectedWithoutVersion {
+                detail: "amdgpu from Linux kernel 7.0.0-28-generic".to_owned(),
+            }
+        );
     }
 
     /// Driver data carries no mutation.
