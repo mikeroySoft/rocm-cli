@@ -401,24 +401,11 @@ fn log_says_oom(log: &str) -> bool {
 
 /// Turn `KEY=VAL` pairs into engine argv.
 ///
-/// A bare key gets one dash (`fa` → `-fa`, `ub` → `-ub`, `ngl` → `-ngl`):
-/// llama.cpp's tuning flags are single-dash short options of one to three
-/// characters, so no length heuristic gets them all right. Write the dashes
-/// yourself (`--ctx-size=8192`) for a GNU-style long option. A key with no
-/// value becomes a bare flag.
+/// Delegates to [`crate::serve_recipe::engine_argv`] so that a configuration
+/// measured here is spelled identically when `rocm serve --recipe` replays it.
+/// Two renderers that disagree would silently break the recipe's only promise.
 fn engine_arg_argv(args: &BTreeMap<String, String>) -> Vec<String> {
-    let mut argv = Vec::with_capacity(args.len() * 2);
-    for (key, value) in args {
-        argv.push(if key.starts_with('-') {
-            key.clone()
-        } else {
-            format!("-{key}")
-        });
-        if !value.is_empty() {
-            argv.push(value.clone());
-        }
-    }
-    argv
+    crate::serve_recipe::engine_argv(args)
 }
 
 fn parse_engine_args(pairs: &[String]) -> Result<BTreeMap<String, String>> {

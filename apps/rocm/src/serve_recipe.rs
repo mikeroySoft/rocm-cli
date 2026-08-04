@@ -227,6 +227,15 @@ pub fn engine_build_id(binary: &Path) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// The engine flag that selects a compute device on the llama.cpp family,
+/// spelled with its dashes so the renderer passes it through untouched.
+///
+/// Distinct from `rocm serve --device`, which is a placement *policy* taking
+/// gpu_required|gpu_preferred|cpu_only. llama.cpp spells this one
+/// `-dev, --device <dev1,dev2,..>`; a bare `device` key would render `-device`,
+/// which the engine rejects.
+const ENGINE_DEVICE_ARG: &str = "--device";
+
 /// The recipe-controlled slice of `rocm serve`'s configuration. Every field starts as the
 /// explicit command-line value (`None`/empty = not given) and a recipe fills only the gaps.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -246,11 +255,6 @@ impl ServeOverrides {
         let mut overrides = Vec::new();
         for (field, slot, recipe_value) in [
             ("--engine", &mut self.engine, recipe.engine.name.as_deref()),
-            (
-                "--device",
-                &mut self.device,
-                recipe.engine.device.as_deref(),
-            ),
             (
                 "--engine-binary",
                 &mut self.binary,
@@ -272,6 +276,29 @@ impl ServeOverrides {
         // clients ask for, the recipe says which file answers to that name.
         if self.weights.is_none() {
             self.weights = recipe.model.weights.clone();
+        }
+        // `[engine] device` is an ENGINE device selector (`ROCm0`, `Vulkan0`), not
+        // `rocm serve --device`, which is a placement policy taking
+        // gpu_required|gpu_preferred|cpu_only. Feeding one to the other fails with
+        // "unsupported device policy: ROCm0". The selector is an engine flag, so it
+        // rides the same passthrough as every other tuned argument.
+        if let Some(selector) = recipe.engine.device.as_deref()
+            && !selector.is_empty()
+        {
+            match self.args.get(ENGINE_DEVICE_ARG) {
+                None => {
+                    self.args
+                        .insert(ENGINE_DEVICE_ARG.to_owned(), selector.to_owned());
+                }
+                Some(supplied) if supplied != selector => {
+                    overrides.push(override_line(
+                        &format!("--engine-arg {ENGINE_DEVICE_ARG}"),
+                        supplied,
+                        selector,
+                    ));
+                }
+                Some(_) => {}
+            }
         }
         for (key, value) in &recipe.engine.args {
             let Some(recipe_value) = value.as_arg() else {
@@ -306,19 +333,27 @@ fn override_line(field: &str, supplied: &str, recipe_value: &str) -> String {
     )
 }
 
-/// Render `KEY=VAL` engine args into engine argv. A key that already carries its dashes
-/// is passed through untouched; otherwise one dash for a single character (`c`, `b`) and
-/// two for anything longer (`spec-type`), which is how llama.cpp-family engines spell
-/// short and long options. An empty value renders the flag alone, for valueless switches.
+/// Render `KEY=VAL` engine args into engine argv.
+///
+/// A key that already carries its dashes is passed through untouched; a bare key
+/// gets exactly one dash (`fa` -> `-fa`, `ub` -> `-ub`, `ngl` -> `-ngl`). No length
+/// heuristic works here: llama.cpp's tuning flags are single-dash short options of
+/// one to three characters, so spelling `fa` as `--fa` produces
+/// `error: invalid argument: --fa`. Write the dashes yourself
+/// (`--ctx-size=8192`) for a GNU-style long option. An empty value renders the
+/// flag alone, for valueless switches.
+///
+/// `rocm bench run` renders through this same function. That is the whole point:
+/// a recipe promises that what was measured is what gets served, and two
+/// renderers that disagree about how to spell a flag break that promise in the
+/// one place nobody would think to check.
 pub fn engine_argv(args: &BTreeMap<String, String>) -> Vec<String> {
     let mut argv = Vec::with_capacity(args.len() * 2);
     for (key, value) in args {
         argv.push(if key.starts_with('-') {
             key.clone()
-        } else if key.chars().count() == 1 {
-            format!("-{key}")
         } else {
-            format!("--{key}")
+            format!("-{key}")
         });
         if !value.is_empty() {
             argv.push(value.clone());
@@ -357,7 +392,7 @@ sha256  = "3f9c"
 name     = "lemonade"
 build_id = "rocmfpx-b1305"
 binary   = "/engines/rocmfpx/bin/llama-server"
-device   = "gpu_required"
+device   = "Vulkan0"
 
 [engine.args]
 fa                 = "on"
@@ -424,7 +459,14 @@ rocm_runtime = "nightly-7-14-0"
         let mut overrides = ServeOverrides::default();
         assert!(overrides.merge_recipe(&sample()).is_empty());
         assert_eq!(overrides.engine.as_deref(), Some("lemonade"));
-        assert_eq!(overrides.device.as_deref(), Some("gpu_required"));
+        assert_eq!(
+            overrides.args["--device"], "Vulkan0",
+            "engine selector must ride the passthrough"
+        );
+        assert_eq!(
+            overrides.device, None,
+            "serve --device is a policy and must stay unset"
+        );
         assert_eq!(
             overrides.binary.as_deref(),
             Some("/engines/rocmfpx/bin/llama-server")
@@ -453,7 +495,14 @@ rocm_runtime = "nightly-7-14-0"
         assert_eq!(overrides.engine.as_deref(), Some("vllm"));
         assert_eq!(overrides.args["c"], "4096");
         // Unrelated recipe values still apply.
-        assert_eq!(overrides.device.as_deref(), Some("gpu_required"));
+        assert_eq!(
+            overrides.args["--device"], "Vulkan0",
+            "engine selector must ride the passthrough"
+        );
+        assert_eq!(
+            overrides.device, None,
+            "serve --device is a policy and must stay unset"
+        );
         assert_eq!(overrides.args["ngl"], "999");
 
         assert_eq!(reported.len(), 2, "both overrides reported: {reported:?}");
@@ -538,10 +587,14 @@ rocm_runtime = "nightly-7-14-0"
     }
 
     #[test]
-    fn engine_argv_spells_short_long_and_valueless_flags() {
+    fn engine_argv_gives_every_bare_key_exactly_one_dash() {
+        // llama.cpp's tuning flags are single-dash short options of one to three
+        // characters. A length heuristic spells `fa` as `--fa`, which the engine
+        // rejects outright with `error: invalid argument: --fa`.
         let args = BTreeMap::from([
             ("c".to_owned(), "8192".to_owned()),
-            ("spec-type".to_owned(), "draft-mtp".to_owned()),
+            ("fa".to_owned(), "on".to_owned()),
+            ("ngl".to_owned(), "999".to_owned()),
             ("no-mmap".to_owned(), String::new()),
             ("--already-dashed".to_owned(), "1".to_owned()),
         ]);
@@ -552,9 +605,30 @@ rocm_runtime = "nightly-7-14-0"
                 "1",
                 "-c",
                 "8192",
-                "--no-mmap",
-                "--spec-type",
-                "draft-mtp"
+                "-fa",
+                "on",
+                "-ngl",
+                "999",
+                "-no-mmap",
+            ]
+        );
+    }
+
+    #[test]
+    fn bench_and_serve_spell_a_recipe_identically() {
+        // The recipe's only promise is that what was measured is what gets served.
+        // `rocm bench run` renders through this same function; if that ever stops
+        // being true, the promise breaks silently.
+        let measured = BTreeMap::from([
+            ("c".to_owned(), "4096".to_owned()),
+            ("fa".to_owned(), "on".to_owned()),
+            ("ngl".to_owned(), "999".to_owned()),
+            ("--device".to_owned(), "ROCm0".to_owned()),
+        ]);
+        assert_eq!(
+            engine_argv(&measured),
+            [
+                "--device", "ROCm0", "-c", "4096", "-fa", "on", "-ngl", "999"
             ]
         );
     }
