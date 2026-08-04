@@ -51,10 +51,128 @@ pub struct LoadSpec {
     pub requests: u32,
 }
 
+/// `perf.*.source` value for numbers measured from the response stream.
+pub const SOURCE_CLIENT: &str = "client";
+
+/// `perf.*.source` value for numbers scraped from the engine's `/metrics`.
+pub const SOURCE_PROMETHEUS: &str = "prometheus";
+
+/// Distribution of a per-request latency, in milliseconds.
+///
+/// `p50`/`p99` are `None` for a Prometheus histogram delta: that source only
+/// yields an average, and inventing percentiles from it would launder a guess
+/// into a measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatencyStats {
+    pub mean: f64,
+    pub p50: Option<f64>,
+    pub p99: Option<f64>,
+    /// [`SOURCE_CLIENT`] or [`SOURCE_PROMETHEUS`].
+    pub source: &'static str,
+}
+
+impl LatencyStats {
+    /// Summarize per-request samples. `None` when `samples` is empty.
+    fn from_samples(mut samples: Vec<f64>, source: &'static str) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable_by(f64::total_cmp);
+        Some(Self {
+            mean: samples.iter().sum::<f64>() / samples.len() as f64,
+            p50: Some(percentile(&samples, 50.0)),
+            p99: Some(percentile(&samples, 99.0)),
+            source,
+        })
+    }
+
+    /// A mean with no known spread (Prometheus histogram delta).
+    const fn mean_only(mean: f64, source: &'static str) -> Self {
+        Self {
+            mean,
+            p50: None,
+            p99: None,
+            source,
+        }
+    }
+}
+
+/// Nearest-rank percentile of an ascending, non-empty slice.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let rank = (p / 100.0 * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+/// One load cell: the CSV row plus the latency distributions that do not fit
+/// its fixed 18 columns.
+#[derive(Debug, Clone)]
+pub struct CellResult {
+    pub row: BenchmarkRow,
+    pub ttft: Option<LatencyStats>,
+    pub tpot: Option<LatencyStats>,
+    /// End-to-end request duration; always client-measured.
+    pub e2e: Option<LatencyStats>,
+    pub requests_failed: u32,
+}
+
 /// Aggregate result from one successful or partially-successful response.
 struct Outcome {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// `None` unless the reply actually arrived as an SSE stream.
+    ttft_ms: Option<f64>,
+    tpot_ms: Option<f64>,
+    e2e_ms: f64,
+}
+
+fn ms_since(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// TTFT and TPOT from the arrival offsets (ms since request send) of the
+/// stream chunks that carried content.
+///
+/// TPOT needs two arrivals to have an interval at all, so a single-chunk
+/// reply reports `None` rather than zero.
+fn stream_latency(arrivals_ms: &[f64]) -> (Option<f64>, Option<f64>) {
+    let (Some(&first), Some(&last)) = (arrivals_ms.first(), arrivals_ms.last()) else {
+        return (None, None);
+    };
+    let n = arrivals_ms.len();
+    (
+        Some(first),
+        (n > 1).then(|| (last - first) / (n - 1) as f64),
+    )
+}
+
+/// Interpret one SSE line: `(carried a content delta, token counts)`.
+fn sse_line(line: &str) -> (bool, Option<(u64, u64)>) {
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return (false, None);
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return (false, None);
+    }
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return (false, None);
+    };
+    let usage = v.get("usage").and_then(|u| {
+        Some((
+            u.get("prompt_tokens")?.as_u64()?,
+            u.get("completion_tokens")?.as_u64()?,
+        ))
+    });
+    let content = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|c| {
+                c.pointer("/delta/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            })
+        });
+    (content, usage)
 }
 
 /// Error type for the bench load writer.
@@ -161,6 +279,15 @@ impl BenchClients {
 /// missing `usage` fields excludes that request from the sums but does not
 /// abort the cell.
 pub async fn run_cell(spec: &LoadSpec, concurrency: u32) -> Result<BenchmarkRow, BenchLoadError> {
+    Ok(run_cell_measured(spec, concurrency).await?.row)
+}
+
+/// [`run_cell`] plus the per-request latency distributions, for callers that
+/// want more than the two mean columns the CSV row can carry.
+pub async fn run_cell_measured(
+    spec: &LoadSpec,
+    concurrency: u32,
+) -> Result<CellResult, BenchLoadError> {
     run_cell_with_clients(spec, concurrency, &BenchClients::new()?).await
 }
 
@@ -168,7 +295,7 @@ async fn run_cell_with_clients(
     spec: &LoadSpec,
     concurrency: u32,
     clients: &BenchClients,
-) -> Result<BenchmarkRow, BenchLoadError> {
+) -> Result<CellResult, BenchLoadError> {
     if concurrency == 0 {
         return Err(BenchLoadError::InvalidConcurrency(concurrency));
     }
@@ -227,10 +354,15 @@ async fn run_cell_with_clients(
                 "messages": [{"role": "user", "content": "x".repeat(input_len as usize)}],
                 "max_tokens": output_len,
                 "temperature": 0.0,
-                "stream": false,
+                // Streaming is what makes a client-side TTFT meaningful: the
+                // first SSE chunk *is* the first token. `include_usage` asks
+                // for the token counts a buffered reply carries in `usage`.
+                "stream": true,
+                "stream_options": {"include_usage": true},
             });
 
-            let resp = client
+            let sent = Instant::now();
+            let mut resp = client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .body(body.to_string())
@@ -242,14 +374,63 @@ async fn run_cell_with_clients(
                 return None;
             }
 
-            let text = resp.text().await.ok()?;
-            let v: Value = serde_json::from_str(&text).ok()?;
-            let usage = v.get("usage")?;
+            let streamed = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream"));
 
-            let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
-            let completion_tokens = usage.get("completion_tokens")?;
-            // Treat missing/zero completion_tokens as failure (excluded from sums).
-            let completion_tokens = completion_tokens.as_u64()?;
+            if !streamed {
+                // The endpoint buffered the whole reply (or ignores `stream`).
+                // First byte of a buffered reply is end-to-end latency, not
+                // TTFT, so report no client latency rather than a wrong one.
+                let text = resp.text().await.ok()?;
+                let v: Value = serde_json::from_str(&text).ok()?;
+                let usage = v.get("usage")?;
+                let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
+                // Treat missing/zero completion_tokens as failure.
+                let completion_tokens = usage.get("completion_tokens")?.as_u64()?;
+                if completion_tokens == 0 {
+                    return None;
+                }
+                return Some(Outcome {
+                    prompt_tokens,
+                    completion_tokens,
+                    ttft_ms: None,
+                    tpot_ms: None,
+                    e2e_ms: ms_since(sent),
+                });
+            }
+
+            let mut buf = String::new();
+            let mut arrivals_ms: Vec<f64> = Vec::new();
+            let mut usage: Option<(u64, u64)> = None;
+            let mut content_deltas: u64 = 0;
+
+            while let Some(bytes) = resp.chunk().await.ok()? {
+                let at_ms = ms_since(sent);
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                let mut produced = false;
+                // Line-wise, not event-wise: SSE frame separators differ
+                // between `\n\n` and `\r\n\r\n`, but a `data:` line is a
+                // `data:` line either way.
+                while let Some(nl) = buf.find('\n') {
+                    let (content, seen) = sse_line(buf[..nl].trim());
+                    buf.drain(..=nl);
+                    produced |= content;
+                    content_deltas += u64::from(content);
+                    usage = seen.or(usage);
+                }
+                if produced {
+                    arrivals_ms.push(at_ms);
+                }
+            }
+
+            let (ttft_ms, tpot_ms) = stream_latency(&arrivals_ms);
+            // ponytail: without `stream_options.include_usage` the counts are
+            // unknown and one content delta ~ one token is close enough for a
+            // throughput number. Upgrade path: tokenize client-side.
+            let (prompt_tokens, completion_tokens) = usage.unwrap_or((0, content_deltas));
             if completion_tokens == 0 {
                 return None;
             }
@@ -257,6 +438,9 @@ async fn run_cell_with_clients(
             Some(Outcome {
                 prompt_tokens,
                 completion_tokens,
+                ttft_ms,
+                tpot_ms,
+                e2e_ms: ms_since(sent),
             })
         });
     }
@@ -264,13 +448,22 @@ async fn run_cell_with_clients(
     let mut sum_prompt: u64 = 0;
     let mut sum_completion: u64 = 0;
     let mut n_success: u32 = 0;
+    let mut n_failed: u32 = 0;
+    let mut ttfts: Vec<f64> = Vec::new();
+    let mut tpots: Vec<f64> = Vec::new();
+    let mut e2es: Vec<f64> = Vec::new();
 
     while let Some(res) = js.join_next().await {
-        if let Ok(Some(outcome)) = res {
-            sum_prompt += outcome.prompt_tokens;
-            sum_completion += outcome.completion_tokens;
-            n_success += 1;
-        }
+        let Ok(Some(outcome)) = res else {
+            n_failed += 1;
+            continue;
+        };
+        sum_prompt += outcome.prompt_tokens;
+        sum_completion += outcome.completion_tokens;
+        n_success += 1;
+        ttfts.extend(outcome.ttft_ms);
+        tpots.extend(outcome.tpot_ms);
+        e2es.push(outcome.e2e_ms);
     }
 
     // Stop the poller and wait for it to exit cleanly.
@@ -299,10 +492,15 @@ async fn run_cell_with_clients(
             (Some(running), Some(waiting))
         });
 
-    // TTFT/TPOT deltas come from the before/after histogram scrapes (unchanged).
-    let (_, _, ttft_ms, tpot_ms) = prom_deltas(prom_before.as_ref(), prom_after.as_ref());
+    // Client-side measurement wins; the Prometheus histogram delta is the
+    // fallback for an engine that buffers replies but publishes metrics.
+    let (_, _, prom_ttft, prom_tpot) = prom_deltas(prom_before.as_ref(), prom_after.as_ref());
+    let ttft = LatencyStats::from_samples(ttfts, SOURCE_CLIENT)
+        .or_else(|| prom_ttft.map(|m| LatencyStats::mean_only(m, SOURCE_PROMETHEUS)));
+    let tpot = LatencyStats::from_samples(tpots, SOURCE_CLIENT)
+        .or_else(|| prom_tpot.map(|m| LatencyStats::mean_only(m, SOURCE_PROMETHEUS)));
 
-    Ok(BenchmarkRow {
+    let row = BenchmarkRow {
         cell: format!("bench-c{concurrency}"),
         run: 1,
         model: Some(spec.model.clone()),
@@ -318,9 +516,17 @@ async fn run_cell_with_clients(
         launcher: Some("rocm bench load (local smoke)".to_string()),
         max_running_reqs,
         max_waiting_reqs,
-        ttft_ms,
-        tpot_ms,
+        ttft_ms: ttft.map(|l| l.mean),
+        tpot_ms: tpot.map(|l| l.mean),
         ..Default::default()
+    };
+
+    Ok(CellResult {
+        row,
+        ttft,
+        tpot,
+        e2e: LatencyStats::from_samples(e2es, SOURCE_CLIENT),
+        requests_failed: n_failed,
     })
 }
 
@@ -419,7 +625,7 @@ pub async fn run_and_append_csv(
 
     let mut rows = Vec::with_capacity(concurrency_levels.len());
     for &conc in concurrency_levels {
-        let row = run_cell_with_clients(spec, conc, &clients).await?;
+        let row = run_cell_with_clients(spec, conc, &clients).await?.row;
         append_one_row(&row, csv_path)?;
         rows.push(row);
     }
@@ -486,7 +692,7 @@ pub async fn run_auto_ramp(
     let clients = BenchClients::new()?;
 
     for &conc in RAMP_SEQUENCE {
-        let row = run_cell_with_clients(spec, conc, &clients).await?;
+        let row = run_cell_with_clients(spec, conc, &clients).await?.row;
         append_one_row(&row, csv_path)?;
 
         let is_last = conc == *RAMP_SEQUENCE.last().unwrap_or(&conc);
@@ -1232,5 +1438,125 @@ mod tests {
         update_peak_pair(&peak, 8, 1);
 
         assert_eq!(peak_pair(&peak), Some((8, 1)));
+    }
+
+    // ---------- client-side TTFT/TPOT ----------
+
+    #[test]
+    fn stream_latency_from_synthetic_chunk_timings() {
+        // Chunks landed 120, 132, 144, 156 ms after the request was sent:
+        // TTFT is the first arrival, TPOT the mean of the 3 gaps (12 ms).
+        let (ttft, tpot) = stream_latency(&[120.0, 132.0, 144.0, 156.0]);
+        assert_eq!(ttft, Some(120.0));
+        assert_eq!(tpot, Some(12.0));
+
+        // Uneven gaps still average: (300-100)/2 = 100.
+        let (ttft, tpot) = stream_latency(&[100.0, 110.0, 300.0]);
+        assert_eq!(ttft, Some(100.0));
+        assert_eq!(tpot, Some(100.0));
+
+        // One chunk has a TTFT but no inter-token interval to average.
+        assert_eq!(stream_latency(&[42.0]), (Some(42.0), None));
+        assert_eq!(stream_latency(&[]), (None, None));
+    }
+
+    #[test]
+    fn latency_stats_percentiles_and_source() {
+        let s = LatencyStats::from_samples((1..=100).map(f64::from).collect(), SOURCE_CLIENT)
+            .expect("100 samples");
+        assert!((s.mean - 50.5).abs() < 1e-9);
+        assert_eq!(s.p50, Some(50.0));
+        assert_eq!(s.p99, Some(99.0));
+        assert_eq!(s.source, SOURCE_CLIENT);
+
+        // A Prometheus histogram delta is a mean with no knowable spread.
+        let p = LatencyStats::mean_only(7.5, SOURCE_PROMETHEUS);
+        assert_eq!((p.p50, p.p99), (None, None));
+
+        assert_eq!(LatencyStats::from_samples(vec![], SOURCE_CLIENT), None);
+    }
+
+    #[test]
+    fn sse_line_classifies_data_content_usage_and_noise() {
+        assert_eq!(
+            sse_line(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#),
+            (true, None)
+        );
+        // Role-only opening chunk carries no token.
+        assert_eq!(
+            sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
+            (false, None)
+        );
+        assert_eq!(
+            sse_line(r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#),
+            (false, Some((9, 3)))
+        );
+        assert_eq!(sse_line("data: [DONE]"), (false, None));
+        assert_eq!(sse_line(": keep-alive"), (false, None));
+        assert_eq!(sse_line(""), (false, None));
+    }
+
+    #[tokio::test]
+    async fn run_cell_measures_client_latency_from_sse_stream() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        // Publishing Prometheus histograms must not override client numbers.
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(prom_body(0, 0, 9.0, 1.0)))
+            .mount(&server)
+            .await;
+
+        let mut spec = make_spec(&server.uri());
+        spec.requests = 4;
+        let cell = run_cell_measured(&spec, 2).await.unwrap();
+
+        assert_eq!(cell.requests_failed, 0);
+        assert_eq!(cell.row.n_requests, Some(4));
+        // Token counts come from the streamed `usage` chunk, not the deltas.
+        assert_eq!(cell.row.prompt_tokens, Some(64));
+        assert_eq!(cell.row.completion_tokens, Some(8));
+
+        let ttft = cell.ttft.expect("client ttft");
+        assert_eq!(ttft.source, SOURCE_CLIENT);
+        assert!(ttft.p50.is_some() && ttft.p99.is_some());
+        assert_eq!(cell.row.ttft_ms, Some(ttft.mean));
+        assert!(cell.e2e.expect("e2e").mean >= ttft.mean);
+    }
+
+    #[tokio::test]
+    async fn buffered_reply_reports_no_client_latency() {
+        // A non-SSE reply's first byte is end-to-end latency, not TTFT.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let spec = make_spec(&server.uri());
+        let cell = run_cell_measured(&spec, 2).await.unwrap();
+
+        assert_eq!(cell.ttft, None);
+        assert_eq!(cell.tpot, None);
+        assert!(cell.e2e.is_some(), "e2e is always client-measurable");
     }
 }

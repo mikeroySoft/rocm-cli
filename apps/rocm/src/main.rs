@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 mod automations;
+mod bench_run;
 mod bootstrap;
 mod comfyui;
 mod dash;
@@ -11,6 +12,7 @@ mod endpoint_keys;
 mod logging;
 mod provider_keys;
 mod providers;
+mod serve_recipe;
 mod serve_summary;
 mod therock;
 mod uninstall;
@@ -344,6 +346,23 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// credential-free.
         #[arg(long)]
         api_key: Option<String>,
+        /// Engine argument passed verbatim to the model server, as `KEY=VAL` (or a bare
+        /// `KEY` for a switch that takes no value). Repeatable; the last use of a key wins.
+        #[arg(
+            long = "engine-arg",
+            value_name = "KEY=VAL",
+            value_parser = serve_recipe::parse_engine_arg
+        )]
+        engine_arg: Vec<(String, String)>,
+        /// Engine executable to launch instead of the one ROCm CLI installed, e.g. a
+        /// locally built `llama-server`.
+        #[arg(long, value_name = "PATH")]
+        engine_binary: Option<PathBuf>,
+        /// Tuned serving recipe to replay: a `hypercricket.recipe.v1` name under the CLI
+        /// recipes directory, or a path to one. Supplies weights, engine binary, device,
+        /// and engine args; the flags above override it, and each override is reported.
+        #[arg(long, value_name = "NAME|PATH")]
+        recipe: Option<String>,
     },
     /// Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -485,6 +504,59 @@ enum BenchCommand {
         /// or the request queue backs up.
         #[arg(long)]
         auto_ramp: bool,
+    },
+    /// Measure exactly one serving configuration and print a `rocm.bench.v1`
+    /// JSON document (the `Hypercricket` measurement seam).
+    ///
+    /// Launches the engine, waits for readiness, discards warmup requests,
+    /// drives ONE load cell, attests what the engine actually loaded from its
+    /// own startup log, then tears the process tree down and re-reads VRAM.
+    /// Ephemeral: no managed service is registered and no dashboard CSV is
+    /// written. Exits 0 whenever it ran — branch on `status`, not the exit
+    /// code.
+    #[command(verbatim_doc_comment)]
+    Run {
+        /// Model reference: a local GGUF path, or a hub id passed to the engine.
+        #[arg(value_name = "MODEL-REF")]
+        model_ref: String,
+        /// Engine to launch (lemonade, vllm, rocmfpx, ...).
+        #[arg(long)]
+        engine: String,
+        /// Override the served binary (default: llama-server, or vllm for --engine vllm).
+        #[arg(long, value_name = "PATH")]
+        engine_binary: Option<PathBuf>,
+        /// Engine flag as KEY=VAL, repeatable. A bare key gets one dash
+        /// (`fa=on` becomes `-fa on`); write your own dashes for a long
+        /// option (`--ctx-size=8192`).
+        #[arg(long, value_name = "KEY=VAL")]
+        engine_arg: Vec<String>,
+        /// Engine device selector, e.g. ROCm0 or Vulkan0.
+        #[arg(long)]
+        device: Option<String>,
+        /// Target GPU: an amd-smi index, or `auto` for the emptiest device.
+        #[arg(long, value_name = "INDEX|auto")]
+        gpu: Option<String>,
+        /// Concurrent in-flight requests.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1024))]
+        conc: u32,
+        /// Input sequence length in tokens.
+        #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..=1_048_576))]
+        isl: u32,
+        /// Output sequence length in tokens.
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=1_048_576))]
+        osl: u32,
+        /// Measured requests in the single load cell.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        requests: u32,
+        /// Requests issued and discarded before measurement begins.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(0..=10_000))]
+        warmup_requests: u32,
+        /// Total wall budget in seconds, including model load.
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_sec: u64,
+        /// Accepted for symmetry; the response is always JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1624,6 +1696,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             api_key,
+            engine_arg,
+            engine_binary,
+            recipe,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -1640,6 +1715,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             api_key,
+            engine_args: engine_arg.into_iter().collect(),
+            engine_binary,
+            recipe,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
@@ -1710,6 +1788,34 @@ fn dispatch(cli: Cli) -> Result<()> {
                 requests,
                 out,
                 auto_ramp,
+            }),
+            BenchCommand::Run {
+                model_ref,
+                engine,
+                engine_binary,
+                engine_arg,
+                device,
+                gpu,
+                conc,
+                isl,
+                osl,
+                requests,
+                warmup_requests,
+                timeout_sec,
+                json: _,
+            } => bench_run::run(bench_run::BenchRunArgs {
+                model_ref,
+                engine,
+                engine_binary,
+                engine_arg,
+                device,
+                gpu,
+                conc,
+                isl,
+                osl,
+                requests,
+                warmup_requests,
+                timeout_sec,
             }),
         },
         Some(Command::Uninstall {
@@ -3889,6 +3995,12 @@ fn render_serve_engine_recipe_lines(engine_recipe: &EngineRecipeHint) -> String 
             engine_recipe.required_flags.join(" ")
         );
     }
+    if let Some(binary) = &engine_recipe.binary {
+        let _ = writeln!(output, "  engine_recipe_binary: {binary}");
+    }
+    if let Some(weights) = &engine_recipe.weights {
+        let _ = writeln!(output, "  engine_recipe_weights: {weights}");
+    }
     output
 }
 
@@ -3920,6 +4032,8 @@ fn protocol_engine_recipe_hint(
                 })
                 .collect(),
             notes: engine_recipe.notes.clone(),
+            binary: None,
+            weights: None,
         })
 }
 
@@ -3959,6 +4073,58 @@ fn engine_recipe_with_tool_call_override(
     });
     set_vllm_tool_call_parser(&mut hint.required_flags, parser);
     Some(hint)
+}
+
+/// Folds explicit engine passthrough — `--engine-arg`, `--engine-binary`, and a recipe's
+/// weights — into the engine recipe hint.
+///
+/// The hint is the only launch-time carrier that already reaches every adapter and
+/// survives a supervised restart, so passthrough rides it instead of growing a second
+/// parallel channel that recovery would have to learn about separately.
+fn engine_recipe_with_passthrough(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    tuning: &serve_recipe::ServeOverrides,
+) -> Option<EngineRecipeHint> {
+    let argv = serve_recipe::engine_argv(&tuning.args);
+    if argv.is_empty() && tuning.binary.is_none() && tuning.weights.is_none() {
+        return hint;
+    }
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    // Appended last so an explicit engine arg wins over an authored catalog flag for the
+    // same option, which is how llama.cpp-family and vLLM both read a repeated flag.
+    hint.required_flags.extend(argv);
+    hint.binary = tuning
+        .binary
+        .as_deref()
+        .map(|path| serve_recipe::expand_tilde(path).display().to_string());
+    hint.weights = tuning
+        .weights
+        .as_deref()
+        .map(|path| serve_recipe::expand_tilde(path).display().to_string());
+    Some(hint)
+}
+
+/// What this machine can say about itself, for recipe staleness. Only facts actually
+/// observed are filled in: an unobservable fact must not read as a changed one, because a
+/// false staleness warning teaches users to ignore the true one.
+fn serve_recipe_host_facts(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    engine_binary: Option<&str>,
+) -> serve_recipe::HostFacts {
+    serve_recipe::HostFacts {
+        engine_build_id: engine_binary
+            .map(serve_recipe::expand_tilde)
+            .as_deref()
+            .and_then(serve_recipe::engine_build_id),
+        gfx: rocm_core::detect_host_gpu_summary(Some(paths)).gfx_target,
+        rocm_runtime: config.active_runtime_key.clone(),
+    }
 }
 
 /// Rewrites `flags` so vLLM tool calling uses exactly `parser`: drops any existing
@@ -4018,6 +4184,9 @@ struct ServeArgs {
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
     api_key: Option<String>,
+    engine_args: BTreeMap<String, String>,
+    engine_binary: Option<PathBuf>,
+    recipe: Option<String>,
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
@@ -4037,6 +4206,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         allow_public_bind,
         tool_call_parser,
         api_key,
+        engine_args,
+        engine_binary,
+        recipe,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
@@ -4053,6 +4225,30 @@ fn serve(args: ServeArgs) -> Result<()> {
     let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref())?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
+    // A tuned recipe is a measured configuration, so fold it in before anything reads the
+    // engine, device, or engine args: every downstream decision must see one merged plan.
+    let mut tuning = serve_recipe::ServeOverrides {
+        engine,
+        device,
+        binary: engine_binary.map(|path| path.display().to_string()),
+        weights: None,
+        args: engine_args,
+    };
+    if let Some(reference) = recipe.as_deref() {
+        let tuned = serve_recipe::load(&paths, reference)?;
+        println!("{}", tuned.applied_line());
+        // A recipe that no longer describes what is running has to say so out loud, both
+        // when a flag displaces one of its values and when the machine has moved under it.
+        for line in tuning.merge_recipe(&tuned) {
+            println!("{line}");
+        }
+        let facts = serve_recipe_host_facts(&paths, &config, tuning.binary.as_deref());
+        if let Some(warning) = serve_recipe::staleness_warning(&tuned, &facts) {
+            println!("{warning}");
+        }
+    }
+    let engine = tuning.engine.clone();
+    let device = tuning.device.clone();
     // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
     // selection would actually consult it: no explicit `--engine` and no non-empty
     // configured `default_engine`.
@@ -4092,11 +4288,26 @@ fn serve(args: ServeArgs) -> Result<()> {
     // comes from authored catalog recipe metadata or an explicit `--tool-call-parser`
     // override, applied here for vLLM only.
     let engine_serves_vllm = selected_engine.eq_ignore_ascii_case("vllm");
-    let engine_recipe = engine_recipe_with_tool_call_override(
+    let engine_recipe = engine_recipe_with_passthrough(
         &selected_engine,
-        recipe_hint,
-        tool_call_parser.as_deref(),
+        engine_recipe_with_tool_call_override(
+            &selected_engine,
+            recipe_hint,
+            tool_call_parser.as_deref(),
+        ),
+        &tuning,
     );
+    // Lemonade is the llama.cpp/GGUF adapter, the only one that serves a weights file
+    // directly. Say so rather than silently discarding the quantization a recipe measured.
+    if let Some(weights) = tuning
+        .weights
+        .as_deref()
+        .filter(|_| !selected_engine.eq_ignore_ascii_case("lemonade"))
+    {
+        println!(
+            "note: recipe weights {weights} apply only to the llama.cpp (lemonade) engine; engine '{selected_engine}' resolves the model itself"
+        );
+    }
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -16806,6 +17017,85 @@ mod tests {
     }
 
     #[test]
+    fn serve_collects_repeated_engine_args_into_a_map() {
+        let cli = parse_serve(&[
+            "--engine-arg",
+            "c=8192",
+            "--engine-arg",
+            "spec-type=draft-mtp",
+            "--engine-arg",
+            "no-mmap",
+            "--engine-arg",
+            "c=4096",
+        ])
+        .expect("repeated --engine-arg parses");
+        match cli.command {
+            Some(Command::Serve { engine_arg, .. }) => {
+                let args: BTreeMap<String, String> = engine_arg.into_iter().collect();
+                // A repeated key is a correction, not an error: the last one wins.
+                assert_eq!(args["c"], "4096");
+                assert_eq!(args["spec-type"], "draft-mtp");
+                assert_eq!(args["no-mmap"], "");
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_recipe_and_engine_binary() {
+        let cli = parse_serve(&[
+            "--recipe",
+            "qwen3-8b-interactive",
+            "--engine-binary",
+            "/engines/rocmfpx/bin/llama-server",
+        ])
+        .expect("--recipe and --engine-binary parse");
+        match cli.command {
+            Some(Command::Serve {
+                recipe,
+                engine_binary,
+                ..
+            }) => {
+                assert_eq!(recipe.as_deref(), Some("qwen3-8b-interactive"));
+                assert_eq!(
+                    engine_binary,
+                    Some(PathBuf::from("/engines/rocmfpx/bin/llama-server"))
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_without_the_tuning_flags_is_unchanged() {
+        // `rocm serve <model>` must keep behaving exactly as it did before passthrough
+        // existed: no recipe, no binary override, no engine args.
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve {
+                model,
+                recipe,
+                engine_binary,
+                engine_arg,
+                ..
+            }) => {
+                assert_eq!(model, "qwen");
+                assert!(recipe.is_none());
+                assert!(engine_binary.is_none());
+                assert!(engine_arg.is_empty());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_an_engine_arg_with_no_key() {
+        let error = parse_serve(&["--engine-arg", "=8192"]).expect_err("empty key rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn completions_generate_for_every_shell() {
         use clap_complete::Shell;
         // The hidden, internal-only verbs that `--help` omits and that must
@@ -21653,6 +21943,56 @@ install therock";
         assert!(!engine_recipe_enables_tool_choice(Some(&without)));
         let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
         assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+    }
+
+    #[test]
+    fn passthrough_rides_the_engine_recipe_hint() {
+        let tuning = serve_recipe::ServeOverrides {
+            binary: Some("/engines/rocmfpx/bin/llama-server".to_owned()),
+            weights: Some("/models/tuned.gguf".to_owned()),
+            args: BTreeMap::from([
+                ("c".to_owned(), "8192".to_owned()),
+                ("no-mmap".to_owned(), String::new()),
+            ]),
+            ..serve_recipe::ServeOverrides::default()
+        };
+        // An authored catalog flag survives; passthrough is appended after it so a
+        // duplicated option resolves to the explicitly requested value.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--reasoning-parser".to_owned(), "qwen3".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_passthrough("lemonade", Some(authored), &tuning)
+            .expect("passthrough synthesizes a hint");
+        assert_eq!(
+            hint.required_flags,
+            ["--reasoning-parser", "qwen3", "-c", "8192", "--no-mmap"]
+        );
+        assert_eq!(
+            hint.binary.as_deref(),
+            Some("/engines/rocmfpx/bin/llama-server")
+        );
+        assert_eq!(hint.weights.as_deref(), Some("/models/tuned.gguf"));
+    }
+
+    #[test]
+    fn passthrough_leaves_an_untuned_serve_untouched() {
+        // No engine args, no binary, no weights: the hint (and the absence of one) must be
+        // exactly what it was before passthrough existed.
+        let tuning = serve_recipe::ServeOverrides::default();
+        assert!(engine_recipe_with_passthrough("lemonade", None, &tuning).is_none());
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        assert_eq!(
+            engine_recipe_with_passthrough("vllm", Some(authored.clone()), &tuning),
+            Some(authored)
+        );
     }
 
     #[test]

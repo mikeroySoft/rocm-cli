@@ -33,6 +33,9 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tar = "0.4"
+# Serving-recipe parsing (`hypercricket.recipe.v1`). This exact version is already in the
+# build graph via rocm-dash-core, so it pulls in nothing new.
+toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

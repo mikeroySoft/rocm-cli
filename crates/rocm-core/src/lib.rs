@@ -1316,6 +1316,14 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// User-authored serving recipes (`hypercricket.recipe.v1`), which `rocm serve
+    /// --recipe <name>` resolves by bare name. Config-rooted, not data-rooted: `data_dir`
+    /// follows the active managed runtime, and a recipe is a measurement *about* a runtime
+    /// that must stay findable after the user activates a different one.
+    pub fn recipes_dir(&self) -> PathBuf {
+        self.config_dir.join("recipes")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
