@@ -535,13 +535,21 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     // exact name through Lemonade's model router (Lemonade renames registered models and
     // its registry has several naming quirks). Download the GGUF and run a packaged
     // llama-server on it directly with `--alias`, which serves it under exactly that name.
-    if let Some(checkpoint) = parse_hf_checkpoint(&request.model_ref) {
+    // Recipe-pinned weights *are* the resolution, so they preempt both branches below: the
+    // checkpoint path would demand a quantization variant the recipe has already chosen,
+    // and the router path would ignore the pinned binary and file outright.
+    let pinned_weights = recipe_weights(&request).is_some();
+    if !pinned_weights && let Some(checkpoint) = parse_hf_checkpoint(&request.model_ref) {
         return serve_hf_checkpoint(&request, &runtime, &process_env, log_path, &checkpoint);
     }
-    if runtime_is_linux()
-        && let Some(server) = find_llama_server_binary(&runtime.manifest)
+    if (runtime_is_linux() || pinned_weights)
+        && let Some(server) = resolve_llama_server_binary(&request, &runtime.manifest)
     {
-        ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
+        // Pinned recipe weights are already on disk, so there is nothing to fetch — and
+        // router resolution would look up a name that file has no relation to.
+        if !pinned_weights {
+            ensure_direct_llama_model_available(&request, &runtime, &process_env, log_path)?;
+        }
         let backend = llama_server_backend_label(&server);
         return serve_direct_llama_server(
             &request,
@@ -697,7 +705,7 @@ fn serve_hf_checkpoint(
             model = request.model_ref
         );
     }
-    let Some(server) = find_llama_server_binary(&runtime.manifest) else {
+    let Some(server) = resolve_llama_server_binary(request, &runtime.manifest) else {
         bail!(
             "no GPU llama-server backend is installed under {}; run `rocm engines install lemonade`",
             runtime
@@ -1727,12 +1735,22 @@ fn serve_direct_llama_server(
     reason: &anyhow::Error,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
-        format!(
-            "Lemonade downloaded model `{}` was not found for direct serving",
-            request.model_ref
-        )
-    })?;
+    // A recipe pins the exact weights its numbers were measured on; resolving a name here
+    // instead would serve a different file under the same measured claim.
+    let model_path = match recipe_weights(request) {
+        Some(weights) => {
+            if !weights.is_file() {
+                bail!("recipe weights are missing at {}", weights.display());
+            }
+            weights
+        }
+        None => direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
+            format!(
+                "Lemonade downloaded model `{}` was not found for direct serving",
+                request.model_ref
+            )
+        })?,
+    };
     if !server.is_file() {
         bail!("Lemonade llama-server is missing at {}", server.display());
     }
@@ -1775,6 +1793,11 @@ fn serve_direct_llama_server(
         .arg("--alias")
         .arg(&request.model_ref)
         .stdin(Stdio::null());
+    // Recipe / `--engine-arg` passthrough goes last so it wins over the defaults above
+    // when it names the same option: llama.cpp takes the final occurrence of a flag.
+    if let Some(hint) = request.engine_recipe.as_ref() {
+        command.args(&hint.required_flags);
+    }
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
     // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
@@ -1937,6 +1960,29 @@ fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Option<PathBu
         .into_iter()
         .map(|backend| llamacpp_dir.join(backend).join(&binary))
         .find(|candidate| candidate.is_file())
+}
+
+/// The `llama-server` to drive: a recipe's own binary when it pinned one, otherwise the
+/// best installed Lemonade backend. A recipe that measured a locally built engine has to
+/// run that exact engine, or its numbers describe a binary nobody is running.
+fn resolve_llama_server_binary(
+    request: &ServeHttpRequest,
+    manifest: &LemonadeInstallManifest,
+) -> Option<PathBuf> {
+    request
+        .engine_recipe
+        .as_ref()
+        .and_then(|hint| hint.binary.as_deref())
+        .map(PathBuf::from)
+        .or_else(|| find_llama_server_binary(manifest))
+}
+
+fn recipe_weights(request: &ServeHttpRequest) -> Option<PathBuf> {
+    request
+        .engine_recipe
+        .as_ref()
+        .and_then(|hint| hint.weights.as_deref())
+        .map(PathBuf::from)
 }
 
 /// The backend label for a packaged llama-server, taken from its parent directory name

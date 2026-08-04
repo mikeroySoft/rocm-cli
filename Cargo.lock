@@ -3584,6 +3584,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

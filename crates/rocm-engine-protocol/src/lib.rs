@@ -499,6 +499,15 @@ pub struct EngineRecipeHint {
     pub unsupported_combinations: Vec<EngineRecipeUnsupportedCombinationHint>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Engine executable to launch instead of the one the CLI installed, and the weights
+    /// file to serve instead of the adapter's own model resolution. Both come from a
+    /// tuned serving recipe: an optimizer that built its own engine and quantized its own
+    /// weights has to be able to say so, and this is the carrier that already survives
+    /// the whole launch chain (serve → wrapper → adapter → supervised restart).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -769,6 +778,8 @@ mod tests {
                     reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
                 }],
                 notes: vec!["signed recipe metadata".to_owned()],
+                binary: Some("/engines/rocmfpx/bin/llama-server".to_owned()),
+                weights: Some("/models/qwen3-8b-ROCMFP4_FAST.gguf".to_owned()),
             }),
         };
 
@@ -814,6 +825,8 @@ mod tests {
                 preferred_endpoint: None,
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),
+                binary: None,
+                weights: None,
             }),
             gpu_selection: None,
         };

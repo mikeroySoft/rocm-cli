@@ -696,7 +696,14 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut command = ProcessCommand::new(&runtime.command);
+    // A recipe may pin the exact `vllm` executable its numbers were measured with; it wins
+    // over the resolved runtime, which is only what the CLI would have installed.
+    let program = request
+        .engine_recipe
+        .as_ref()
+        .and_then(|hint| hint.binary.as_deref())
+        .map_or_else(|| runtime.command.clone(), PathBuf::from);
+    let mut command = ProcessCommand::new(&program);
     command
         .arg("serve")
         .arg(&request.model_ref)
@@ -1777,6 +1784,8 @@ mod tests {
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],
+            binary: None,
+            weights: None,
         }
     }
 
