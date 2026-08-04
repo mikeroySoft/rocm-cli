@@ -21968,7 +21968,7 @@ install therock";
             .expect("passthrough synthesizes a hint");
         assert_eq!(
             hint.required_flags,
-            ["--reasoning-parser", "qwen3", "-c", "8192", "--no-mmap"]
+            ["--reasoning-parser", "qwen3", "-c", "8192", "-no-mmap"]
         );
         assert_eq!(
             hint.binary.as_deref(),
