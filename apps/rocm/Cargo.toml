@@ -34,7 +34,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4"
-# Serving-recipe parsing (`hypercricket.recipe.v1`). This exact version is already in the
+# Serving-recipe parsing (see `serve_recipe::SCHEMAS`). This exact version is already in the
 # build graph via rocm-dash-core, so it pulls in nothing new.
 toml = "0.8"
 tracing = "0.1"

@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `hypercricket.recipe.v1` — a measured serving configuration produced by an external
-//! optimizer and replayed by `rocm serve --recipe`.
+//! `hyperloom-r.recipe.v1` (and its former spelling `hypercricket.recipe.v1`) — a
+//! measured serving configuration produced by an external optimizer and replayed by
+//! `rocm serve --recipe`.
 //!
 //! Every value in a recipe was measured together, on one machine, with one engine build.
 //! That is why this module reports instead of enforcing: overriding a recipe value from
@@ -20,8 +21,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The only recipe schema this build understands.
-pub const SCHEMA: &str = "hypercricket.recipe.v1";
+/// The recipe schemas this build understands, newest spelling first. The optimizer was
+/// renamed; recipes written under the old id are still valid documents describing the
+/// same fields, so refusing them would strand measurements that cost GPU hours.
+pub const SCHEMAS: &[&str] = &["hyperloom-r.recipe.v1", "hypercricket.recipe.v1"];
 
 /// Sections beyond these (`tuned_for`, `measured`, `quality`) are the optimizer's
 /// evidence, not serving input, and are deliberately ignored rather than rejected so a
@@ -114,15 +117,20 @@ impl fmt::Display for ArgValue {
     }
 }
 
-/// Load a recipe named on the command line. A bare name resolves under the CLI-owned
-/// recipes directory; anything that looks like a path is used as one.
+/// Load a recipe named on the command line. A bare name resolves under the CLI's
+/// recipe directories; anything that looks like a path is used as one.
 pub fn load(paths: &AppPaths, reference: &str) -> Result<Recipe> {
     let path = resolve_path(paths, reference);
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read recipe {}", path.display()))?;
+    let text = fs::read_to_string(&path).with_context(|| missing(paths, reference, &path))?;
     parse(&text, &path)
 }
 
+/// The file a `--recipe` reference names.
+///
+/// A bare name is looked up in the scratch directory first and the permanent one
+/// second, so an experiment can shadow a committed recipe without editing it.
+/// When it exists in neither, the permanent path is returned: that is where the
+/// user meant it to be, and naming it beats naming a cache directory.
 pub fn resolve_path(paths: &AppPaths, reference: &str) -> PathBuf {
     let looks_like_path = reference.contains('/')
         || reference.contains('\\')
@@ -132,17 +140,42 @@ pub fn resolve_path(paths: &AppPaths, reference: &str) -> PathBuf {
     if looks_like_path {
         return expand_tilde(reference);
     }
-    paths.recipes_dir().join(format!("{reference}.toml"))
+    let file = format!("{reference}.toml");
+    let [scratch, permanent] = paths.recipe_search_dirs();
+    let scratch = scratch.join(&file);
+    if scratch.is_file() {
+        return scratch;
+    }
+    permanent.join(file)
+}
+
+/// A miss names every directory searched. A recipe that "vanished" is nearly
+/// always sitting in the other one.
+fn missing(paths: &AppPaths, reference: &str, path: &Path) -> String {
+    if reference.contains('/') || reference.contains('\\') {
+        return format!("failed to read recipe {}", path.display());
+    }
+    let [scratch, permanent] = paths.recipe_search_dirs();
+    format!(
+        "no recipe `{reference}` in {} (scratch) or {} (permanent)",
+        scratch.display(),
+        permanent.display()
+    )
 }
 
 pub fn parse(text: &str, source: &Path) -> Result<Recipe> {
     let recipe: Recipe = toml::from_str(text)
         .with_context(|| format!("failed to parse recipe {}", source.display()))?;
-    if recipe.schema != SCHEMA {
+    if !SCHEMAS.contains(&recipe.schema.as_str()) {
         bail!(
-            "recipe {} declares schema `{}`; this build understands `{SCHEMA}`",
+            "recipe {} declares schema `{}`; this build understands {}",
             source.display(),
-            recipe.schema
+            recipe.schema,
+            SCHEMAS
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(" and ")
         );
     }
     Ok(recipe)
@@ -448,6 +481,23 @@ rocm_runtime = "nightly-7-14-0"
     }
 
     #[test]
+    fn parse_accepts_both_recipe_schema_ids_and_rejects_a_third() {
+        for id in SCHEMAS {
+            let text = SAMPLE.replace("hypercricket.recipe.v1", id);
+            let recipe = parse(&text, Path::new("sample.toml"))
+                .unwrap_or_else(|e| panic!("`{id}` should parse: {e}"));
+            assert_eq!(&recipe.schema, id);
+            assert_eq!(recipe.name, "qwen3-8b-interactive");
+        }
+        let text = SAMPLE.replace("hypercricket.recipe.v1", "hypercricket.recipe.v2");
+        let error = parse(&text, Path::new("sample.toml")).expect_err("v2 is not accepted");
+        let message = error.to_string();
+        for id in SCHEMAS {
+            assert!(message.contains(id), "error should name `{id}`: {message}");
+        }
+    }
+
+    #[test]
     fn parse_rejects_a_structured_engine_arg() {
         // A table would otherwise be flattened into argv the engine misreads.
         let text = SAMPLE.replace("ngl                = 999", "ngl = { value = 999 }");
@@ -655,20 +705,23 @@ rocm_runtime = "nightly-7-14-0"
     }
 
     #[test]
-    fn a_bare_name_resolves_under_the_cli_recipes_directory() {
+    fn a_bare_name_resolves_under_the_permanent_recipes_directory() {
         let paths = AppPaths {
             config_dir: PathBuf::from("/cfg"),
             data_dir: PathBuf::from("/data"),
             cache_dir: PathBuf::from("/cache"),
         };
+        // Not `/cfg/recipes`: that is what `rocm uninstall` deletes.
+        let permanent = paths.recipes_dir();
+        assert_ne!(permanent, PathBuf::from("/cfg/recipes"));
         assert_eq!(
             resolve_path(&paths, "qwen3-8b-interactive"),
-            PathBuf::from("/cfg/recipes/qwen3-8b-interactive.toml")
+            permanent.join("qwen3-8b-interactive.toml")
         );
         // Dotted names are still names, not paths.
         assert_eq!(
             resolve_path(&paths, "qwen3.5-4b"),
-            PathBuf::from("/cfg/recipes/qwen3.5-4b.toml")
+            permanent.join("qwen3.5-4b.toml")
         );
         assert_eq!(
             resolve_path(&paths, "./tuned.toml"),
@@ -677,6 +730,57 @@ rocm_runtime = "nightly-7-14-0"
         assert_eq!(
             resolve_path(&paths, "tuned.toml"),
             PathBuf::from("tuned.toml")
+        );
+    }
+
+    #[test]
+    fn a_scratch_recipe_shadows_the_permanent_one_of_the_same_name() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-recipe-scope-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        // Absent scratch file: the permanent path is what a launch reads, and
+        // what a miss reports — never a cache directory the user never chose.
+        assert_eq!(
+            resolve_path(&paths, "ornith"),
+            paths.recipes_dir().join("ornith.toml")
+        );
+
+        let scratch = paths.temp_recipes_dir();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let experiment = scratch.join("ornith.toml");
+        std::fs::write(&experiment, SAMPLE).unwrap();
+        assert_eq!(
+            resolve_path(&paths, "ornith"),
+            experiment,
+            "an experiment must take effect without editing the measured recipe"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_recipe_names_both_directories_it_looked_in() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("/cfg"),
+            data_dir: PathBuf::from("/data"),
+            cache_dir: PathBuf::from("/cache"),
+        };
+        let error = load(&paths, "nothing-here").expect_err("no such recipe");
+        let text = error.to_string();
+        assert!(
+            text.contains("/cache/recipes"),
+            "names the scratch dir: {text}"
+        );
+        assert!(
+            text.contains(&paths.recipes_dir().display().to_string()),
+            "names the permanent dir: {text}"
         );
     }
 

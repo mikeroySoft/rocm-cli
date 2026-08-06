@@ -38,24 +38,28 @@ impl AppState {
 /// request to `complete()`). Handles ONLY `Openai` and `Anthropic`; `Local`
 /// returns `None` because its build (auto-detect probe → Rig/ChatGPT) is owned
 /// by `event_loop`'s inline path and can't be reproduced from `ResolvedArgs`
-/// alone. Keys come from `ResolvedArgs` (in-process seam), never argv. `None`
-/// signals "couldn't build" (e.g. a missing key) so the caller surfaces an
-/// actionable error turn instead of switching to a dead backend.
+/// alone. Keys and provider enablement come from `ResolvedArgs` (the in-process
+/// seam, never argv). The returned config lets a successful gate selection
+/// transition into the normal accepted chat surface.
 pub(super) fn build_chat_agent(
     provider: ChatProvider,
     args: &ResolvedArgs,
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
     approval_tx: mpsc::UnboundedSender<ClientMsg>,
-) -> Option<std::sync::Arc<dyn crate::agent::AgentClient>> {
+) -> Option<(
+    std::sync::Arc<dyn crate::agent::AgentClient>,
+    crate::llm::LlmConfig,
+)> {
     match provider {
         // Local is rebuilt by the caller's inline path (it needs the live probe).
         ChatProvider::Local => None,
         ChatProvider::Openai => {
+            if !args.openai_enabled {
+                return None;
+            }
             // Require a real key. Without this, `RigAgentClient::new` falls back to
             // a dummy `sk-no-key` bearer and still builds, so the switch reports
-            // success and then 401s at request time. Returning `None` here makes
-            // the caller surface an actionable error and stay on the current
-            // backend instead of switching to a dead one.
+            // success and then 401s at request time.
             let api_key = args.chat_api_key.clone().filter(|k| !k.trim().is_empty())?;
             let cfg = crate::llm::LlmConfig {
                 base_url: OPENAI_BASE_URL.to_string(),
@@ -67,11 +71,17 @@ pub(super) fn build_chat_agent(
                 api_key: Some(api_key),
                 auth_header: None,
             };
-            crate::agent::RigAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+            let client =
+                crate::agent::RigAgentClient::new(cfg.clone(), executor, Some(approval_tx)).ok()?;
+            Some((
+                std::sync::Arc::new(client) as std::sync::Arc<dyn crate::agent::AgentClient>,
+                cfg,
+            ))
         }
         ChatProvider::Anthropic => {
+            if !args.anthropic_enabled {
+                return None;
+            }
             // Leave base_url empty → the Anthropic backend uses rig's default
             // host. model "" → CLAUDE_SONNET_4_6 (resolved inside the backend).
             let cfg = crate::llm::LlmConfig {
@@ -80,9 +90,13 @@ pub(super) fn build_chat_agent(
                 api_key: args.anthropic_api_key.clone(),
                 auth_header: None,
             };
-            crate::agent::AnthropicAgentClient::new(cfg, executor, Some(approval_tx))
-                .ok()
-                .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
+            let client =
+                crate::agent::AnthropicAgentClient::new(cfg.clone(), executor, Some(approval_tx))
+                    .ok()?;
+            Some((
+                std::sync::Arc::new(client) as std::sync::Arc<dyn crate::agent::AgentClient>,
+                cfg,
+            ))
         }
     }
 }

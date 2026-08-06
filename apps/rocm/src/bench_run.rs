@@ -329,6 +329,20 @@ fn attest_line(line: &str, a: &mut Attested, s: &mut AttestScratch) -> bool {
         return true;
     }
 
+    // `sched_reserve: Flash Attention was auto, set to enabled`
+    //
+    // b9752 resolves an `auto` request only when the scheduler reserves, long
+    // after `llama_context: flash_attn = auto` printed the undecided value.
+    // Reading just the latter leaves the knob permanently unknown, so every
+    // `fa` proposal is quarantined as inconclusive and flash-attention can
+    // never be tuned — even though the engine did state what it chose.
+    if let Some((_, rest)) = line.split_once("Flash Attention was auto, set to")
+        && let Some(on) = parse_bool(rest.trim().trim_end_matches('.'))
+    {
+        a.flash_attn = Some(on);
+        return true;
+    }
+
     // Everything else llama.cpp prints at startup is `label: key = value`.
     let Some((lhs, value)) = line.split_once('=') else {
         return false;
@@ -1162,6 +1176,25 @@ ggml_vulkan: Compiling shaders...
             a.unparsed.iter().any(|l| l.contains("auto")),
             "an undecided line must surface in unparsed so the caller sees it"
         );
+    }
+
+    #[test]
+    fn resolved_flash_attn_beats_the_undecided_line() {
+        // b9752 prints both, in this order. Reading only the first leaves `fa`
+        // permanently unknown, which quarantines every flash-attention
+        // proposal as inconclusive instead of confirming the flag took.
+        let a = parse_attested(
+            "0.00.487.709 I llama_context: flash_attn    = auto\n\
+             0.00.505.519 I sched_reserve: Flash Attention was auto, set to enabled\n",
+        );
+        assert_eq!(a.flash_attn, Some(true));
+        assert!(
+            !a.unparsed.iter().any(|l| l.contains("Flash Attention")),
+            "the resolution was read, so it is not a stale-extractor signal"
+        );
+
+        let off = parse_attested("sched_reserve: Flash Attention was auto, set to disabled\n");
+        assert_eq!(off.flash_attn, Some(false));
     }
 
     #[test]

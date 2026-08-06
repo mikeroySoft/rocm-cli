@@ -218,6 +218,24 @@ pub fn default_cache_dir() -> Option<PathBuf> {
         .or_else(|| project_dirs().map(|dirs| dirs.cache_dir().to_path_buf()))
 }
 
+/// Where measured serving recipes live permanently.
+///
+/// Deliberately not derived from `AppPaths`. Every root there is disposable or
+/// mobile: `config_dir` is what `rocm uninstall` removes, `cache_dir` is a
+/// cache, and `data_dir` follows the active managed runtime. A recipe costs
+/// hours of GPU time to produce and describes hardware, not configuration, so
+/// it outlives all three — and resolving it through the config would make it
+/// unfindable in exactly the case that matters, a config directory that is
+/// gone.
+///
+/// `$HOME/ROCm/recipes` by default, beside the weights and optimizer sessions
+/// the recipes refer to. `ROCM_CLI_RECIPES_DIR` overrides it.
+pub fn default_recipes_dir() -> Option<PathBuf> {
+    env_path_override("ROCM_CLI_RECIPES_DIR")
+        .or_else(|| runtime_home_dir().map(|dir| dir.join("ROCm").join("recipes")))
+        .or_else(|| project_dirs().map(|dirs| dirs.data_dir().join("recipes")))
+}
+
 pub fn managed_runtime_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("cache")
 }

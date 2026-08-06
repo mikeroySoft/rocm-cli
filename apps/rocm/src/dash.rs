@@ -14,6 +14,7 @@
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use rocm_dash_tui::ui::launcher::LauncherChoice;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
 use rocm_dash_tui::ui::runtime_manager::RuntimeSummary;
 
-use crate::therock;
+use crate::{serve_recipe, therock};
 
 /// Build the telemetry-daemon options from the unified dashboard config.
 ///
@@ -68,20 +69,28 @@ pub fn runner_options(
     }
 }
 
-/// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
-/// logs); see the chat invariant.
+/// OpenAI API key for the dash chat seam. `ROCMDASH_CHAT_API_KEY` keeps highest
+/// precedence for existing dashboard deployments; otherwise use the shared
+/// provider resolver (`OPENAI_API_KEY`, then the OS secure store).
 ///
-/// Key-sourcing asymmetry (intentional): the chat/OpenAI-compatible key is
-/// env-only (`ROCMDASH_CHAT_API_KEY`, `OPENAI_API_KEY`) — this preserves the
-/// long-standing chat invariant and is deliberately NOT extended to the secure
-/// store. The Anthropic key (see [`anthropic_api_key_for_dash`]) additionally
-/// consults the OS secure store via `provider_keys`, because the Anthropic
-/// provider was added later with secure-store onboarding. Do not "harmonize"
-/// these by adding secure-store lookup here without revisiting the invariant.
-fn chat_api_key_from_env() -> Option<String> {
-    ["ROCMDASH_CHAT_API_KEY", "OPENAI_API_KEY"]
-        .into_iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+/// The key rides in-process through `ResolvedArgs` (NEVER argv or config files).
+/// This makes `rocm config set-provider-key openai` work in the dashboard instead
+/// of leaving the Chat tab stranded on local detection.
+fn openai_api_key_for_dash() -> Option<String> {
+    let dashboard_key = std::env::var("ROCMDASH_CHAT_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let provider_key = crate::provider_keys::resolve_provider_api_key("openai", "OPENAI_API_KEY")
+        .ok()
+        .map(|k| k.value);
+    select_openai_api_key(dashboard_key, provider_key)
+}
+
+fn select_openai_api_key(
+    dashboard_key: Option<String>,
+    provider_key: Option<String>,
+) -> Option<String> {
+    dashboard_key.or(provider_key)
 }
 
 /// Anthropic API key for the dash chat seam — sourced env-first (`ANTHROPIC_API_KEY`)
@@ -98,16 +107,82 @@ fn anthropic_api_key_for_dash() -> Option<String> {
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
 /// serve-wizard picker consumes (the bin owns the `rocm-core` dependency so the
 /// dash crates stay free of it).
-fn model_recipe_summaries() -> Vec<ModelRecipeSummary> {
-    builtin_model_recipes()
+///
+/// Tuned serving recipes found in `recipe_dirs` lead the list. They are the
+/// measured answer for this exact machine, whereas the built-in catalog is a
+/// generic recommendation — and a catalog row that shadowed a tuned one would
+/// serve the same model with none of its measurements.
+///
+/// The directories are an argument, not read from a global, so a test scans a
+/// scratch tree instead of the caller's real recipe folder.
+fn model_recipe_summaries(recipe_dirs: &[PathBuf]) -> Vec<ModelRecipeSummary> {
+    let tuned = serve_recipe_summaries(recipe_dirs);
+    let tuned_ids: BTreeSet<&str> = tuned.iter().map(|s| s.id.as_str()).collect();
+    let catalog = builtin_model_recipes()
         .into_iter()
+        .filter(|r| !tuned_ids.contains(r.canonical_model_id.as_str()))
         .map(|r| ModelRecipeSummary {
             id: r.canonical_model_id,
             aliases: r.aliases,
             task: r.task,
             preferred_engine: r.preferred_engines.into_iter().next(),
+            recipe: None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    [tuned, catalog].concat()
+}
+
+/// Adapt recipe files this build understands (see [`serve_recipe::SCHEMAS`]) into
+/// picker rows that carry their recipe
+/// name, so choosing one emits `--recipe`.
+///
+/// `recipe_dirs` is scanned in the same order `--recipe` resolves — scratch
+/// first, permanent second — so the picker offers exactly what a launch would
+/// use, never a stale twin of it.
+///
+/// Tolerant, like [`runtime_summaries`]: a missing directory, an unreadable
+/// entry, or a file that is not a recipe this build understands is skipped
+/// rather than failing the dashboard launch. Sorted by recipe name so the list
+/// does not reshuffle between runs on directory-iteration order.
+fn serve_recipe_summaries(recipe_dirs: &[PathBuf]) -> Vec<ModelRecipeSummary> {
+    let mut by_name: BTreeMap<String, ModelRecipeSummary> = BTreeMap::new();
+    // Reversed: the permanent entry is inserted first so a scratch entry of the
+    // same name overwrites it.
+    for dir in recipe_dirs.iter().rev() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(recipe) = serve_recipe::parse(&text, &path) else {
+                continue;
+            };
+            // A recipe with no `[model] ref` cannot name a serve target, and the
+            // recipe name is not one — it is a label for the tuning.
+            let Some(id) = recipe.model.model_ref.clone() else {
+                continue;
+            };
+            by_name.insert(
+                recipe.name.clone(),
+                ModelRecipeSummary {
+                    id,
+                    aliases: vec![recipe.name.clone()],
+                    task: "tuned".to_string(),
+                    preferred_engine: recipe.engine.name.clone(),
+                    recipe: Some(recipe.name),
+                },
+            );
+        }
+    }
+    by_name.into_values().collect()
 }
 
 /// Adapt the registered ROCm runtimes into the TUI-local summaries the runtime
@@ -171,9 +246,9 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
 /// Resolve the TUI args from the unified config + environment.
 ///
 /// MUST be called on a synchronous thread *before* any tokio runtime is entered:
-/// the Anthropic-key secure-store fallback ([`anthropic_api_key_for_dash`]) uses
-/// a blocking zbus client that spins its own runtime, which panics ("cannot
-/// start a runtime from within a runtime") if invoked from inside `run_async`.
+/// the OpenAI/Anthropic secure-store fallbacks use a blocking zbus client that
+/// spins its own runtime, which panics ("cannot start a runtime from within a
+/// runtime") if invoked from inside `run_async`.
 /// The sync entry points `run`/`run_chat` call this and pass the result in.
 pub fn resolved_args(
     config: &RocmCliConfig,
@@ -195,11 +270,13 @@ pub fn resolved_args(
         chat_env_url: std::env::var("OPENAI_BASE_URL")
             .ok()
             .filter(|v| !v.is_empty()),
-        chat_api_key: chat_api_key_from_env(),
+        chat_api_key: openai_api_key_for_dash(),
         anthropic_api_key: anthropic_api_key_for_dash(),
+        openai_enabled: config.provider_enabled("openai"),
+        anthropic_enabled: config.provider_enabled("anthropic"),
         chat_auto_consent: false,
         chat_mock: false,
-        model_recipes: model_recipe_summaries(),
+        model_recipes: model_recipe_summaries(&paths.recipe_search_dirs()),
         runtimes: runtime_summaries(paths, config),
         automations: automation_summaries(config),
         // The real executor is injected in `run_async` for a live dash; None
@@ -666,6 +743,23 @@ mod tests {
     }
 
     #[test]
+    fn openai_dashboard_key_falls_back_to_saved_provider_key() {
+        assert_eq!(
+            select_openai_api_key(None, Some("saved-openai-key".to_string())).as_deref(),
+            Some("saved-openai-key")
+        );
+        assert_eq!(
+            select_openai_api_key(
+                Some("dashboard-key".to_string()),
+                Some("saved-openai-key".to_string())
+            )
+            .as_deref(),
+            Some("dashboard-key"),
+            "the dashboard-specific override keeps precedence"
+        );
+    }
+
+    #[test]
     fn runner_options_wires_services_dir_to_registry() {
         let p = paths();
         let opts = runner_options(&cfg(), &p, false);
@@ -844,11 +938,17 @@ mod tests {
     #[test]
     fn model_recipe_summaries_carry_id_and_engine() {
         let records = builtin_model_recipes();
-        let summaries = model_recipe_summaries();
+        // No recipe directories at all: catalog rows only, so this keeps pinning
+        // the catalog adaptation on its own.
+        let summaries = model_recipe_summaries(&[]);
         assert!(!summaries.is_empty());
         assert_eq!(summaries.len(), records.len(), "no recipes dropped");
         // Every summary has a non-empty canonical id (the serve argv target).
         assert!(summaries.iter().all(|s| !s.id.is_empty()));
+        assert!(
+            summaries.iter().all(|s| s.recipe.is_none()),
+            "catalog rows carry no serving recipe"
+        );
         // The preferred engine is actually plumbed (not zeroed) — at least one
         // recipe declares one, and the first summary mirrors its record.
         assert!(
@@ -864,5 +964,129 @@ mod tests {
             first_summary.preferred_engine.as_ref(),
             first.preferred_engines.first()
         );
+    }
+
+    /// A scratch [scratch, permanent] pair under the temp dir.
+    ///
+    /// Never `AppPaths::recipe_search_dirs()`: its permanent entry is the real
+    /// user recipe folder, and a test that writes there destroys measured work.
+    fn scratch_recipe_dirs(tag: &str) -> (PathBuf, [PathBuf; 2]) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-dash-{tag}-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let dirs = [root.join("scratch"), root.join("permanent")];
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        (root, dirs)
+    }
+
+    const TUNED: &str = r#"
+schema = "hypercricket.recipe.v1"
+name   = "ornith-1.0-9b-interactive"
+[model]
+ref     = "deepreinforce-ai/Ornith-1.0-9B"
+weights = "/models/ornith-1.0-9b-Q8_0.gguf"
+[engine]
+name = "lemonade"
+"#;
+
+    #[test]
+    fn tuned_recipes_lead_the_picker_and_carry_their_recipe_name() {
+        let (root, dirs) = scratch_recipe_dirs("tuned");
+        let permanent = &dirs[1];
+        std::fs::write(permanent.join("ornith-1.0-9b-interactive.toml"), TUNED).unwrap();
+        // Not a recipe this build understands, and not TOML at all: both are
+        // skipped rather than sinking the whole picker.
+        std::fs::write(
+            permanent.join("foreign.toml"),
+            "schema = \"hypercricket.recipe.v2\"\nname = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(permanent.join("notes.txt"), "not a recipe").unwrap();
+
+        let summaries = model_recipe_summaries(&dirs);
+
+        let tuned = &summaries[0];
+        assert_eq!(
+            tuned.id, "deepreinforce-ai/Ornith-1.0-9B",
+            "the serve target is the recipe's model ref, not its name"
+        );
+        assert_eq!(tuned.recipe.as_deref(), Some("ornith-1.0-9b-interactive"));
+        assert_eq!(tuned.preferred_engine.as_deref(), Some("lemonade"));
+        assert!(
+            tuned
+                .aliases
+                .contains(&"ornith-1.0-9b-interactive".to_string()),
+            "the recipe name is searchable in the picker filter"
+        );
+        assert_eq!(
+            summaries.iter().filter(|s| s.recipe.is_some()).count(),
+            1,
+            "the foreign-schema and non-TOML files are skipped"
+        );
+        assert!(
+            summaries.len() > 1,
+            "catalog rows still follow the tuned ones"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tuned_recipe_shadows_its_catalog_row() {
+        let (root, dirs) = scratch_recipe_dirs("shadow");
+        // Take a real catalog id so the collision is the one users hit.
+        let claimed = builtin_model_recipes()[0].canonical_model_id.clone();
+        std::fs::write(
+            dirs[1].join("claimed.toml"),
+            TUNED.replace("deepreinforce-ai/Ornith-1.0-9B", &claimed),
+        )
+        .unwrap();
+
+        let summaries = model_recipe_summaries(&dirs);
+
+        let rows: Vec<_> = summaries.iter().filter(|s| s.id == claimed).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row per model, never a tuned/untuned pair"
+        );
+        assert!(
+            rows[0].recipe.is_some(),
+            "the measured row wins over the recommendation"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scratch_recipe_shadows_the_permanent_one_in_the_picker() {
+        // The picker must offer what a launch would actually run. `--recipe`
+        // resolves scratch first, so a picker showing the permanent twin would
+        // name a config the user is not about to get.
+        let (root, dirs) = scratch_recipe_dirs("picker-shadow");
+        std::fs::write(dirs[1].join("ornith-1.0-9b-interactive.toml"), TUNED).unwrap();
+        std::fs::write(
+            dirs[0].join("ornith-1.0-9b-interactive.toml"),
+            TUNED.replace("name = \"lemonade\"", "name = \"vllm\""),
+        )
+        .unwrap();
+
+        let tuned: Vec<_> = model_recipe_summaries(&dirs)
+            .into_iter()
+            .filter(|s| s.recipe.as_deref() == Some("ornith-1.0-9b-interactive"))
+            .collect();
+
+        assert_eq!(tuned.len(), 1, "one row per recipe name, not one per copy");
+        assert_eq!(
+            tuned[0].preferred_engine.as_deref(),
+            Some("vllm"),
+            "the scratch copy is the one a launch would read"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
