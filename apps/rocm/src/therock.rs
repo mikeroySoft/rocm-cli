@@ -4197,7 +4197,7 @@ echo Python 3.12.10
                 channel: manifest.channel.clone(),
                 format: manifest.format.clone(),
                 family: manifest.family.clone(),
-                installed_version: manifest.version.clone(),
+                installed_version: manifest.version,
                 latest_version: None,
                 status: "error".to_owned(),
                 message: Some("temporary DNS failure".to_owned()),

@@ -137,6 +137,8 @@ impl From<LatencyStats> for LatencyOut {
     }
 }
 
+// The `_mib` suffixes are the serialized JSON contract, not redundant naming.
+#[allow(clippy::struct_field_names)]
 #[derive(Serialize)]
 struct VramOut {
     peak_mib: Option<u64>,
@@ -441,9 +443,10 @@ fn engine_argv(
             port.to_string(),
         ]
     } else {
-        let (model_flag, model_value) = weights.map_or(("-hf", model_ref.to_string()), |p| {
-            ("-m", p.display().to_string())
-        });
+        let (model_flag, model_value) = weights.map_or_else(
+            || ("-hf", model_ref.to_string()),
+            |p| ("-m", p.display().to_string()),
+        );
         vec![
             model_flag.into(),
             model_value,
