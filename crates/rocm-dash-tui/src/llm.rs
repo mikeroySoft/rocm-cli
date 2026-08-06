@@ -29,8 +29,8 @@ pub const DEFAULT_CHAT_MODEL: &str = "local-model";
 /// Short, one-shot probe budget so detection never stalls TUI startup.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Fully-resolved chat endpoint configuration. `api_key` is sourced from the
-/// environment only — never from TOML/CLI/source (see `main.rs`).
+/// Fully-resolved chat endpoint configuration. `api_key` is sourced externally
+/// (environment or OS secure store), never from TOML/CLI/source/argv.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LlmConfig {
     pub base_url: String,

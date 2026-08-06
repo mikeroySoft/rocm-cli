@@ -10,11 +10,11 @@
 //! - **Enable / Disable** the selected assistant provider — mutating, routed
 //!   through the approval gate (`rocm config enable-provider|disable-provider`).
 //!
-//! **API keys are NEVER entered or stored here.** Per the chat invariant + D6,
-//! the AMD LLM gateway key (and any provider key the chat surface uses) is
-//! sourced from the environment ONLY — this overlay deliberately offers no
-//! key-entry field and says so. Other config edits (default engine/runtime,
-//! telemetry mode) are documented fast-follows. Zero `std::thread::spawn`/`try_recv`.
+//! **API keys are NEVER entered or stored by this overlay.** Provider keys come
+//! from the session environment or the OS secure store populated by
+//! `rocm config set-provider-key`; this screen deliberately has no key-entry
+//! field. Other config edits (default engine/runtime, telemetry mode) are
+//! documented fast-follows. Zero `std::thread::spawn`/`try_recv`.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -165,7 +165,7 @@ fn activate_selected(c: &mut ConfigManagerState, jobs: &mut State) -> Vec<SideEf
                     format!("{} {}", exe_label(&cmd), args.join(" ")),
                     String::new(),
                     "This changes which assistant providers are enabled. No API key \
-                     is entered or stored — keys are read from the environment only."
+                     is entered here — keys come from the environment or OS secure store."
                         .to_string(),
                 ],
             );
@@ -288,10 +288,10 @@ pub fn draw_config_manager(
         rows[2],
     );
 
-    // The env-only key notice is always visible — this overlay never takes keys.
+    // The key-source notice is always visible — this overlay never takes keys.
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "API keys are read from the environment only — never entered here. \
+            "API keys: environment or OS secure store — never entered here. \
              ↑↓ action · Enter run · Esc close",
             Style::default().fg(theme.muted),
         ))),
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_body_states_keys_are_env_only() {
+    fn approval_body_names_supported_key_sources() {
         let mut cm = Some(ConfigManagerState::default());
         let mut jobs = State::default();
         cm.as_mut().unwrap().action_sel = 1;
@@ -370,8 +370,8 @@ mod tests {
                 .request
                 .body
                 .iter()
-                .any(|l| l.contains("environment only")),
-            "approval must reaffirm the env-only key invariant"
+                .any(|l| { l.contains("environment") && l.contains("OS secure store") }),
+            "approval must name both supported key sources"
         );
     }
 
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_lists_actions_and_env_only_notice() {
+    fn snapshot_lists_actions_and_key_source_notice() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let theme = Theme::from_name("default-dark");
@@ -480,6 +480,6 @@ mod tests {
         assert!(out.contains("Config & providers"));
         assert!(out.contains("Show saved config"));
         assert!(out.contains("Enable provider"));
-        assert!(out.contains("environment only"));
+        assert!(out.contains("environment or OS secure store"));
     }
 }

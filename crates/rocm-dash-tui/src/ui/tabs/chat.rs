@@ -57,6 +57,22 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ),
         Span::styled("detect a local engine", Style::default().fg(theme.fg)),
     ]);
+    let provider_hint = Line::from(vec![
+        Span::styled(
+            "[o] ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("OpenAI    ", Style::default().fg(theme.fg)),
+        Span::styled(
+            "[a] ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Anthropic", Style::default().fg(theme.fg)),
+    ]);
 
     let (title, lines): (&str, Vec<Line>) = if state.chat_detecting {
         (
@@ -109,9 +125,15 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             ],
         )
     } else {
-        // Normal consent gate, with a detect affordance + last-attempt message.
+        // Normal consent gate: cloud-provider choices remain reachable even
+        // when no local endpoint exists, followed by local detection.
         let (title, mut lines) = consent_gate_lines(state, theme, endpoint);
         lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Use an enabled cloud provider:",
+            Style::default().fg(theme.muted),
+        )));
+        lines.push(provider_hint);
         lines.push(detect_hint);
         if let Some(m) = state.chat_detect_msg.as_ref() {
             lines.push(Line::from(Span::styled(
@@ -531,6 +553,21 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn unavailable_gate_offers_remote_providers() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        let out = render_str(&mut s);
+        assert!(out.contains("OpenAI"), "OpenAI action must be visible");
+        assert!(
+            out.contains("Anthropic"),
+            "Anthropic action must be visible"
+        );
+        assert!(
+            out.contains("detect a local engine"),
+            "local detection remains available"
+        );
     }
 
     #[test]

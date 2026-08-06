@@ -107,6 +107,11 @@ pub struct ServeWizardState {
     pub approval: Option<PendingServe>,
     /// In-flight (or just-finished) launch job id.
     pub active_job: Option<String>,
+    /// Serving recipe to replay (`rocm serve --recipe`), set by picking a tuned
+    /// row. Cleared whenever the model is edited by hand: a recipe pins weights
+    /// and flags measured for one model, so carrying it onto a different one
+    /// would serve the wrong file under the right name.
+    pub recipe: Option<String>,
     /// Transient validation message (e.g. empty model / bad port).
     pub message: Option<String>,
 }
@@ -125,6 +130,7 @@ impl Default for ServeWizardState {
             picker: None,
             approval: None,
             active_job: None,
+            recipe: None,
             message: None,
         }
     }
@@ -151,7 +157,10 @@ impl ServeWizardState {
 
     fn type_char(&mut self, c: char) {
         match self.current_field() {
-            Field::Model => self.model.push(c),
+            Field::Model => {
+                self.model.push(c);
+                self.recipe = None;
+            }
             Field::Host => self.host.push(c),
             // Port accepts digits only — never builds an unparseable `--port`.
             Field::Port if c.is_ascii_digit() => self.port.push(c),
@@ -163,6 +172,7 @@ impl ServeWizardState {
         match self.current_field() {
             Field::Model => {
                 self.model.pop();
+                self.recipe = None;
             }
             Field::Host => {
                 self.host.pop();
@@ -183,6 +193,13 @@ impl ServeWizardState {
         let mut args = vec!["serve".to_string(), model.to_string()];
         args.push("--engine".to_string());
         args.push(ENGINES[self.engine_idx.min(ENGINES.len() - 1)].to_string());
+        // A recipe supplies weights, engine binary, engine device, and every
+        // measured flag; `--engine` above only fills what the recipe omits, and
+        // the CLI reports any value it overrides.
+        if let Some(recipe) = self.recipe.as_deref() {
+            args.push("--recipe".to_string());
+            args.push(recipe.to_string());
+        }
         // Index 0 = engine default → omit --device.
         if self.device_idx > 0 {
             args.push("--device".to_string());
@@ -243,6 +260,14 @@ pub fn on_key(
         match picker.on_key(key.code, recipes) {
             PickerOutcome::Chosen(summary) => {
                 w.model = summary.id;
+                // A tuned row carries its recipe onto the launch; a catalog row
+                // clears any recipe left from an earlier pick, so the argv can
+                // never pair one model with another model's measurements.
+                w.recipe = summary.recipe;
+                w.message = w
+                    .recipe
+                    .as_deref()
+                    .map(|name| format!("recipe {name} will be applied"));
                 // Pre-select the recipe's preferred engine when it is one this
                 // wizard lists; otherwise leave the engine choice untouched.
                 if let Some(eng) = summary.preferred_engine
@@ -263,6 +288,7 @@ pub fn on_key(
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
                 w.model = path.to_string_lossy().into_owned();
+                w.recipe = None;
                 w.browser = None;
             }
             FolderOutcome::Cancelled => w.browser = None,
@@ -604,6 +630,118 @@ mod tests {
     }
 
     #[test]
+    fn build_args_replays_a_selected_recipe() {
+        let w = ServeWizardState {
+            model: "deepreinforce-ai/Ornith-1.0-9B".into(),
+            recipe: Some("ornith-1.0-9b-interactive".into()),
+            ..Default::default()
+        };
+        let args = w.build_args().unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "deepreinforce-ai/Ornith-1.0-9B",
+                "--engine",
+                "lemonade",
+                "--recipe",
+                "ornith-1.0-9b-interactive",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
+                "--managed",
+            ]
+        );
+    }
+
+    #[test]
+    fn picking_a_tuned_recipe_carries_it_onto_the_launch() {
+        let recipes = vec![ModelRecipeSummary {
+            id: "deepreinforce-ai/Ornith-1.0-9B".into(),
+            aliases: vec!["ornith-1.0-9b-interactive".into()],
+            task: "tuned".into(),
+            preferred_engine: Some("lemonade".into()),
+            recipe: Some("ornith-1.0-9b-interactive".into()),
+        }];
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter)); // open picker
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter)); // choose it
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "deepreinforce-ai/Ornith-1.0-9B");
+        assert_eq!(w.recipe.as_deref(), Some("ornith-1.0-9b-interactive"));
+        assert!(w.build_args().unwrap().contains(&"--recipe".to_string()));
+    }
+
+    #[test]
+    fn editing_the_model_drops_a_recipe_tuned_for_the_old_one() {
+        // The trap this guards: pick a tuned row, then retype the model. Keeping
+        // the recipe would serve the previous model's measured weights under the
+        // new name — fast, quiet, and wrong.
+        let recipes = vec![ModelRecipeSummary {
+            id: "GLM-4".into(),
+            aliases: vec![],
+            task: "tuned".into(),
+            preferred_engine: None,
+            recipe: Some("glm-4-interactive".into()),
+        }];
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter));
+        assert!(wiz.as_ref().unwrap().recipe.is_some());
+
+        // Field 0 is Model; a single keystroke on it invalidates the pairing.
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Backspace));
+        let w = wiz.as_ref().unwrap();
+        assert!(w.recipe.is_none(), "backspace on Model clears the recipe");
+        assert!(!w.build_args().unwrap().contains(&"--recipe".to_string()));
+
+        for k in typed("x") {
+            on_key(&mut wiz, &mut jobs, &recipes, k);
+        }
+        assert!(
+            wiz.as_ref().unwrap().recipe.is_none(),
+            "typing on Model clears the recipe"
+        );
+    }
+
+    #[test]
+    fn picking_a_catalog_row_clears_an_earlier_recipe() {
+        let recipes = vec![
+            ModelRecipeSummary {
+                id: "tuned-model".into(),
+                aliases: vec![],
+                task: "tuned".into(),
+                preferred_engine: None,
+                recipe: Some("tuned-model-interactive".into()),
+            },
+            ModelRecipeSummary {
+                id: "plain-model".into(),
+                aliases: vec![],
+                task: "chat".into(),
+                preferred_engine: None,
+                recipe: None,
+            },
+        ];
+        // Reopening the picker seeds its filter from the model field, which
+        // would narrow back to the tuned row; start from the state that matters
+        // instead — a recipe already held, picker open, filter clear.
+        let mut wiz = Some(ServeWizardState {
+            recipe: Some("tuned-model-interactive".into()),
+            picker: Some(ModelPicker::default()),
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Down));
+        on_key(&mut wiz, &mut jobs, &recipes, key(KeyCode::Enter)); // catalog row
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "plain-model");
+        assert!(w.recipe.is_none(), "a catalog row carries no tuning");
+    }
+
+    #[test]
     fn build_args_includes_device_when_not_default_and_foreground() {
         let w = ServeWizardState {
             model: "glm".into(),
@@ -833,6 +971,7 @@ mod tests {
             aliases: vec!["glm".into()],
             task: "chat".into(),
             preferred_engine: Some("vllm".into()),
+            recipe: None,
         }];
         let mut wiz = Some(ServeWizardState::default()); // field 0 = Model
         let mut jobs = State::default();
@@ -869,6 +1008,7 @@ mod tests {
             aliases: vec![],
             task: "chat".into(),
             preferred_engine: Some("not-in-engines-list".into()),
+            recipe: None,
         }];
         let mut wiz = Some(ServeWizardState::default()); // engine_idx 0 = lemonade
         let mut jobs = State::default();
@@ -890,12 +1030,14 @@ mod tests {
                 aliases: vec!["qwen".into()],
                 task: "chat".into(),
                 preferred_engine: None,
+                recipe: None,
             },
             ModelRecipeSummary {
                 id: "GLM-4".into(),
                 aliases: vec!["glm".into()],
                 task: "chat".into(),
                 preferred_engine: None,
+                recipe: None,
             },
         ];
         let mut wiz = Some(ServeWizardState::default());
@@ -920,6 +1062,7 @@ mod tests {
             aliases: vec![],
             task: "chat".into(),
             preferred_engine: None,
+            recipe: None,
         }];
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();

@@ -358,7 +358,8 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         /// locally built `llama-server`.
         #[arg(long, value_name = "PATH")]
         engine_binary: Option<PathBuf>,
-        /// Tuned serving recipe to replay: a `hypercricket.recipe.v1` name under the CLI
+        /// Tuned serving recipe to replay: a `hyperloom-r.recipe.v1` (or legacy
+        /// `hypercricket.recipe.v1`) name under the CLI
         /// recipes directory, or a path to one. Supplies weights, engine binary, device,
         /// and engine args; the flags above override it, and each override is reported.
         #[arg(long, value_name = "NAME|PATH")]

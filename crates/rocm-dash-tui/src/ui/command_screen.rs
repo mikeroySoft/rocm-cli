@@ -58,9 +58,9 @@ fn parse_args(input: &str) -> Vec<String> {
 
 /// Whether the argv looks like it carries (or sets) a secret — so the approval
 /// modal can warn that a key passed as an argument would be exposed in the
-/// process argv and the job log. Defends the env-only key invariant at the one
-/// place the TUI accepts freeform text: the escape hatch never *stores* a key,
-/// but it should not let one slip through unflagged.
+/// process argv and the job log. Defends the external-key-source invariant at
+/// the one place the TUI accepts freeform text: the escape hatch never *stores*
+/// a key, but it should not let one slip through unflagged.
 fn looks_secret_bearing(args: &[String]) -> bool {
     args.iter().any(|a| {
         let a = a.to_ascii_lowercase();

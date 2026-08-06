@@ -45,9 +45,29 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_TOOL_TURNS: usize = 5;
 
 /// Max tokens the model may emit in its final answer. Shared by all three
-/// backends (RigAgentClient, ChatGptAgentClient, AnthropicAgentClient) so the
-/// budget is defined once. `u64` to match rig's `AgentBuilder::max_tokens`.
+/// backends so the budget is defined once.
 const MAX_AGENT_TOKENS: u64 = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiTokenLimit {
+    MaxTokens(u64),
+    MaxCompletionTokens(u64),
+}
+
+/// GPT-5 Chat Completions rejects the legacy `max_tokens` field. Keep local and
+/// older OpenAI-compatible models on that widely-supported field while using
+/// `max_completion_tokens` for the GPT-5 family.
+fn openai_token_limit(model: &str) -> OpenAiTokenLimit {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    let is_gpt5 = model.strip_prefix("gpt-5").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.starts_with('-') || suffix.starts_with('.')
+    });
+    if is_gpt5 {
+        OpenAiTokenLimit::MaxCompletionTokens(MAX_AGENT_TOKENS)
+    } else {
+        OpenAiTokenLimit::MaxTokens(MAX_AGENT_TOKENS)
+    }
+}
 
 /// Default system preamble for the dashboard assistant.
 const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
@@ -1021,11 +1041,13 @@ impl AgentClient for RigAgentClient {
         let snap = Arc::new(snapshot);
         let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
-        let agent = self
-            .client
-            .agent(&self.model)
-            .preamble(&self.preamble)
-            .max_tokens(MAX_AGENT_TOKENS);
+        let agent = self.client.agent(&self.model).preamble(&self.preamble);
+        let agent = match openai_token_limit(&self.model) {
+            OpenAiTokenLimit::MaxTokens(limit) => agent.max_tokens(limit),
+            OpenAiTokenLimit::MaxCompletionTokens(limit) => {
+                agent.additional_params(serde_json::json!({ "max_completion_tokens": limit }))
+            }
+        };
         // Telemetry + skill registry tools (shared registration site).
         let agent = register_telemetry_tools(agent, &snap, &fired);
         // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -1166,9 +1188,9 @@ where
 
 /// No-key ChatGPT backend over Rig's native `chatgpt` OAuth provider.
 ///
-/// This is the no-key default that restores the ChatGPT device-login the vendored Codex
-/// path provided. It takes NO api_key (the env-only key invariant is untouched:
-/// this path authenticates with an OAuth device-code flow, not a key). The
+/// This is the no-key default that restores the ChatGPT device-login the vendored
+/// Codex path provided. It takes NO api_key: this path authenticates with an
+/// OAuth device-code flow instead.
 /// `on_device_code` callback surfaces the verification URL + user code so the
 /// chat tab can show the operator how to sign in; the resulting token is
 /// persisted by the provider so re-launches don't re-prompt.
@@ -1470,6 +1492,24 @@ mod tests {
     use super::*;
     use rocm_dash_core::bench_schema::{BenchmarkRow, PassFail};
     use rocm_dash_core::metrics::{GpuMetrics, Instance, Snapshot};
+
+    #[test]
+    fn gpt5_uses_max_completion_tokens() {
+        for model in ["gpt-5", "gpt-5-mini", "gpt-5.1", "openai/gpt-5"] {
+            assert_eq!(
+                openai_token_limit(model),
+                OpenAiTokenLimit::MaxCompletionTokens(MAX_AGENT_TOKENS),
+                "{model}"
+            );
+        }
+        for model in ["local-model", "gpt-4o", "gpt-50"] {
+            assert_eq!(
+                openai_token_limit(model),
+                OpenAiTokenLimit::MaxTokens(MAX_AGENT_TOKENS),
+                "{model}"
+            );
+        }
+    }
 
     fn fixture_snapshot() -> StateSnapshot {
         let snap = Snapshot {
@@ -2030,8 +2070,8 @@ mod tests {
     fn chatgpt_oauth_client_builds_offline_without_taking_a_key() {
         // Construction is offline (login is deferred to authorize() in
         // complete()); the device-code callback is wired but not yet invoked.
-        // Crucially, the constructor signature takes NO api_key — the env-only
-        // key invariant is structurally preserved on the no-key path.
+        // Crucially, the constructor signature takes NO api_key; OAuth stays
+        // separate from the externally sourced provider-key paths.
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
         let client = ChatGptAgentClient::new(
