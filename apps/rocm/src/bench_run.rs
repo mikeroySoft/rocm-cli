@@ -672,7 +672,12 @@ fn wait_ready(
         // Not the engine name: bench run drives whatever binary it is pointed
         // at, so this is the generic `/v1/models` probe. Backend attestation
         // comes from the startup log, never from a health payload.
+        //
+        // A bench target is only ready when it can answer a request: a listing
+        // response means the model is named, not that a measurement taken now
+        // would be of a loaded model.
         if crate::wait_for_service_http_ready("bench", "127.0.0.1", port, model, None, READY_PROBE)
+            == crate::EndpointReadiness::Serving
         {
             return (true, false);
         }
