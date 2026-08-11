@@ -31,10 +31,11 @@ pub mod examine;
 pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod redact;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, MatchState, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE};
@@ -43,6 +44,7 @@ pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
 };
+pub use redact::{Redactor, env_is_exportable, key_is_sensitive};
 use runtime::env_path_override;
 #[cfg(test)]
 use runtime::home_rocm_dir;
@@ -4374,15 +4376,39 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Persist the config, atomically.
+    ///
+    /// Written to a sibling temporary file and renamed over the target, so a
+    /// crash or a full disk mid-write leaves the previous config intact. An
+    /// in-place `fs::write` truncates first: interrupt it and the machine
+    /// loses `active_runtime_key` and `previous_runtime_key` together, which
+    /// is the one moment activation must not be able to fail.
+    ///
+    /// `rename` is atomic within a filesystem, and the temporary file is a
+    /// sibling precisely so it cannot land on another one.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes =
+            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
+
+        let temporary = paths.config_dir.join(format!(
+            "config.json.tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::write(&temporary, &bytes)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            // Best effort: a leftover temp file is untidy, but the rename
+            // failure is the error worth reporting.
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+        }
         Ok(())
     }
 

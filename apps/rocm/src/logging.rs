@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 /// File name prefix for the daily-rotated client log
 /// (`~/.rocm/logs/rocm-cli.log.<date>`), sibling to the daemon's
 /// `rocmdashd.log` under the same canonical `AppPaths` root.
-const LOG_FILE_PREFIX: &str = "rocm-cli.log";
+pub(crate) const LOG_FILE_PREFIX: &str = "rocm-cli.log";
 
 /// Total number of daily log files retained on disk, INCLUDING today's
 /// actively-written file; older ones are pruned on startup so a long-lived

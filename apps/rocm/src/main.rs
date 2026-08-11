@@ -2,12 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
+mod app_contract;
+mod app_logs;
 mod automations;
 mod bootstrap;
 mod comfyui;
 mod dash;
 mod dash_seam;
 mod endpoint_keys;
+mod install_app;
 mod logging;
 mod provider_keys;
 mod providers;
@@ -181,6 +184,63 @@ enum Command {
     InternalBridgeSnapshot {
         #[arg(long)]
         pretty: bool,
+    },
+    /// Emit the versioned app-facing snapshot consumed by ROCm App.
+    ///
+    /// Hidden: this is a machine contract between the CLI and the desktop app,
+    /// not a user-facing command. `rocm examine --json` remains the documented
+    /// diagnostic surface and is unchanged.
+    #[command(name = "app-snapshot", hide = true)]
+    InternalAppSnapshot {
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Emit bounded, redacted log records for ROCm App.
+    ///
+    /// Hidden: a machine contract, like `app-snapshot`. `rocm logs` remains the
+    /// documented human surface and is unchanged. `--json` selects the compact
+    /// form the app parses; without it the same payload is printed pretty, for
+    /// a human checking why the app and the CLI disagree.
+    #[command(name = "app-logs", hide = true)]
+    InternalAppLogs {
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        #[arg(long)]
+        severity: Option<String>,
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        page: usize,
+        #[arg(long)]
+        page_size: Option<usize>,
+        #[arg(long)]
+        reveal_locations: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Emit the app-facing diagnosis, without the fix commands.
+    ///
+    /// Hidden: a machine contract. `rocm diagnose` is the documented surface and
+    /// keeps its `commands` field; this one omits it, because the app plans by
+    /// fix id and must never hold argv.
+    #[command(name = "app-diagnose", hide = true)]
+    InternalAppDiagnose {
+        #[arg(long)]
+        symptom: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a redacted support bundle and print its manifest.
+    #[command(name = "app-support-bundle", hide = true)]
+    InternalAppSupportBundle {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        symptom: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     #[command(name = "sandbox-run", hide = true)]
     InternalSandboxRun {
@@ -536,6 +596,30 @@ rocm install sdk --family gfx110X-all --dry-run")]
         #[arg(long)]
         reconcile: bool,
     },
+    /// Install ROCm App, the desktop tray application.
+    ///
+    /// This is the only command that installs ROCm App. Installing the CLI on
+    /// its own never installs it.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm install app --dry-run\n  \
+rocm install app --yes\n\n\
+Installing ROCm App also installs a matching rocm command-line tool.\n\
+No driver is installed, updated, or modified.")]
+    App {
+        /// Show the exact plan without downloading or installing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking. Required when stdin is not a terminal.
+        #[arg(long)]
+        yes: bool,
+        /// Read the release manifest from a local file instead of the network.
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<std::path::PathBuf>,
+        /// Accept a release manifest older than 90 days. The staleness
+        /// refusal becomes a warning shown with the install plan.
+        #[arg(long)]
+        allow_stale_manifest: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -589,6 +673,11 @@ enum RuntimesCommand {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
+    /// Check that a ROCm install is usable without changing it.
+    Validate {
+        /// Runtime key or friendly runtime selector.
+        runtime: String,
+    },
     /// Switch back to the previously selected ROCm install.
     Rollback,
     /// Remove a ROCm install from ROCm CLI.
@@ -596,6 +685,9 @@ enum RuntimesCommand {
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Confirm removal for callers that review mutations before execution.
+        #[arg(long)]
+        yes: bool,
     },
     /// Add a ROCm install from a saved manifest file.
     Import {
@@ -878,18 +970,41 @@ impl PermissionsModeArg {
     }
 }
 
+/// Read-only, machine-readable probes that ROCm App runs on a schedule.
+///
+/// They are exempt from file logging for two reasons that both matter. A first
+/// run must be able to report "nothing has run yet" without *creating* the data
+/// directory it is reporting on, and a monitor polling every minute must not
+/// fill the log a user opens with the act of opening it.
+const APP_PROBE_COMMANDS: [&str; 4] = [
+    "app-snapshot",
+    "app-logs",
+    "app-diagnose",
+    "app-support-bundle",
+];
+
+fn is_app_probe(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|first| APP_PROBE_COMMANDS.contains(&first.as_str()))
+}
+
 fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
     // Held for the whole process lifetime: dropping it flushes and stops the
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let _log_guard = AppPaths::discover()
-        .ok()
-        .and_then(|paths| logging::init(&paths));
+    let _log_guard = if is_app_probe(&raw_args) {
+        None
+    } else {
+        AppPaths::discover()
+            .ok()
+            .and_then(|paths| logging::init(&paths))
+    };
 
     maybe_migrate_legacy_dashboard_config();
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
     }
@@ -1390,6 +1505,73 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::InternalAppSnapshot { pretty }) => {
+            let paths = AppPaths::discover()?;
+            let config = RocmCliConfig::load(&paths)?;
+            let snapshot =
+                app_contract::build_snapshot(app_contract::gather_inputs(&paths, &config)?);
+            if pretty {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!("{}", serde_json::to_string(&snapshot)?);
+            }
+            Ok(())
+        }
+        Some(Command::InternalAppLogs {
+            sources,
+            severity,
+            since_unix_ms,
+            search,
+            page,
+            page_size,
+            reveal_locations,
+            json,
+        }) => {
+            let paths = AppPaths::discover()?;
+            let query = app_logs::LogsQuery {
+                sources: sources
+                    .iter()
+                    .map(|value| {
+                        app_logs::SourceId::parse(value)
+                            .with_context(|| format!("unknown log source: {value}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                min_severity: severity
+                    .as_deref()
+                    .map(|value| {
+                        app_logs::Severity::from_token(value)
+                            .with_context(|| format!("unknown severity: {value}"))
+                    })
+                    .transpose()?,
+                since_unix_ms,
+                search,
+                page,
+                page_size,
+                reveal_locations,
+            };
+            let redactor = rocm_core::Redactor::from_host();
+            let inputs = app_logs::gather_logs(&paths, &redactor);
+            app_logs::print_json(&app_logs::build_logs(inputs, &query), json)
+        }
+        Some(Command::InternalAppDiagnose { symptom, json }) => {
+            let redactor = rocm_core::Redactor::from_host();
+            let (_, diagnosis) =
+                app_logs::diagnose_host(symptom.as_deref().unwrap_or_default(), &redactor);
+            app_logs::print_json(&diagnosis, json)
+        }
+        Some(Command::InternalAppSupportBundle { out, symptom, json }) => {
+            let paths = AppPaths::discover()?;
+            let config = RocmCliConfig::load(&paths)?;
+            let redactor = rocm_core::Redactor::from_host();
+            let response = app_logs::write_support_bundle(
+                &paths,
+                &config,
+                &out,
+                symptom.as_deref().unwrap_or_default(),
+                &redactor,
+            )?;
+            app_logs::print_json(&response, json)
+        }
         Some(Command::InternalSandboxRun {
             tool,
             service_id,
@@ -1757,6 +1939,7 @@ fn refresh_startup_update_check_quietly() {
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let _ =
         therock::maybe_refresh_startup_update_check(&paths, config.active_runtime_key.as_deref());
+    let _ = therock::maybe_refresh_available_versions(&paths, config.active_runtime_key.as_deref());
 }
 
 fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -2181,7 +2364,118 @@ fn install(target: InstallTarget) -> Result<()> {
                 }
             }
         }
+        InstallTarget::App {
+            dry_run,
+            yes,
+            manifest,
+            allow_stale_manifest,
+        } => {
+            install_app_command(
+                &paths,
+                dry_run,
+                yes,
+                manifest.as_deref(),
+                allow_stale_manifest,
+            )?;
+        }
     }
+    Ok(())
+}
+
+/// `rocm install app`.
+///
+/// Dry-run and apply render the **same** plan text, so what a user reviews is
+/// exactly what they approve. Apply additionally requires confirmation:
+/// interactively a typed `yes`, non-interactively the explicit `--yes` flag —
+/// the same convention every other mutating command in this CLI uses.
+fn install_app_command(
+    paths: &AppPaths,
+    dry_run: bool,
+    yes: bool,
+    manifest_path: Option<&std::path::Path>,
+    allow_stale_manifest: bool,
+) -> Result<()> {
+    let host = install_app::TargetHost::detect();
+    // Before any network access: an unsupported host should not announce
+    // itself to a download server just to be refused.
+    host.ensure_supported()?;
+
+    let policy = install_app::AppTrustPolicy::from_env();
+    let raw = match manifest_path {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("could not read app release manifest {}", path.display()))?,
+        None => bail!(
+            "no app release manifest source is configured.\n\
+             Pass --manifest <path> with a signed release manifest, or set \
+             ROCM_CLI_APP_MANIFEST_URL once release hosting is published."
+        ),
+    };
+
+    let manifest = install_app::parse_manifest(&raw)?;
+    let plan = install_app::build_plan(
+        &manifest,
+        &host,
+        &policy,
+        install_app::default_install_root(paths),
+        allow_stale_manifest,
+    )?;
+
+    print!("{}", plan.render());
+    if dry_run {
+        println!("  result: dry run, nothing was downloaded or installed");
+        return Ok(());
+    }
+
+    if !yes {
+        if !rocm_core::interactive_terminal() {
+            bail!("`rocm install app` needs approval. Re-run with --yes to apply without asking.");
+        }
+        print!("Install ROCm App with the plan above? [y/N]: ");
+        io::stdout()
+            .flush()
+            .context("failed to flush install prompt")?;
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .context("failed to read install confirmation")?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("  result: cancelled, nothing was downloaded or installed");
+            return Ok(());
+        }
+    }
+
+    let launcher = install_app::ProcessLauncher { os: host.os };
+    let declared_size_bytes = plan.asset.size_bytes;
+    let fetch = |url: &str| -> Result<Vec<u8>> {
+        let response = ureq::get(url)
+            .call()
+            .with_context(|| format!("could not download {url}"))?;
+        // Capped at the manifest's declared size plus one byte: an endless
+        // response body must become a size mismatch reported by
+        // verify_asset_bytes, not memory exhaustion before verification.
+        Ok(install_app::read_capped(
+            response.into_reader(),
+            declared_size_bytes,
+        )?)
+    };
+
+    let executed = install_app::apply(&install_app::ApplyInputs {
+        plan: &plan,
+        policy: &policy,
+        fetch: &fetch,
+        launcher: &launcher,
+        scratch_parent: &paths.cache_dir,
+    })?;
+
+    println!("  result: installed from {}", executed.display());
+    record_cli_audit_event(
+        paths,
+        "app",
+        "install_app",
+        "info",
+        format!("ROCm App {} installed", plan.app_version),
+        None,
+    );
     Ok(())
 }
 
@@ -5444,6 +5738,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
+        RuntimesCommand::Validate { runtime } => {
+            let manifest = check_runtime(&paths, &runtime)?;
+            println!("runtime check passed");
+            println!("  runtime_id: {}", manifest.runtime_id);
+            println!("  runtime_key: {}", manifest.runtime_key);
+            println!("  version: {}", manifest.version);
+        }
         RuntimesCommand::Rollback => {
             let result = rollback_runtime(&paths, &mut config)?;
             println!("runtime rolled back");
@@ -5470,7 +5771,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall { runtime } => {
+        RuntimesCommand::Uninstall { runtime, yes: _ } => {
             let result = uninstall_runtime(&paths, &mut config, &runtime)?;
             println!("runtime removed");
             println!("  runtime_id: {}", result.runtime_id);
@@ -5915,6 +6216,13 @@ fn uninstall_runtime(
                 )
             })?;
         }
+    } else {
+        // The marker is only deleted when the runtime being removed is the
+        // *active* one. Removing the runtime the marker names as `previous`
+        // left the config field cleared above and the marker still pointing at
+        // a runtime that no longer exists — a rollback target that would fail
+        // the moment anyone used it.
+        clear_previous_runtime_marker(paths, &manifest.runtime_key)?;
     }
 
     Ok(RuntimeUninstallResult {
@@ -5954,10 +6262,45 @@ fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) 
         && paths_equivalent(&local.install_root, &manifest.install_root))
 }
 
+/// Drop a stale `previous` pointer from the active-runtime marker.
+///
+/// A no-op unless the marker names exactly this runtime as its previous, so
+/// an unreadable or absent marker is left alone rather than rewritten.
+fn clear_previous_runtime_marker(paths: &AppPaths, runtime_key: &str) -> Result<()> {
+    let marker_path = active_runtime_marker_path(paths);
+    if !marker_path.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(&marker_path)
+        .with_context(|| format!("failed to read {}", marker_path.display()))?;
+    let mut marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
+    if !marker
+        .previous_runtime_key
+        .as_deref()
+        .is_some_and(|key| key.eq_ignore_ascii_case(runtime_key))
+    {
+        return Ok(());
+    }
+    marker.previous_runtime_id = None;
+    marker.previous_runtime_key = None;
+    write_active_runtime_marker(paths, marker)
+}
+
 fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
         bail!(
             "refusing to remove unsafe runtime folder {}",
+            path.display()
+        );
+    }
+    // `rocm_core` already owns the list of locations nothing may recursively
+    // delete — `/`, `/usr`, `/opt`, `C:\Windows`, and the rest. It was written
+    // for exactly this check and was simply not wired to it, so a manifest
+    // pointing at a system directory reached `remove_dir_all` unchallenged.
+    if rocm_core::runtime_install_root_is_protected(path) {
+        bail!(
+            "refusing to remove protected system folder {}",
             path.display()
         );
     }
@@ -6842,11 +7185,21 @@ fn select_runtime_manifest<'a>(
         bail!("runtime selector must not be empty");
     }
 
-    if let Some(manifest) = manifests
+    // Exact keys are matched first, and duplicates are refused rather than
+    // resolved to whichever manifest happened to sort first. Two registry
+    // entries claiming one key means something already went wrong; picking one
+    // at random compounds it, and the caller may be about to delete it.
+    let exact = manifests
         .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
-    {
-        return Ok(manifest);
+        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [manifest] => return Ok(manifest),
+        [] => {}
+        _ => bail!(
+            "runtime_key `{selector}` matches {} installed runtimes; the runtime registry has duplicate entries and must be repaired before this runtime can be changed",
+            exact.len()
+        ),
     }
 
     let matches = manifests
@@ -6867,6 +7220,21 @@ fn select_runtime_manifest<'a>(
             );
         }
     }
+}
+
+fn check_runtime(paths: &AppPaths, selector: &str) -> Result<therock::InstalledRuntimeManifest> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, selector)?;
+    validate_runtime_manifest_for_activation(manifest)?;
+    if manifest.format == "wheel" {
+        let python = manifest
+            .python_executable
+            .as_deref()
+            .context("pip runtime manifest is missing python_executable")?;
+        let probe = therock::probe_rocm_sdk_runtime(Path::new(python))?;
+        therock::validate_rocm_sdk_runtime_probe(&probe)?;
+    }
+    Ok(manifest.clone())
 }
 
 pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManifest) -> String {
@@ -16228,6 +16596,10 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "status",
         "completions",
         "bridge-snapshot",
+        "app-snapshot",
+        "app-logs",
+        "app-diagnose",
+        "app-support-bundle",
         "sandbox-run",
         "mcp-call",
         "__engine-serve-http",
@@ -16282,6 +16654,70 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `treat_as_natural_language`'s `STRUCTURED` list is a second, hand-kept
+    /// copy of the clap subcommand names. When they drift, the missing verb is
+    /// not rejected — it is silently swallowed by the natural-language planner
+    /// and answered with a "no action selected" plan, which reads like the
+    /// command ran and did nothing. Adding `app-snapshot` hit exactly that, so
+    /// the two lists are now pinned together.
+    #[test]
+    fn app_contract_structured_list_covers_every_subcommand() {
+        let unlisted: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .filter(|name| treat_as_natural_language(std::slice::from_ref(name)))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "these clap subcommands are routed to the natural-language planner \
+             instead of being dispatched; add them to STRUCTURED: {unlisted:?}"
+        );
+    }
+
+    /// Found by running the built binary against an empty root, not by a unit
+    /// test: `main` initialised the rotating file log before dispatching, so
+    /// `app-logs` created the very data directory a first run is supposed to
+    /// report as absent, and then reported its own log file as an available
+    /// source. The producer's own tests passed throughout — they exercise the
+    /// builder, not the process.
+    #[test]
+    fn app_probe_commands_are_exempt_from_creating_a_logs_directory() {
+        for probe in APP_PROBE_COMMANDS {
+            assert!(
+                is_app_probe(&[probe.to_owned()]),
+                "{probe} would initialise file logging"
+            );
+            assert!(
+                is_app_probe(&[probe.to_owned(), "--json".to_owned()]),
+                "{probe} with flags"
+            );
+        }
+        // Everything else still logs. A monitor polling every minute is the
+        // exception; a user running a command is exactly what the log is for.
+        for ordinary in ["examine", "diagnose", "install", "runtimes", "logs", "fix"] {
+            assert!(!is_app_probe(&[ordinary.to_owned()]), "{ordinary}");
+        }
+        assert!(!is_app_probe(&[]));
+        // A probe name appearing later in argv is an argument, not the command.
+        assert!(!is_app_probe(&["chat".to_owned(), "app-logs".to_owned()]));
+    }
+
+    /// Every probe exempted from logging must still be a real subcommand, or
+    /// the exemption silently covers nothing.
+    #[test]
+    fn app_probe_commands_are_all_real_subcommands() {
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_owned())
+            .collect();
+        for probe in APP_PROBE_COMMANDS {
+            assert!(
+                names.iter().any(|n| n == probe),
+                "{probe} is not a subcommand"
+            );
+        }
     }
 
     #[test]
@@ -20318,6 +20754,13 @@ install therock";
         ])
         .expect("install sdk should accept a TheRock family override");
     }
+    #[test]
+    fn app_runtime_commands_parse() {
+        Cli::try_parse_from(["rocm", "runtimes", "validate", "runtime-key"])
+            .expect("runtime validation should be a real command");
+        Cli::try_parse_from(["rocm", "runtimes", "uninstall", "runtime-key", "--yes"])
+            .expect("reviewed runtime removal should accept --yes");
+    }
 
     #[test]
     fn top_level_cli_commands_are_not_treated_as_freeform() {
@@ -22096,6 +22539,154 @@ ID_LIKE="suse opensuse"
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// The config write is atomic: an interrupted save must leave the previous
+    /// selection readable, not a truncated file.
+    ///
+    /// Proven structurally rather than by killing a process mid-write: the
+    /// save writes a sibling temp file and renames it, so at no instant does
+    /// `config.json` exist in a partial state. The test asserts the invariant
+    /// the rename provides — the destination is either the old content or the
+    /// new one — and that no temp file is left behind.
+    #[test]
+    fn runtime_activation_config_write_is_atomic() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-atomic");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+
+        let saved = RocmCliConfig::load(&paths)?;
+        assert_eq!(
+            saved.active_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        let leftovers = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        // A second save replaces the file wholesale rather than appending or
+        // partially overwriting: the parse below fails on any leftover tail.
+        config.previous_runtime_key = Some("release-pip-gfx120x-all-7-12-0".to_owned());
+        config.save(&paths)?;
+        let reloaded = RocmCliConfig::load(&paths)?;
+        assert_eq!(
+            reloaded.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Removing the runtime the marker names as `previous` must not leave the
+    /// marker pointing at something that is gone.
+    ///
+    /// Uninstall cleared the config field but only deleted the marker when the
+    /// *active* runtime was removed, so the rollback target on disk outlived
+    /// the runtime it named.
+    #[test]
+    fn runtime_activation_previous_marker_is_repaired_when_that_runtime_is_removed() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-stale-previous");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+        activate_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-13-0")?;
+
+        let before: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(
+            before.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
+        );
+
+        uninstall_runtime(&paths, &mut config, "release-pip-gfx120x-all-7-12-0")?;
+
+        assert_eq!(config.previous_runtime_key, None, "config field cleared");
+        let after: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(after.runtime_key, "release-pip-gfx120x-all-7-13-0");
+        assert_eq!(
+            after.previous_runtime_key, None,
+            "marker still names a runtime that no longer exists"
+        );
+        assert_eq!(after.previous_runtime_id, None);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Two registry entries claiming one key is a repair job, not a coin toss.
+    #[test]
+    fn runtime_activation_rejects_a_duplicated_exact_key() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-duplicate-key");
+        let first = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-12-0",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        // A second registry file with the same runtime_key: the loader accepts
+        // every parseable manifest and does not enforce uniqueness.
+        let duplicate = paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join("duplicate.json");
+        fs::write(&duplicate, serde_json::to_vec_pretty(&first)?)?;
+
+        let error = activate_runtime(&paths, &mut RocmCliConfig::default(), &first.runtime_key)
+            .expect_err("a duplicated key must be refused");
+        let text = error.to_string();
+        assert!(text.contains("duplicate"), "unhelpful refusal: {text}");
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A manifest pointing at a system directory must never reach
+    /// `remove_dir_all`.
+    #[test]
+    fn runtime_activation_uninstall_refuses_a_protected_install_root() {
+        for protected in ["/", "/usr", "/usr/lib", "/opt"] {
+            let Err(error) = ensure_runtime_install_root_is_safe_to_remove(Path::new(protected))
+            else {
+                panic!("{protected} was accepted for deletion");
+            };
+            assert!(
+                error.to_string().contains("protected") || error.to_string().contains("unsafe"),
+                "unhelpful refusal for {protected}: {error}"
+            );
+        }
     }
 
     #[test]
