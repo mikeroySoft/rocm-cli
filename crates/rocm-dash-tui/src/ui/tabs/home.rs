@@ -8,10 +8,6 @@
 //! gauge + spark, a stacked VRAM/TEMP/POWER mini-spark cluster, and Running /
 //! Health / Updates tiles. Empty/absent telemetry renders honest placeholders
 //! rather than synthetic numbers.
-//!
-//! ponytail: Home is added behind the existing default this phase (P2). It is
-//! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
-//! the default and folds the telemetry tabs into Observe.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

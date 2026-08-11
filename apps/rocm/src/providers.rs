@@ -1003,13 +1003,32 @@ fn openai_chat_request_body_with_stream(
             })
         }).collect::<Vec<_>>(),
         "stream": stream,
-        "max_tokens": request.max_tokens.unwrap_or(512),
     });
+    body[openai_token_limit_field(model)] = serde_json::json!(request.max_tokens.unwrap_or(512));
     if request.rocm_tools && !stream {
         body["tools"] = serde_json::Value::Array(rocm_openai_tool_definitions());
         body["tool_choice"] = serde_json::json!("auto");
     }
     body
+}
+
+/// GPT-5 Chat Completions rejects the legacy `max_tokens` field with HTTP 400,
+/// so `rocm chat --provider openai` cannot reach the default OpenAI model
+/// without this. Local engines and older OpenAI-compatible servers share this
+/// builder and only understand `max_tokens`, so the switch is on the model
+/// name. Mirrors `openai_token_limit` in rocm-dash-tui's agent; that crate
+/// depends on none of ours, so a shared helper would mean a new crate edge for
+/// five lines.
+fn openai_token_limit_field(model: &str) -> &'static str {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    let is_gpt5 = model.strip_prefix("gpt-5").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.starts_with('-') || suffix.starts_with('.')
+    });
+    if is_gpt5 {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
 }
 
 fn rocm_openai_tool_definitions() -> Vec<serde_json::Value> {
@@ -1891,6 +1910,37 @@ mod tests {
         assert_eq!(anthropic["model"], "claude-test");
         assert_eq!(anthropic["messages"][0]["role"], "user");
         assert_eq!(anthropic["max_tokens"], 42);
+    }
+
+    #[test]
+    fn gpt5_request_bodies_use_max_completion_tokens() {
+        // OpenAI answers a gpt-5 chat completion carrying `max_tokens` with
+        // HTTP 400 `unsupported_parameter`, so the legacy field must not be
+        // sent for that family — and must still be sent for everything else,
+        // including the local engines that share this builder.
+        let request = ChatRequest {
+            model: Some("gpt-5".to_owned()),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: "hello".to_owned(),
+            }],
+            max_tokens: Some(42),
+            rocm_tools: false,
+        };
+        for model in ["gpt-5", "gpt-5-mini", "gpt-5.1", "openai/gpt-5"] {
+            for body in [
+                openai_chat_request_body(model, &request),
+                openai_stream_chat_request_body(model, &request),
+            ] {
+                assert_eq!(body["max_completion_tokens"], 42, "{model}");
+                assert!(body.get("max_tokens").is_none(), "{model}");
+            }
+        }
+        for model in ["gpt-4o", "gpt-50", "Qwen3-0.6B-GGUF"] {
+            let body = openai_chat_request_body(model, &request);
+            assert_eq!(body["max_tokens"], 42, "{model}");
+            assert!(body.get("max_completion_tokens").is_none(), "{model}");
+        }
     }
 
     #[test]

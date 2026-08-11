@@ -12,10 +12,7 @@
 //! payload types it raises (`SlashOutcome`, `SlashToolRequest`, `ProviderSwitch`)
 //! stay in `mod.rs` alongside the `AppState` fields that carry them.
 
-use super::{
-    ActiveTab, AppState, ChatProvider, ChatTurn, Modal, ProviderSwitch, SlashOutcome,
-    SlashToolRequest,
-};
+use super::{ActiveTab, AppState, ChatProvider, ChatTurn, Modal, SlashOutcome, SlashToolRequest};
 
 impl AppState {
     /// Route a chat-input line that may be a slash command. Returns
@@ -453,16 +450,7 @@ impl AppState {
                     )));
                 }
                 Some(arg) => match ChatProvider::parse(arg) {
-                    Some(p) => {
-                        // Snapshot the prior provider BEFORE the optimistic set so
-                        // a failed switch (missing key) can revert to it.
-                        let previous = self.active_provider;
-                        self.active_provider = p;
-                        self.provider_switch = Some(ProviderSwitch {
-                            previous,
-                            target: p,
-                        });
-                    }
+                    Some(p) => self.request_chat_provider(p),
                     None => {
                         self.chat.push(ChatTurn::error(format!(
                             "unknown provider `{arg}` (try local, openai, or anthropic)"

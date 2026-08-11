@@ -89,13 +89,15 @@ pub struct ResolvedArgs {
     /// Chat endpoint base URL from the environment (`OPENAI_BASE_URL`).
     /// A separate, lower-precedence tier than `chat_url`.
     pub chat_env_url: Option<String>,
-    /// Chat api key, sourced from the environment ONLY (never TOML/CLI/source).
-    /// Used by the local/OpenAI backends.
+    /// OpenAI-compatible API key, sourced by the bin from the dashboard override,
+    /// `OPENAI_API_KEY`, or the OS secure store (never TOML/CLI/source/argv).
     pub chat_api_key: Option<String>,
     /// Anthropic API key, sourced by the bin (env-first then OS secure store —
-    /// NEVER argv) and carried in-process via this seam. `None` when absent;
-    /// the Anthropic backend then surfaces an actionable error on switch.
+    /// NEVER argv) and carried in-process via this seam. `None` when absent.
     pub anthropic_api_key: Option<String>,
+    /// Whether prompt sending through each remote provider is enabled in config.
+    pub openai_enabled: bool,
+    pub anthropic_enabled: bool,
     /// Pre-consent to using the detected endpoint (`--chat-yes`), skipping the
     /// one-time in-TUI prompt for the demo.
     pub chat_auto_consent: bool,
@@ -727,6 +729,12 @@ impl AppState {
             active_provider: ChatProvider::default(),
             provider_switch: None,
         }
+    }
+
+    pub(crate) const fn request_chat_provider(&mut self, target: ChatProvider) {
+        let previous = self.active_provider;
+        self.active_provider = target;
+        self.provider_switch = Some(ProviderSwitch { previous, target });
     }
 
     /// Close every operational overlay. The overlays are mutually exclusive
@@ -1784,7 +1792,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
-        // takes NO api_key (env-only invariant untouched — OAuth, not a key).
+        // takes NO api_key because OAuth owns authentication on this path.
         let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
         if no_key_no_endpoint {
             let oauth_tx = chat_tx.clone();
@@ -2216,46 +2224,52 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }
         }
 
-        // Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
-        // newly-selected backend. `Local` reuses whatever the inline launch path
-        // built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
-        // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
-        // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
-        // error turn. Construction only — no network until the next submit.
+        // Drain a provider switch. The slash command and the unavailable-chat
+        // provider actions share this path. `Local` restores the inline launch
+        // backend; remote providers are rebuilt from enabled provider state and
+        // keys carried in `ResolvedArgs`. Construction performs no network I/O.
         if let Some(ProviderSwitch { previous, target }) = state.provider_switch.take() {
             match target {
                 ChatProvider::Local => {
-                    // Restore the auto-detected local backend saved before the
-                    // event loop. `build_chat_agent(Local)` returns None by
-                    // design, so the restore must happen here — otherwise a prior
-                    // `/provider openai` would leave requests routed to OpenAI.
                     agent = local_agent.clone();
                     state
                         .chat
                         .push(ChatTurn::system("switched to local".to_string()));
                 }
                 ChatProvider::Openai | ChatProvider::Anthropic => {
-                    if let Some(new_agent) =
+                    if let Some((new_agent, cfg)) =
                         build_chat_agent(target, args, state.tool_executor.clone(), chat_tx.clone())
                     {
                         agent = Some(new_agent);
+                        // Selecting a provider from the gate is explicit consent.
+                        // Also replace a stale local config so the accepted
+                        // surface reflects the backend that will receive prompts.
+                        state.set_chat_config(Some(cfg), true);
                         state
                             .chat
                             .push(ChatTurn::system(format!("switched to {}", target.label())));
                     } else {
-                        // Revert the optimistic `active_provider` set by the slash
-                        // handler back to the provider active BEFORE the switch
-                        // attempt — not unconditionally Local — so the displayed
-                        // provider stays honest (e.g. a failed openai→anthropic
-                        // switch stays on openai). `agent` is never reassigned on a
-                        // failed build, so it already matches `previous`; the two
-                        // stay consistent (no stale-remote routing under a wrong
-                        // label).
                         state.active_provider = previous;
-                        let hint = if target == ChatProvider::Anthropic {
-                            "anthropic requires ANTHROPIC_API_KEY in env or secure store"
+                        let enabled = match target {
+                            ChatProvider::Openai => args.openai_enabled,
+                            ChatProvider::Anthropic => args.anthropic_enabled,
+                            ChatProvider::Local => true,
+                        };
+                        let hint = if enabled {
+                            format!(
+                                "set {} or run `rocm config set-provider-key {}`",
+                                if target == ChatProvider::Anthropic {
+                                    "ANTHROPIC_API_KEY"
+                                } else {
+                                    "OPENAI_API_KEY"
+                                },
+                                target.label()
+                            )
                         } else {
-                            "openai requires OPENAI_API_KEY in the environment"
+                            format!(
+                                "enable it with `rocm config enable-provider {}`",
+                                target.label()
+                            )
                         };
                         state.chat.push(ChatTurn::error(format!(
                             "could not switch to {}: {hint}",
@@ -2656,6 +2670,8 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         KeyAction::ChatConsentAccept => state.accept_chat_consent(),
         KeyAction::ChatConsentDecline => state.decline_chat_consent(),
         KeyAction::ChatDetect => state.request_detect(),
+        KeyAction::ChatUseOpenai => state.request_chat_provider(ChatProvider::Openai),
+        KeyAction::ChatUseAnthropic => state.request_chat_provider(ChatProvider::Anthropic),
         KeyAction::ChatDetectAccept => state.accept_detect_offer(),
         KeyAction::ChatDetectSave => state.save_detect_offer(),
         KeyAction::ChatDetectDismiss => state.dismiss_detect_offer(),
@@ -3107,6 +3123,10 @@ pub enum KeyAction {
     ChatConsentDecline,
     /// Chat: probe for a local engine and offer it (in-TUI auto-detect).
     ChatDetect,
+    /// Chat: select the configured OpenAI provider from the endpoint gate.
+    ChatUseOpenai,
+    /// Chat: select the configured Anthropic provider from the endpoint gate.
+    ChatUseAnthropic,
     /// Chat: accept the detected local endpoint for this session.
     ChatDetectAccept,
     /// Chat: accept the detected endpoint and persist it to config.
@@ -3215,9 +3235,8 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 }
             }
             ChatConsent::Pending | ChatConsent::Declined => {
-                // Consent gate: y/Enter accept, n decline, d detect a local
-                // engine. Other keys (q, digits, Tab, ?) fall through to the
-                // globals so the user isn't trapped.
+                // Consent gate: accept/decline the shown endpoint, detect local,
+                // or explicitly choose a configured cloud provider.
                 match k.code {
                     KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                         return KeyAction::ChatConsentAccept;
@@ -3228,15 +3247,21 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                     KeyCode::Char('d' | 'D') => {
                         return KeyAction::ChatDetect;
                     }
+                    KeyCode::Char('o' | 'O') => {
+                        return KeyAction::ChatUseOpenai;
+                    }
+                    KeyCode::Char('a' | 'A') => {
+                        return KeyAction::ChatUseAnthropic;
+                    }
                     _ => {}
                 }
             }
-            // No endpoint configured: the only gate action is to detect one.
-            ChatConsent::Unavailable => {
-                if let KeyCode::Char('d' | 'D') = k.code {
-                    return KeyAction::ChatDetect;
-                }
-            }
+            ChatConsent::Unavailable => match k.code {
+                KeyCode::Char('d' | 'D') => return KeyAction::ChatDetect,
+                KeyCode::Char('o' | 'O') => return KeyAction::ChatUseOpenai,
+                KeyCode::Char('a' | 'A') => return KeyAction::ChatUseAnthropic,
+                _ => {}
+            },
         }
     }
     // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
@@ -4994,6 +5019,24 @@ mod tests {
             ),
             KeyAction::ChatDetect
         );
+        assert_eq!(
+            handle_key(
+                press(KeyCode::Char('o')),
+                ActiveTab::Chat,
+                &Modal::None,
+                unavail
+            ),
+            KeyAction::ChatUseOpenai
+        );
+        assert_eq!(
+            handle_key(
+                press(KeyCode::Char('a')),
+                ActiveTab::Chat,
+                &Modal::None,
+                unavail
+            ),
+            KeyAction::ChatUseAnthropic
+        );
         // With an offer pending, y/n map to the offer (not consent).
         let offering = ChatKeyCtx {
             focused: false,
@@ -5519,6 +5562,8 @@ mod tests {
             chat_env_url: None,
             chat_api_key: None,
             anthropic_api_key: key.map(str::to_string),
+            openai_enabled: true,
+            anthropic_enabled: true,
             chat_auto_consent: false,
             chat_mock: false,
             model_recipes: Vec::new(),

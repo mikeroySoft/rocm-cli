@@ -3612,6 +3612,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tokio",
+ "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

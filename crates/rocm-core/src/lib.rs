@@ -54,19 +54,20 @@ use runtime::env_path_override;
 use runtime::home_rocm_dir;
 pub use runtime::{
     RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
-    default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
-    platform_binary_name, prepend_runtime_path, runtime_directory_label,
-    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
-    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
-    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
-    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
-    runtime_paths_equivalent, runtime_python_activation_hint, runtime_python_activation_script,
-    runtime_python_bin_dir_name, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    runtime_python_executable_name, runtime_rocm_library_filename, shell_command_for_host,
+    default_data_dir, default_interactive_shell_program, default_recipes_dir, managed_logs_dir,
+    managed_pip_cache_dir, managed_runtime_cache_dir, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
+    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
+    runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
+    runtime_rocm_library_filename, shell_command_for_host,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, ensure_uv_binary, uv_binary_name, uv_command_env,
@@ -1314,6 +1315,31 @@ impl AppPaths {
 
     pub fn services_dir(&self) -> PathBuf {
         self.data_dir.join("services")
+    }
+
+    /// Measured serving recipes (`hyperloom-r.recipe.v1`, or the legacy
+    /// `hypercricket.recipe.v1`), resolved by bare name
+    /// by `rocm serve --recipe <name>`.
+    ///
+    /// Rooted outside this struct on purpose — see [`default_recipes_dir`]. It
+    /// used to be `config_dir/recipes`, which meant `rocm uninstall` deleted
+    /// hours of measurement along with a settings file.
+    pub fn recipes_dir(&self) -> PathBuf {
+        default_recipes_dir().unwrap_or_else(|| self.config_dir.join("recipes"))
+    }
+
+    /// Scratch recipes: experiments that shadow a committed recipe of the same
+    /// name without editing it.
+    ///
+    /// Cache-rooted because that is exactly the guarantee wanted — disposable,
+    /// and never the place a measurement is kept.
+    pub fn temp_recipes_dir(&self) -> PathBuf {
+        self.cache_dir.join("recipes")
+    }
+
+    /// Both recipe directories in resolution order: scratch shadows committed.
+    pub fn recipe_search_dirs(&self) -> [PathBuf; 2] {
+        [self.temp_recipes_dir(), self.recipes_dir()]
     }
 
     pub fn audit_dir(&self) -> PathBuf {

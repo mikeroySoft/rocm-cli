@@ -26,6 +26,12 @@ use crate::ui::theme::Theme;
 
 /// A flattened model-recipe entry for the picker. Mirrors the fields of
 /// `rocm-core::ModelRecipeRecord` the picker needs, with no core dependency.
+///
+/// Two kinds of row share this type. A catalog row is a recommendation and
+/// carries no `recipe`. A tuned row was produced by an optimizer, names a
+/// recipe file the CLI understands, and replays measured weights/binary/flags —
+/// serving its `id` without that recipe would silently discard the tuning, so
+/// the name rides along with the selection rather than being looked up later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRecipeSummary {
     /// Canonical model id (what `rocm serve` is invoked with).
@@ -36,6 +42,9 @@ pub struct ModelRecipeSummary {
     pub task: String,
     /// Preferred serving engine, if the recipe declares one.
     pub preferred_engine: Option<String>,
+    /// Serving-recipe name to replay via `rocm serve --recipe`, when this row
+    /// came from the recipes directory rather than the built-in catalog.
+    pub recipe: Option<String>,
 }
 
 /// Picker state: a filter query + a cursor into the filtered list.
@@ -115,7 +124,10 @@ pub fn draw_model_picker(
     recipes: &[ModelRecipeSummary],
     theme: &Theme,
 ) {
-    let popup = centered_rect(76, 78, 110, 28, area);
+    // Wider than the other overlays: a tuned row carries a recipe name after
+    // the id/task/engine columns, and a name truncated to "or…" identifies
+    // nothing. Still clamped so it does not drown a large terminal.
+    let popup = centered_rect(88, 78, 132, 28, area);
     let inner = draw_popup_frame(f, popup, "Pick a model recipe", theme);
     if inner.height == 0 {
         return;
@@ -160,7 +172,7 @@ pub fn draw_model_picker(
             .iter()
             .map(|r| {
                 let eng = r.preferred_engine.as_deref().unwrap_or("—");
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{:<30}", trunc(&r.id, 30)),
                         Style::default().fg(theme.fg),
@@ -170,7 +182,21 @@ pub fn draw_model_picker(
                         Style::default().fg(theme.muted),
                     ),
                     Span::styled(format!("engine: {eng}"), Style::default().fg(theme.accent)),
-                ]))
+                ];
+                // A tuned row and a catalog row serve the same model id but not
+                // the same configuration, so the recipe name is shown rather
+                // than left to the `task` column to imply. No "recipe:" label —
+                // the `tuned` column already said that, and the width it costs
+                // is width the name needs.
+                if let Some(recipe) = r.recipe.as_deref() {
+                    spans.push(Span::styled(
+                        format!("  · {}", trunc(recipe, 34)),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         let mut ls = ListState::default();
@@ -212,18 +238,21 @@ mod tests {
                 aliases: vec!["qwen".into()],
                 task: "chat".into(),
                 preferred_engine: Some("lemonade".into()),
+                recipe: None,
             },
             ModelRecipeSummary {
                 id: "GLM-4".into(),
                 aliases: vec!["glm".into()],
                 task: "chat".into(),
                 preferred_engine: Some("vllm".into()),
+                recipe: None,
             },
             ModelRecipeSummary {
                 id: "Llama-3.2-3B".into(),
                 aliases: vec!["llama".into()],
                 task: "chat".into(),
                 preferred_engine: None,
+                recipe: None,
             },
         ]
     }
