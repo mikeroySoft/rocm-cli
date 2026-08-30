@@ -190,6 +190,10 @@ pub fn runtime_home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
+pub fn runtime_config_dir() -> Option<PathBuf> {
+    BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
+}
+
 pub(crate) fn env_path_override(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)

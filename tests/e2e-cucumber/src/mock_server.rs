@@ -338,9 +338,15 @@ mod scripted_metrics_tests {
         );
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRequest {
+    pub path: String,
+    pub body: Value,
+}
+
 #[derive(Clone)]
 struct ServerState {
-    model_name: String,
+    model_names: Vec<String>,
     /// `Some` only when this server was started via
     /// [`MockServer::start_with_metrics`]; drives the `/metrics` route. Kept as
     /// an `Option` (rather than always registering the route) so a plain
@@ -364,6 +370,7 @@ struct ServerState {
     /// `/v1` prefix would pass while 404ing against a real engine. Recording the
     /// path lets a scenario assert the versioned route was the one used.
     chat_paths: Arc<Mutex<Vec<String>>>,
+    protocol_requests: Arc<Mutex<Vec<CapturedRequest>>>,
 }
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
@@ -440,13 +447,22 @@ pub struct MockServer {
     last_chat_request: Arc<Mutex<Option<Value>>>,
     /// Shared with the running server's `ServerState`; see the field doc there.
     chat_paths: Arc<Mutex<Vec<String>>>,
+    protocol_requests: Arc<Mutex<Vec<CapturedRequest>>>,
     /// `Some` only when started with [`MockServer::start_with_scripted_metrics`].
     scripted: Option<Arc<ScriptedMetrics>>,
 }
 
 impl MockServer {
     pub async fn start(model_name: &str) -> Self {
-        Self::spawn(model_name, false).await
+        Self::spawn(&[model_name], false, true).await
+    }
+
+    pub async fn start_with_models(model_names: &[&str]) -> Self {
+        Self::spawn(model_names, false, true).await
+    }
+
+    pub async fn start_models_only(model_name: &str) -> Self {
+        Self::spawn(&[model_name], false, false).await
     }
 
     /// Like [`Self::start`], but also opts into a deterministic vLLM-flavoured
@@ -456,7 +472,7 @@ impl MockServer {
     /// all, so it keeps returning a 404 there, same as before this method
     /// existed.
     pub async fn start_with_metrics(model_name: &str) -> Self {
-        Self::spawn(model_name, true).await
+        Self::spawn(&[model_name], true, true).await
     }
 
     /// Like [`Self::start_with_metrics`] but the `/metrics` endpoint starts in
@@ -467,19 +483,23 @@ impl MockServer {
     pub async fn start_with_scripted_metrics(model_name: &str) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let protocol_requests = Arc::new(Mutex::new(Vec::new()));
         let scripted = Arc::new(ScriptedMetrics::new());
         let state = ServerState {
-            model_name: model_name.to_string(),
+            model_names: vec![model_name.to_string()],
             metrics: None,
             scripted_metrics: Some(Arc::clone(&scripted)),
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
+            protocol_requests: Arc::clone(&protocol_requests),
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
             .route("/models", get(handle_models))
             .route("/v1/chat/completions", post(handle_chat))
             .route("/chat/completions", post(handle_chat))
+            .route("/v1/responses", post(handle_responses))
+            .route("/v1/messages", post(handle_messages))
             .route("/metrics", get(handle_scripted_metrics))
             .with_state(state);
         Self {
@@ -487,6 +507,7 @@ impl MockServer {
             last_chat_request,
             scripted: Some(scripted),
             chat_paths,
+            protocol_requests,
         }
     }
 
@@ -516,22 +537,36 @@ impl MockServer {
             .failure_count()
     }
 
-    async fn spawn(model_name: &str, with_metrics: bool) -> Self {
+    async fn spawn(model_names: &[&str], with_metrics: bool, with_protocols: bool) -> Self {
+        assert!(
+            !model_names.is_empty(),
+            "mock server needs at least one model"
+        );
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let protocol_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
-            model_name: model_name.to_string(),
+            model_names: model_names
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
+            protocol_requests: Arc::clone(&protocol_requests),
         };
 
         let mut app = Router::new()
             .route("/v1/models", get(handle_models))
-            .route("/models", get(handle_models))
-            .route("/v1/chat/completions", post(handle_chat))
-            .route("/chat/completions", post(handle_chat));
+            .route("/models", get(handle_models));
+        if with_protocols {
+            app = app
+                .route("/v1/chat/completions", post(handle_chat))
+                .route("/chat/completions", post(handle_chat))
+                .route("/v1/responses", post(handle_responses))
+                .route("/v1/messages", post(handle_messages));
+        }
         if with_metrics {
             app = app.route("/metrics", get(handle_metrics));
         }
@@ -542,6 +577,7 @@ impl MockServer {
             scripted: None,
             last_chat_request,
             chat_paths,
+            protocol_requests,
         }
     }
 
@@ -573,12 +609,15 @@ impl MockServer {
             .route("/v1/models", get(reject))
             .route("/models", get(reject))
             .route("/v1/chat/completions", post(reject))
-            .route("/chat/completions", post(reject));
+            .route("/chat/completions", post(reject))
+            .route("/v1/responses", post(reject))
+            .route("/v1/messages", post(reject));
 
         Self {
             server: http_server::spawn(app).await,
             last_chat_request: Arc::new(Mutex::new(None)),
             chat_paths: Arc::new(Mutex::new(Vec::new())),
+            protocol_requests: Arc::new(Mutex::new(Vec::new())),
             scripted: None,
         }
     }
@@ -623,6 +662,21 @@ impl MockServer {
             }
             tokio::time::sleep(CHAT_REQUEST_POLL_INTERVAL).await;
         }
+    }
+
+    #[must_use]
+    pub fn protocol_requests(&self) -> Vec<CapturedRequest> {
+        self.protocol_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn clear_protocol_requests(&self) {
+        self.protocol_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Shut the server down explicitly. Equivalent to dropping it — the
@@ -684,12 +738,20 @@ pub fn write_service_record_with(
     port: u16,
     options: ServiceRecordOptions,
 ) {
-    std::fs::create_dir_all(services_dir).expect("failed to create services dir");
+    write_service_record_named_with(services_dir, "e2e-mock", model, port, options);
+}
 
-    // The CLI only extracts host:port from `endpoint_url` and appends
-    // `/v1/models` for its readiness probe, which the mock serves.
+pub fn write_service_record_named_with(
+    services_dir: &Path,
+    service_id: &str,
+    model: &str,
+    port: u16,
+    options: ServiceRecordOptions,
+) {
+    std::fs::create_dir_all(services_dir).expect("failed to create services dir");
+    let manifest_path = services_dir.join(format!("{service_id}.json"));
     let record = json!({
-        "service_id": "e2e-mock",
+        "service_id": service_id,
         "engine": "vllm",
         "model_ref": model,
         "canonical_model_id": model,
@@ -711,13 +773,13 @@ pub fn write_service_record_with(
         "engine_recipe_json": null,
         "restart_count": 0,
         "last_restart_unix_ms": null,
-        "manifest_path": services_dir.join("e2e-mock.json"),
-        "log_path": services_dir.join("e2e-mock.log"),
-        "engine_state_path": services_dir.join("e2e-mock.state.json"),
+        "manifest_path": manifest_path,
+        "log_path": services_dir.join(format!("{service_id}.log")),
+        "engine_state_path": services_dir.join(format!("{service_id}.state.json")),
         "created_at_unix_ms": 1_700_000_000_000_u64,
     });
     std::fs::write(
-        services_dir.join("e2e-mock.json"),
+        services_dir.join(format!("{service_id}.json")),
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");
@@ -726,7 +788,9 @@ pub fn write_service_record_with(
 async fn handle_models(State(state): State<ServerState>) -> Json<Value> {
     Json(json!({
         "object": "list",
-        "data": [{"id": state.model_name, "object": "model"}]
+        "data": state.model_names.into_iter()
+            .map(|id| json!({"id": id, "object": "model"}))
+            .collect::<Vec<_>>()
     }))
 }
 
@@ -755,31 +819,18 @@ async fn handle_chat(
     uri: axum::http::Uri,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    // Record which of the two chat routes the client actually used, so a
-    // scenario can distinguish the versioned path from the unversioned one.
     state
         .chat_paths
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(uri.path().to_string());
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("<missing>")
-        .to_string();
-
-    // Record the request body so scenarios can assert on exactly what the CLI
-    // sent (see `MockServer::last_chat_request` / `wait_for_chat_request`) —
-    // the canned reply below never varies with the prompt, so without this a
-    // corrupted or missing request would pass unnoticed.
+    let model = request_model(&body);
+    capture_request(&state, &uri, &body);
     *state
         .last_chat_request
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
 
-    // Tests assert on the request contract, not the reply text, so the default
-    // is a fixed stub. Demos (`rocm-demo-env`) set `ROCM_MOCK_CHAT_REPLY` to a
-    // realistic answer so the recorded screencast reads naturally.
     let content = std::env::var("ROCM_MOCK_CHAT_REPLY")
         .unwrap_or_else(|_| "This is a mock response for testing.".to_string());
 
@@ -803,4 +854,62 @@ async fn handle_chat(
             "total_tokens": 18
         }
     }))
+}
+
+async fn handle_responses(
+    State(state): State<ServerState>,
+    uri: axum::http::Uri,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let model = request_model(&body);
+    capture_request(&state, &uri, &body);
+    Json(json!({
+        "id": "resp_mock_1",
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "This is a mock response for testing."}]
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 8, "total_tokens": 18}
+    }))
+}
+
+async fn handle_messages(
+    State(state): State<ServerState>,
+    uri: axum::http::Uri,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let model = request_model(&body);
+    capture_request(&state, &uri, &body);
+    Json(json!({
+        "id": "msg_mock_1",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "This is a mock response for testing."}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 10, "output_tokens": 8}
+    }))
+}
+
+fn request_model(body: &Value) -> String {
+    body.get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string()
+}
+
+fn capture_request(state: &ServerState, uri: &axum::http::Uri, body: &Value) {
+    state
+        .protocol_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(CapturedRequest {
+            path: uri.path().to_string(),
+            body: body.clone(),
+        });
 }

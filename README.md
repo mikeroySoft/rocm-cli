@@ -211,6 +211,7 @@ requirements.
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm agents [<agent>]` | List, inspect, configure, or test local agent harnesses |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
@@ -417,6 +418,49 @@ Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
 omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
 controls forwarded to the request; each is independent, so omit any of them to
 use the provider's default.
+
+### Agent harnesses
+
+Configure supported agent CLIs to use a local ROCm model server:
+
+```
+rocm agents
+rocm agents <agent>
+rocm agents <agent> --setup --dry-run [--model MODEL] [--base-url URL]
+                    [--agent-version VERSION]
+rocm agents <agent> --setup --yes [--model MODEL] [--base-url URL]
+                    [--agent-version VERSION] [--no-check]
+rocm agents <agent> --test [--agent-version VERSION]
+```
+
+Supported harness names are `claude`, `hermes`, `openclaw`, `codex`,
+`opencode`, `qwen-code`, `aider`, and `continue`; `rocm agents` lists them
+with installation and configuration status. `rocm agents <agent>` inspects
+one harness without changing it, including its detected executable, version,
+configuration path, endpoint, and model. Use `--agent-version` to select a
+supported configuration schema explicitly, including when preparing setup
+before the harness is installed.
+
+Setup automatically uses the unique ready loopback service managed by
+rocm-cli. `--model` selects a matching service when several are ready. If no
+managed service matches, setup falls back to
+`http://127.0.0.1:11435/v1`; supply `--model` for an offline setup plan, or
+start a server with `rocm serve <model>`. An explicit `--base-url` must be a
+loopback HTTP URL; if `--model` is omitted, the endpoint must advertise one
+unambiguous model.
+
+`--dry-run` prints the target and file changes without writing them. A normal
+setup prompts before writing; `--yes` supplies that approval for scripts and
+other non-interactive use. After writing, setup probes the harness's native
+API route with the exact model and restores the previous configuration if the
+check fails. `--no-check` deliberately keeps the configuration without making
+that protocol request.
+
+`--test` runs the installed harness against a nonce probe in an isolated
+temporary workspace using harness-specific safe arguments. It verifies the
+probe remains intact and the nonce appears in the harness's final output,
+without exposing the caller's repository. Harnesses may create ordinary
+cache or session files inside that temporary workspace.
 
 ### ComfyUI
 

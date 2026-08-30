@@ -148,6 +148,42 @@ cargo test -p rocm --bin rocm http_header_value
 rocm install sdk --channel release --format wheel --dry-run
 ```
 
+## Agent Harness Setup E2E
+
+The `rocm agents` behavior spec is
+[`agents.feature`](../tests/e2e-cucumber/features/agents.feature). Run its 30
+mock scenarios through the existing E2E workflow:
+
+```bash
+E2E_ONLY_AGENTS=1 cargo xtask e2e
+```
+
+The focused selector stays inside the suite's expectation and capability
+resolver. Do not select this feature with cucumber `--tags` or `-n`; those
+filters bypass that resolver.
+
+The mock scenarios cover list and inspect output, managed-service detection and
+the default endpoint fallback, dry-run and approval behavior, safe config
+updates, rollback and `--no-check`, version selection, protocol routes, and
+isolated harness probes. Harness-binary coverage is deliberately narrower:
+
+| Harnesses | Harness-binary coverage |
+|---|---|
+| Claude Code and Codex | Fake-harness coverage in the 30 mock scenarios, plus one gated real-binary scenario |
+| Hermes, OpenClaw, OpenCode, Qwen Code, Aider, and Continue | Fake-harness CLI argv coverage only; no real-binary lane exists yet |
+
+The real Claude Code and Codex scenario uses a GPU-served vLLM model and is
+excluded unless both opt-ins are set:
+
+```bash
+E2E_ONLY_AGENTS=1 E2E_INCLUDE_NIGHTLY=1 E2E_INCLUDE_REAL_AGENTS=1 cargo xtask e2e
+```
+
+It also requires Linux, a supported AMD GPU, an active managed runtime, vLLM,
+and real `claude` and `codex` executables on `PATH`. The presence of this gated
+scenario is not itself a coverage claim: count it as real-binary coverage only
+for a lane that meets those prerequisites and actually runs it.
+
 ## TheRock SDK Install Test
 
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
