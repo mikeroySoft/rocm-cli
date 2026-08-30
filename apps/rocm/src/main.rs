@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+mod agents;
 mod automations;
 mod bootstrap;
 mod comfyui;
@@ -106,6 +107,20 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Configure local model agent harnesses.
+    ///
+    /// Setup auto-detects the unique ready managed service, or selects a ready service
+    /// whose model exactly matches --model. If neither resolves, it falls back to
+    /// http://127.0.0.1:11435/v1.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm agents                              List supported agent harnesses\n  \
+rocm agents claude --setup --dry-run     Preview setup without writing configuration\n  \
+rocm agents claude --setup --yes         Approve and apply setup without prompting\n  \
+rocm agents claude --test                Test the harness in an isolated workspace")]
+    Agents {
+        #[command(flatten)]
+        args: agents::AgentsArgs,
+    },
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
@@ -1600,6 +1615,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         cli.command,
         Some(
             Command::Update { .. }
+                | Command::Agents { .. }
                 | Command::Bootstrap { .. }
                 | Command::Completions { .. }
                 | Command::Storage { .. }
@@ -1893,6 +1909,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
         Some(Command::Automations { command }) => automations(command),
+        Some(Command::Agents { args }) => agents::run(args),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
@@ -17716,6 +17733,7 @@ fn service_model_names_match(left: &str, right: &str) -> bool {
 fn treat_as_natural_language(args: &[String]) -> bool {
     const STRUCTURED: &[&str] = &[
         "examine",
+        "agents",
         "diagnose",
         "fix",
         "status",
