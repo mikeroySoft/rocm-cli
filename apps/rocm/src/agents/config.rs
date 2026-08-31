@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use toml_edit::{DocumentMut, Item, value};
@@ -23,13 +23,30 @@ const LOCAL_CREDENTIAL: &str = "rocm-local";
 const QWEN_CREDENTIAL_ENV: &str = "ROCM_LOCAL_API_KEY";
 
 #[derive(Debug, Clone)]
+struct ConfigFileState {
+    path: PathBuf,
+    snapshot: Snapshot,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ConfigState {
     pub(super) path: PathBuf,
     pub(super) configured: bool,
     pub(super) endpoint: Option<String>,
     pub(super) model: Option<String>,
     pub(super) warnings: Vec<String>,
-    snapshot: Snapshot,
+    files: Vec<ConfigFileState>,
+    omp_legacy_models: Option<ConfigFileState>,
+}
+
+impl ConfigState {
+    fn file(&self, index: usize) -> &ConfigFileState {
+        &self.files[index]
+    }
+
+    pub(super) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.iter().map(|file| file.path.as_path())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +66,20 @@ pub(super) struct ConfigPlan {
 #[derive(Debug, Clone)]
 pub(super) struct AppliedConfig {
     pub(super) changed: bool,
-    rollback: Option<Rollback>,
+    rollbacks: Vec<Rollback>,
 }
 
 #[derive(Debug, Clone)]
 enum PlanPayload {
     None,
-    Direct(Vec<u8>),
+    Direct(Vec<DirectWrite>),
     Native(NativePlan),
+}
+
+#[derive(Debug, Clone)]
+struct DirectWrite {
+    file: usize,
+    after: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,16 +159,31 @@ impl<'a> OpenClawDesired<'a> {
 }
 
 pub(super) fn inspect(harness: AgentHarness) -> Result<ConfigState> {
-    let path = config_path(harness)?;
-    let snapshot = transaction::snapshot(&path)?;
-    let (endpoint, model) = inspect_values(harness, snapshot.raw.as_deref(), &path)?;
+    let paths = config_paths(harness)?;
+    let files = paths
+        .iter()
+        .map(|path| {
+            transaction::snapshot(path).map(|snapshot| ConfigFileState {
+                path: path.clone(),
+                snapshot,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let omp_legacy_models = (harness == AgentHarness::Omp && files[0].snapshot.raw.is_none())
+        .then(|| {
+            let path = paths[0].with_extension("json");
+            transaction::snapshot(&path).map(|snapshot| ConfigFileState { path, snapshot })
+        })
+        .transpose()?;
+    let (endpoint, model) = inspect_values(harness, &files, omp_legacy_models.as_ref())?;
     Ok(ConfigState {
+        path: paths[0].clone(),
         configured: endpoint.is_some() && model.is_some(),
         endpoint,
         model,
         warnings: precedence_warnings(harness),
-        path,
-        snapshot,
+        files,
+        omp_legacy_models,
     })
 }
 
@@ -165,11 +203,21 @@ pub(super) fn plan(
             harness.canonical_name()
         );
     }
-    if state.snapshot.symlink {
+    if let Some(file) = state
+        .omp_legacy_models
+        .as_ref()
+        .filter(|file| file.snapshot.raw.is_some() || file.snapshot.symlink)
+    {
+        bail!(
+            "legacy OMP model registry {} needs OMP's YAML migration; run OMP once to migrate models.json to models.yml, then rerun this setup",
+            file.path.display()
+        );
+    }
+    if let Some(file) = state.files.iter().find(|file| file.snapshot.symlink) {
         bail!(
             "refusing to configure {} through symlink {}; replace it with a regular file or configure it manually",
             harness.canonical_name(),
-            state.path.display()
+            file.path.display()
         );
     }
 
@@ -273,6 +321,8 @@ pub(super) fn plan(
         AgentHarness::QwenCode => direct_json_plan(&state, |root, changes| {
             qwen_json(root, version, target, changes)
         })?,
+        AgentHarness::Pi => direct_pi_plan(&state, target)?,
+        AgentHarness::Omp => direct_omp_plan(&state, target)?,
         AgentHarness::Codex => direct_toml_plan(&state, target)?,
         AgentHarness::Aider => direct_aider_plan(&state, target)?,
         AgentHarness::Continue => direct_continue_plan(&state, target)?,
@@ -305,69 +355,109 @@ pub(super) fn apply(plan: &ConfigPlan) -> Result<AppliedConfig> {
     if plan.changes.is_empty() {
         return Ok(AppliedConfig {
             changed: false,
-            rollback: None,
+            rollbacks: Vec::new(),
         });
     }
-    transaction::ensure_fresh(&plan.state.path, &plan.state.snapshot)?;
+    for file in &plan.state.files {
+        transaction::ensure_fresh(&file.path, &file.snapshot)?;
+    }
+    if let Some(file) = &plan.state.omp_legacy_models {
+        transaction::ensure_fresh(&file.path, &file.snapshot)?;
+    }
 
     match &plan.payload {
         PlanPayload::None => Ok(AppliedConfig {
             changed: false,
-            rollback: None,
+            rollbacks: Vec::new(),
         }),
-        PlanPayload::Direct(after) => {
-            transaction::atomic_write(&plan.state.path, after, plan.state.snapshot.mode)?;
-            Ok(AppliedConfig {
-                changed: true,
-                rollback: Some(Rollback::new(
-                    plan.state.path.clone(),
-                    plan.state.snapshot.clone(),
-                    Some(after.clone()),
-                )),
-            })
-        }
+        PlanPayload::Direct(writes) => apply_direct(plan, writes),
         PlanPayload::Native(native) => apply_native(plan, native),
     }
 }
 
 pub(super) fn rollback(applied: &AppliedConfig) -> Result<()> {
-    match &applied.rollback {
-        Some(rollback) => rollback.restore(),
-        None => Ok(()),
-    }
+    transaction::restore_all(&applied.rollbacks)
 }
 
-fn config_path(harness: AgentHarness) -> Result<PathBuf> {
-    let home = user_home()?;
-    let path = match harness {
-        AgentHarness::Claude => env_path("CLAUDE_CONFIG_DIR")
-            .unwrap_or_else(|| home.join(".claude"))
-            .join("settings.json"),
-        AgentHarness::Hermes => env_path("HERMES_HOME")
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    env_path("LOCALAPPDATA")
-                        .unwrap_or_else(|| home.join("AppData").join("Local"))
-                        .join("hermes")
-                } else {
-                    home.join(".hermes")
-                }
-            })
-            .join("config.yaml"),
-        AgentHarness::OpenClaw => {
-            if let Some(path) = env_path("OPENCLAW_CONFIG_PATH") {
-                path
-            } else {
-                env_path("OPENCLAW_STATE_DIR")
-                    .unwrap_or_else(|| openclaw_home(&home).join(".openclaw"))
-                    .join("openclaw.json")
-            }
+fn apply_direct(plan: &ConfigPlan, writes: &[DirectWrite]) -> Result<AppliedConfig> {
+    let mut rollbacks = Vec::with_capacity(writes.len());
+    for write in writes {
+        let file = plan.state.file(write.file);
+        if let Err(error) = transaction::ensure_fresh(&file.path, &file.snapshot) {
+            return match transaction::restore_all(&rollbacks) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(error.context(format!(
+                    "failed to restore configuration after partial setup: {rollback_error:#}"
+                ))),
+            };
         }
-        AgentHarness::Codex => env_path("CODEX_HOME")
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("config.toml"),
+        if let Err(error) = transaction::atomic_write(&file.path, &write.after, file.snapshot.mode)
+        {
+            let mut failures = Vec::new();
+            if let Err(rollback_error) =
+                transaction::restore_failed_write(&file.path, &file.snapshot, &write.after)
+            {
+                failures.push(format!("{rollback_error:#}"));
+            }
+            if let Err(rollback_error) = transaction::restore_all(&rollbacks) {
+                failures.push(format!("{rollback_error:#}"));
+            }
+            return if failures.is_empty() {
+                Err(error)
+            } else {
+                Err(error.context(format!(
+                    "failed to restore configuration after partial setup: {}",
+                    failures.join("; ")
+                )))
+            };
+        }
+        rollbacks.push(Rollback::new(
+            file.path.clone(),
+            file.snapshot.clone(),
+            Some(write.after.clone()),
+        ));
+    }
+    Ok(AppliedConfig {
+        changed: !rollbacks.is_empty(),
+        rollbacks,
+    })
+}
+
+fn config_paths(harness: AgentHarness) -> Result<Vec<PathBuf>> {
+    let home = user_home()?;
+    let paths = match harness {
+        AgentHarness::Claude => vec![
+            env_path("CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|| home.join(".claude"))
+                .join("settings.json"),
+        ],
+        AgentHarness::Hermes => vec![
+            env_path("HERMES_HOME")
+                .unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        env_path("LOCALAPPDATA")
+                            .unwrap_or_else(|| home.join("AppData").join("Local"))
+                            .join("hermes")
+                    } else {
+                        home.join(".hermes")
+                    }
+                })
+                .join("config.yaml"),
+        ],
+        AgentHarness::OpenClaw => vec![if let Some(path) = env_path("OPENCLAW_CONFIG_PATH") {
+            path
+        } else {
+            env_path("OPENCLAW_STATE_DIR")
+                .unwrap_or_else(|| openclaw_home(&home).join(".openclaw"))
+                .join("openclaw.json")
+        }],
+        AgentHarness::Codex => vec![
+            env_path("CODEX_HOME")
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("config.toml"),
+        ],
         AgentHarness::OpenCode => {
-            if let Some(path) = env_path("OPENCODE_CONFIG") {
+            let path = if let Some(path) = env_path("OPENCODE_CONFIG") {
                 absolute_from_cwd(path)?
             } else {
                 let root = config_root(&home).join("opencode");
@@ -378,19 +468,42 @@ fn config_path(harness: AgentHarness) -> Result<PathBuf> {
                 } else {
                     json
                 }
-            }
+            };
+            vec![path]
         }
-        AgentHarness::QwenCode => env_path("QWEN_HOME")
-            .unwrap_or_else(|| home.join(".qwen"))
-            .join("settings.json"),
-        AgentHarness::Aider => home.join(".aider.conf.yml"),
-        AgentHarness::Continue => env_path("CONTINUE_GLOBAL_DIR")
-            .map(absolute_from_cwd)
-            .transpose()?
-            .unwrap_or_else(|| home.join(".continue"))
-            .join("config.yaml"),
+        AgentHarness::QwenCode => vec![
+            env_path("QWEN_HOME")
+                .unwrap_or_else(|| home.join(".qwen"))
+                .join("settings.json"),
+        ],
+        AgentHarness::Aider => vec![home.join(".aider.conf.yml")],
+        AgentHarness::Continue => vec![
+            env_path("CONTINUE_GLOBAL_DIR")
+                .map(absolute_from_cwd)
+                .transpose()?
+                .unwrap_or_else(|| home.join(".continue"))
+                .join("config.yaml"),
+        ],
+        AgentHarness::Pi => {
+            let root = env_path_expanded("PI_CODING_AGENT_DIR", &home)
+                .unwrap_or_else(|| home.join(".pi").join("agent"));
+            vec![root.join("models.json"), root.join("settings.json")]
+        }
+        AgentHarness::Omp => {
+            let root = omp_config_root(&home);
+            let agent = if let Some(profile) = omp_profile()? {
+                root.join("profiles").join(profile).join("agent")
+            } else {
+                env_path_expanded("PI_CODING_AGENT_DIR", &home)
+                    .unwrap_or_else(|| root.join("agent"))
+            };
+            vec![
+                yaml_config_path(&agent, "models")?,
+                yaml_config_path(&agent, "config")?,
+            ]
+        }
     };
-    Ok(path)
+    Ok(paths)
 }
 
 fn user_home() -> Result<PathBuf> {
@@ -416,6 +529,68 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
+fn env_path_expanded(name: &str, home: &Path) -> Option<PathBuf> {
+    env_path(name).map(|path| {
+        path.strip_prefix("~")
+            .map_or_else(|_| path.clone(), |suffix| home.join(suffix))
+    })
+}
+
+fn omp_config_root(home: &Path) -> PathBuf {
+    let name = env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from(".omp"));
+    let mut root = home.to_path_buf();
+    for component in Path::new(&name).components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                root.pop();
+            }
+            Component::Normal(part) => root.push(part),
+        }
+    }
+    root
+}
+
+fn omp_profile() -> Result<Option<String>> {
+    let Some(profile) = env::var_os("OMP_PROFILE").or_else(|| env::var_os("PI_PROFILE")) else {
+        return Ok(None);
+    };
+    let profile = profile
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("OMP profile name must be valid UTF-8"))?
+        .trim();
+    if profile.is_empty() || profile == "default" {
+        return Ok(None);
+    }
+    let path = Path::new(profile);
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        bail!("OMP profile name must be a single path component");
+    }
+    Ok(Some(profile.to_owned()))
+}
+
+fn yaml_config_path(root: &Path, stem: &str) -> Result<PathBuf> {
+    let yml = root.join(format!("{stem}.yml"));
+    let yaml = root.join(format!("{stem}.yaml"));
+    match std::fs::symlink_metadata(&yml) {
+        Ok(_) => Ok(yml),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&yaml) {
+                Ok(_) => Ok(yaml),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(yml),
+                Err(error) => {
+                    Err(error).with_context(|| format!("failed to inspect {}", yaml.display()))
+                }
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", yml.display())),
+    }
+}
 
 fn absolute_from_cwd(path: PathBuf) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -436,7 +611,8 @@ fn precedence_warnings(harness: AgentHarness) -> Vec<String> {
         AgentHarness::QwenCode => &[".qwen/settings.json"],
         AgentHarness::Aider => &[".aider.conf.yml"],
         AgentHarness::Continue => &[".continue/config.yaml"],
-        AgentHarness::Hermes | AgentHarness::OpenClaw => &[],
+        AgentHarness::Pi => &[".pi/settings.json"],
+        AgentHarness::Hermes | AgentHarness::OpenClaw | AgentHarness::Omp => &[],
     };
     for candidate in candidates {
         if Path::new(candidate).is_file() {
@@ -445,7 +621,23 @@ fn precedence_warnings(harness: AgentHarness) -> Vec<String> {
             ));
         }
     }
-    if harness == AgentHarness::OpenCode && std::env::var_os("OPENCODE_CONFIG_CONTENT").is_some() {
+    if harness == AgentHarness::Omp {
+        let project = [".omp/config.yml", ".omp/config.yaml"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).is_file());
+        if let Some(project) = project {
+            warnings.push(format!(
+                "project configuration {project} has higher precedence; the user-level configuration is the only file changed"
+            ));
+        }
+        if env::var_os("PI_CONFIG_FILES").is_some_and(|value| !value.is_empty()) {
+            warnings.push(
+                "PI_CONFIG_FILES overlays have higher precedence; the user-level configuration is the only file changed"
+                    .to_owned(),
+            );
+        }
+    }
+    if harness == AgentHarness::OpenCode && env::var_os("OPENCODE_CONFIG_CONTENT").is_some() {
         warnings.push(
             "OPENCODE_CONFIG_CONTENT has higher precedence than the user-level file".to_owned(),
         );
@@ -458,10 +650,18 @@ fn precedence_warnings(harness: AgentHarness) -> Vec<String> {
 
 fn inspect_values(
     harness: AgentHarness,
-    raw: Option<&[u8]>,
-    path: &Path,
+    files: &[ConfigFileState],
+    omp_legacy_models: Option<&ConfigFileState>,
 ) -> Result<(Option<String>, Option<String>)> {
-    let Some(raw) = raw else {
+    if harness == AgentHarness::Pi {
+        return inspect_pi_values(files);
+    }
+    if harness == AgentHarness::Omp {
+        return inspect_omp_values(files, omp_legacy_models);
+    }
+    let file = &files[0];
+    let path = &file.path;
+    let Some(raw) = file.snapshot.raw.as_deref() else {
         return Ok((None, None));
     };
     let text = std::str::from_utf8(raw)
@@ -551,7 +751,49 @@ fn inspect_values(
             }
             Ok((None, None))
         }
+        AgentHarness::Pi | AgentHarness::Omp => unreachable!("handled above"),
     }
+}
+
+fn inspect_pi_values(files: &[ConfigFileState]) -> Result<(Option<String>, Option<String>)> {
+    let models = json_file_value(&files[0])?;
+    let settings = json_file_value(&files[1])?;
+    let endpoint = models
+        .as_ref()
+        .and_then(|value| json_string_at(value, &["providers", "rocm-local", "baseUrl"]));
+    let model = settings.as_ref().and_then(|value| {
+        (json_string_at(value, &["defaultProvider"]).as_deref() == Some("rocm-local"))
+            .then(|| json_string_at(value, &["defaultModel"]))
+            .flatten()
+    });
+    Ok((endpoint, model))
+}
+
+fn inspect_omp_values(
+    files: &[ConfigFileState],
+    legacy_models: Option<&ConfigFileState>,
+) -> Result<(Option<String>, Option<String>)> {
+    let models = yaml_file_at(files, 0)?;
+    let settings = yaml_file_at(files, 1)?;
+    let legacy_endpoint = legacy_models
+        .and_then(|file| json_file_value(file).ok().flatten())
+        .and_then(|value| json_string_at(&value, &["providers", "rocm-local", "baseUrl"]));
+    let endpoint = yaml_path_string(&models, "providers.rocm-local.baseUrl").or(legacy_endpoint);
+    let model = yaml_path_string(&settings, "modelRoles.default")
+        .and_then(|value| value.strip_prefix("rocm-local/").map(str::to_owned));
+    Ok((endpoint, model))
+}
+
+fn json_file_value(file: &ConfigFileState) -> Result<Option<Value>> {
+    file.snapshot
+        .raw
+        .as_deref()
+        .map(|raw| {
+            let text = std::str::from_utf8(raw)
+                .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?;
+            parse_json_value(text, &file.path)
+        })
+        .transpose()
 }
 
 fn parse_json_value(text: &str, path: &Path) -> Result<Value> {
@@ -600,28 +842,49 @@ fn direct_json_plan<F>(state: &ConfigState, edit: F) -> Result<(Vec<SemanticChan
 where
     F: FnOnce(&CstObject, &mut Vec<SemanticChange>) -> Result<()>,
 {
-    let text = state
+    let (changes, after) = direct_json_edit(state, 0, edit)?;
+    Ok(direct_result(0, changes, after))
+}
+
+fn direct_json_edit<F>(
+    state: &ConfigState,
+    file_index: usize,
+    edit: F,
+) -> Result<(Vec<SemanticChange>, Option<Vec<u8>>)>
+where
+    F: FnOnce(&CstObject, &mut Vec<SemanticChange>) -> Result<()>,
+{
+    let file = state.file(file_index);
+    let text = file
         .snapshot
         .raw
         .as_deref()
         .map(std::str::from_utf8)
         .transpose()
-        .with_context(|| format!("{} is not valid UTF-8", state.path.display()))?
+        .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?
         .unwrap_or("{}\n");
     let root = CstRootNode::parse(text, &ParseOptions::default())
-        .with_context(|| format!("failed to parse {} as JSONC", state.path.display()))?;
+        .with_context(|| format!("failed to parse {} as JSONC", file.path.display()))?;
     let object = match root.object_value() {
         Some(object) => object,
         None if root.value().is_none() => root.object_value_or_set(),
-        None => bail!("{} must contain a JSON object", state.path.display()),
+        None => bail!("{} must contain a JSON object", file.path.display()),
     };
     let mut changes = Vec::new();
     edit(&object, &mut changes)?;
-    if changes.is_empty() {
-        Ok((changes, PlanPayload::None))
-    } else {
-        Ok((changes, PlanPayload::Direct(root.to_string().into_bytes())))
-    }
+    let after = (!changes.is_empty()).then(|| root.to_string().into_bytes());
+    Ok((changes, after))
+}
+
+fn direct_result(
+    file: usize,
+    changes: Vec<SemanticChange>,
+    after: Option<Vec<u8>>,
+) -> (Vec<SemanticChange>, PlanPayload) {
+    let payload = after.map_or(PlanPayload::None, |after| {
+        PlanPayload::Direct(vec![DirectWrite { file, after }])
+    });
+    (changes, payload)
 }
 
 fn json_object(parent: &CstObject, key: &str) -> Result<CstObject> {
@@ -673,6 +936,80 @@ fn json_set(
     } else {
         parent.append(key, desired.into());
     }
+}
+
+fn direct_pi_plan(
+    state: &ConfigState,
+    target: &ResolvedTarget,
+) -> Result<(Vec<SemanticChange>, PlanPayload)> {
+    let (mut changes, models_after) = direct_json_edit(state, 0, |root, changes| {
+        let providers = json_object(root, "providers")?;
+        let provider = json_object(&providers, "rocm-local")?;
+        json_set(
+            &provider,
+            "baseUrl",
+            &target.api_base,
+            "providers.rocm-local.baseUrl",
+            changes,
+        );
+        json_set(
+            &provider,
+            "api",
+            "openai-completions",
+            "providers.rocm-local.api",
+            changes,
+        );
+        json_set(
+            &provider,
+            "apiKey",
+            LOCAL_CREDENTIAL,
+            "providers.rocm-local.apiKey",
+            changes,
+        );
+        let models = json_array(&provider, "models")?;
+        if !models.elements().into_iter().any(|node| {
+            node.as_object()
+                .and_then(|model| model.get("id"))
+                .and_then(|property| property.value())
+                .and_then(|value| value.as_string_lit())
+                .and_then(|value| value.decoded_value().ok())
+                .is_some_and(|id| id == target.model)
+        }) {
+            push_change(
+                changes,
+                "providers.rocm-local.models[].id",
+                None,
+                &Value::String(target.model.clone()),
+            );
+            models.append(CstInputValue::Object(vec![(
+                "id".to_owned(),
+                target.model.clone().into(),
+            )]));
+        }
+        Ok(())
+    })?;
+    let (settings_changes, settings_after) = direct_json_edit(state, 1, |root, changes| {
+        json_set(
+            root,
+            "defaultProvider",
+            "rocm-local",
+            "defaultProvider",
+            changes,
+        );
+        json_set(root, "defaultModel", &target.model, "defaultModel", changes);
+        Ok(())
+    })?;
+    changes.extend(settings_changes);
+    let writes = [(0, models_after), (1, settings_after)]
+        .into_iter()
+        .filter_map(|(file, after)| after.map(|after| DirectWrite { file, after }))
+        .collect::<Vec<_>>();
+    let payload = if writes.is_empty() {
+        PlanPayload::None
+    } else {
+        PlanPayload::Direct(writes)
+    };
+    Ok((changes, payload))
 }
 
 fn qwen_json(
@@ -789,17 +1126,18 @@ fn direct_toml_plan(
     state: &ConfigState,
     target: &ResolvedTarget,
 ) -> Result<(Vec<SemanticChange>, PlanPayload)> {
-    let text = state
+    let file = state.file(0);
+    let text = file
         .snapshot
         .raw
         .as_deref()
         .map(std::str::from_utf8)
         .transpose()
-        .with_context(|| format!("{} is not valid UTF-8", state.path.display()))?
+        .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?
         .unwrap_or("");
     let mut document = text
         .parse::<DocumentMut>()
-        .with_context(|| format!("failed to parse {} as TOML", state.path.display()))?;
+        .with_context(|| format!("failed to parse {} as TOML", file.path.display()))?;
     let mut changes = Vec::new();
     toml_set_string(&mut document["model"], &target.model, "model", &mut changes);
     toml_set_string(
@@ -836,14 +1174,8 @@ fn direct_toml_plan(
         );
         *auth_item = value(false);
     }
-    if changes.is_empty() {
-        Ok((changes, PlanPayload::None))
-    } else {
-        Ok((
-            changes,
-            PlanPayload::Direct(document.to_string().into_bytes()),
-        ))
-    }
+    let after = (!changes.is_empty()).then(|| document.to_string().into_bytes());
+    Ok(direct_result(0, changes, after))
 }
 
 fn toml_set_string(
@@ -999,20 +1331,25 @@ fn continue_model(target: &ResolvedTarget) -> Mapping {
 }
 
 fn yaml_file(state: &ConfigState) -> Result<YamlFile> {
-    let text = state
+    yaml_file_at(&state.files, 0)
+}
+
+fn yaml_file_at(files: &[ConfigFileState], file_index: usize) -> Result<YamlFile> {
+    let file = &files[file_index];
+    let text = file
         .snapshot
         .raw
         .as_deref()
         .map(std::str::from_utf8)
         .transpose()
-        .with_context(|| format!("{} is not valid UTF-8", state.path.display()))?
+        .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?
         .unwrap_or("");
     if text.trim().is_empty() {
-        let file = YamlFile::new();
-        file.ensure_document();
-        Ok(file)
+        let yaml = YamlFile::new();
+        yaml.ensure_document();
+        Ok(yaml)
     } else {
-        parse_yaml(text, &state.path)
+        parse_yaml(text, &file.path)
     }
 }
 
@@ -1032,11 +1369,8 @@ fn yaml_result(
     file: &YamlFile,
     changes: Vec<SemanticChange>,
 ) -> Result<(Vec<SemanticChange>, PlanPayload)> {
-    if changes.is_empty() {
-        Ok((changes, PlanPayload::None))
-    } else {
-        Ok((changes, PlanPayload::Direct(file.to_string().into_bytes())))
-    }
+    let after = (!changes.is_empty()).then(|| file.to_string().into_bytes());
+    Ok(direct_result(0, changes, after))
 }
 
 fn yaml_set_string(
@@ -1071,6 +1405,309 @@ fn yaml_path_string(file: &YamlFile, path: &str) -> Option<String> {
     file.document()?
         .get_path(path)
         .and_then(|node| node.as_scalar().map(yaml_edit::Scalar::as_string))
+}
+
+fn direct_omp_plan(
+    state: &ConfigState,
+    target: &ResolvedTarget,
+) -> Result<(Vec<SemanticChange>, PlanPayload)> {
+    let models_file = yaml_file_at(&state.files, 0)?;
+    let models_root = models_file
+        .document()
+        .and_then(|document| document.as_mapping())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} must contain a YAML mapping",
+                state.file(0).path.display()
+            )
+        })?;
+    let mut changes = Vec::new();
+    let models_after = if models_root.get("providers").is_none() {
+        push_omp_provider_changes(&mut changes, target);
+        Some(yaml_append_mapping_entry(
+            &models_file,
+            &models_root,
+            omp_models(target)?,
+        )?)
+    } else {
+        let providers = yaml_mapping(&models_root, "providers")?;
+        if providers.get("rocm-local").is_none() {
+            push_omp_provider_changes(&mut changes, target);
+            Some(yaml_append_mapping_entry(
+                &models_file,
+                &providers,
+                omp_provider(target)?.build().build(),
+            )?)
+        } else {
+            let provider = yaml_mapping(&providers, "rocm-local")?;
+            yaml_set_string(
+                &provider,
+                "baseUrl",
+                &target.api_base,
+                "providers.rocm-local.baseUrl",
+                &mut changes,
+            );
+            yaml_set_string(
+                &provider,
+                "auth",
+                "none",
+                "providers.rocm-local.auth",
+                &mut changes,
+            );
+            yaml_set_string(
+                &provider,
+                "api",
+                "openai-completions",
+                "providers.rocm-local.api",
+                &mut changes,
+            );
+            let missing_entry = if let Some(node) = provider.get("models") {
+                let models = node
+                    .as_sequence()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "configuration setting providers.rocm-local.models must be a YAML sequence"
+                        )
+                    })?
+                    .clone();
+                let mut found = false;
+                for entry in models.values() {
+                    let Some(model) = entry.as_mapping() else {
+                        continue;
+                    };
+                    if yaml_mapping_string(model, "id").as_deref() == Some(target.model.as_str()) {
+                        yaml_set_string(
+                            model,
+                            "name",
+                            &target.model,
+                            "providers.rocm-local.models[].name",
+                            &mut changes,
+                        );
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    None
+                } else {
+                    if models.is_flow_style() {
+                        bail!(
+                            "configuration setting providers.rocm-local.models must use block YAML style"
+                        );
+                    }
+                    changes.push(SemanticChange {
+                        setting: "providers.rocm-local.models[].id".to_owned(),
+                        old_value: None,
+                        new_value: target.model.clone(),
+                    });
+                    let source = models_file.to_string();
+                    let start = models.byte_range().start as usize;
+                    if start > source.len() || !source.is_char_boundary(start) {
+                        bail!("failed to locate YAML sequence insertion point");
+                    }
+                    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+                    let indent = source[line_start..]
+                        .bytes()
+                        .take_while(|byte| *byte == b' ')
+                        .count();
+                    let model = omp_model(target)?;
+                    Some((
+                        models.byte_range().end as usize,
+                        SequenceBuilder::new().item(model).build().build(),
+                        indent,
+                    ))
+                }
+            } else {
+                if provider.is_flow_style() {
+                    bail!("configuration setting providers.rocm-local must use block YAML style");
+                }
+                changes.push(SemanticChange {
+                    setting: "providers.rocm-local.models[].id".to_owned(),
+                    old_value: None,
+                    new_value: target.model.clone(),
+                });
+                let model = omp_model(target)?;
+                Some((
+                    provider.byte_range().end as usize,
+                    MappingBuilder::new()
+                        .sequence("models", |models| models.item(model))
+                        .build()
+                        .build(),
+                    provider.detect_indentation_level(),
+                ))
+            };
+            if changes.is_empty() {
+                None
+            } else if let Some((offset, entry, indent)) = missing_entry {
+                Some(yaml_append_entry(&models_file, offset, entry, indent)?)
+            } else {
+                Some(models_file.to_string().into_bytes())
+            }
+        }
+    };
+
+    let config_file = yaml_file_at(&state.files, 1)?;
+    let config_root = config_file
+        .document()
+        .and_then(|document| document.as_mapping())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} must contain a YAML mapping",
+                state.file(1).path.display()
+            )
+        })?;
+    let mut config_changes = Vec::new();
+    let config_after = if config_root.get("modelRoles").is_none() {
+        push_change(
+            &mut config_changes,
+            "modelRoles.default",
+            None,
+            &Value::String(format!("rocm-local/{}", target.model)),
+        );
+        Some(yaml_append_mapping_entry(
+            &config_file,
+            &config_root,
+            MappingBuilder::new()
+                .mapping("modelRoles", |roles| {
+                    roles.pair("default", format!("rocm-local/{}", target.model))
+                })
+                .build()
+                .build(),
+        )?)
+    } else {
+        let roles = yaml_mapping(&config_root, "modelRoles")?;
+        yaml_set_string(
+            &roles,
+            "default",
+            &format!("rocm-local/{}", target.model),
+            "modelRoles.default",
+            &mut config_changes,
+        );
+        (!config_changes.is_empty()).then(|| config_file.to_string().into_bytes())
+    };
+    changes.extend(config_changes);
+
+    let writes = [(0, models_after), (1, config_after)]
+        .into_iter()
+        .filter_map(|(file, after)| after.map(|after| DirectWrite { file, after }))
+        .collect::<Vec<_>>();
+    let payload = if writes.is_empty() {
+        PlanPayload::None
+    } else {
+        PlanPayload::Direct(writes)
+    };
+    Ok((changes, payload))
+}
+
+fn yaml_mapping(parent: &Mapping, key: &str) -> Result<Mapping> {
+    parent
+        .get(key)
+        .and_then(|node| node.as_mapping().cloned())
+        .ok_or_else(|| anyhow::anyhow!("configuration setting {key} must be a YAML mapping"))
+}
+
+fn push_omp_provider_changes(changes: &mut Vec<SemanticChange>, target: &ResolvedTarget) {
+    for (setting, value) in [
+        ("providers.rocm-local.baseUrl", target.api_base.as_str()),
+        ("providers.rocm-local.auth", "none"),
+        ("providers.rocm-local.api", "openai-completions"),
+    ] {
+        push_change(changes, setting, None, &Value::String(value.to_owned()));
+    }
+    changes.push(SemanticChange {
+        setting: "providers.rocm-local.models[].id".to_owned(),
+        old_value: None,
+        new_value: target.model.clone(),
+    });
+}
+
+fn yaml_append_mapping_entry(
+    file: &YamlFile,
+    parent: &Mapping,
+    entry: YamlFile,
+) -> Result<Vec<u8>> {
+    if parent.is_flow_style() {
+        bail!("configuration mapping must use block YAML style");
+    }
+    yaml_append_entry(
+        file,
+        parent.byte_range().end as usize,
+        entry,
+        parent.detect_indentation_level(),
+    )
+}
+
+fn yaml_append_entry(
+    file: &YamlFile,
+    offset: usize,
+    entry: YamlFile,
+    indent: usize,
+) -> Result<Vec<u8>> {
+    let mut yaml = file.to_string();
+    if offset > yaml.len() || !yaml.is_char_boundary(offset) {
+        bail!("failed to locate YAML mapping insertion point");
+    }
+    let rendered = entry.to_string();
+    let eol = if yaml.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut addition =
+        String::with_capacity(rendered.len() + indent * rendered.lines().count() + eol.len() * 2);
+    if offset > 0 && !yaml[..offset].ends_with('\n') {
+        addition.push_str(eol);
+    }
+    let padding = " ".repeat(indent);
+    for (index, line) in rendered.lines().enumerate() {
+        if index > 0 {
+            addition.push_str(eol);
+        }
+        addition.push_str(&padding);
+        addition.push_str(line);
+    }
+    if offset == yaml.len() || !yaml[offset..].starts_with(eol) {
+        addition.push_str(eol);
+    }
+    yaml.insert_str(offset, &addition);
+    Ok(yaml.into_bytes())
+}
+
+fn omp_models(target: &ResolvedTarget) -> Result<YamlFile> {
+    Ok(MappingBuilder::new()
+        .mapping("providers", |providers| {
+            providers.mapping("rocm-local", |provider| {
+                provider
+                    .pair("baseUrl", target.api_base.clone())
+                    .pair("auth", "none")
+                    .pair("api", "openai-completions")
+                    .sequence("models", |models| {
+                        models.mapping(|model| {
+                            model
+                                .pair("id", target.model.clone())
+                                .pair("name", target.model.clone())
+                        })
+                    })
+            })
+        })
+        .build()
+        .build())
+}
+
+fn omp_provider(target: &ResolvedTarget) -> Result<MappingBuilder> {
+    let model = omp_model(target)?;
+    Ok(MappingBuilder::new().mapping("rocm-local", |provider| {
+        provider
+            .pair("baseUrl", target.api_base.clone())
+            .pair("auth", "none")
+            .pair("api", "openai-completions")
+            .sequence("models", |models| models.item(model))
+    }))
+}
+
+fn omp_model(target: &ResolvedTarget) -> Result<Mapping> {
+    MappingBuilder::new()
+        .pair("id", target.model.clone())
+        .pair("name", target.model.clone())
+        .build_document()
+        .as_mapping()
+        .ok_or_else(|| anyhow::anyhow!("failed to build OMP model mapping"))
 }
 
 fn direct_hermes_plan(
@@ -1232,14 +1869,15 @@ fn native_openclaw_plan(
 ) -> Result<(Vec<SemanticChange>, PlanPayload)> {
     let executable = native_executable(version, AgentHarness::OpenClaw)?;
     let desired = OpenClawDesired::new(target);
-    let value = state
+    let file = state.file(0);
+    let value = file
         .snapshot
         .raw
         .as_deref()
         .map(std::str::from_utf8)
         .transpose()
-        .with_context(|| format!("{} is not valid UTF-8", state.path.display()))?
-        .map(|text| parse_json_value(text, &state.path))
+        .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?
+        .map(|text| parse_json_value(text, &file.path))
         .transpose()?
         .unwrap_or_else(|| json!({}));
     let mut changes = Vec::new();
@@ -1357,12 +1995,13 @@ fn native_set(setting: &str, value: &str) -> NativeInvocation {
 }
 
 fn yaml_raw_string(state: &ConfigState, path: &str) -> Result<Option<String>> {
-    let Some(raw) = state.snapshot.raw.as_deref() else {
+    let file = state.file(0);
+    let Some(raw) = file.snapshot.raw.as_deref() else {
         return Ok(None);
     };
     let text = std::str::from_utf8(raw)
-        .with_context(|| format!("{} is not valid UTF-8", state.path.display()))?;
-    Ok(yaml_path_string(&parse_yaml(text, &state.path)?, path))
+        .with_context(|| format!("{} is not valid UTF-8", file.path.display()))?;
+    Ok(yaml_path_string(&parse_yaml(text, &file.path)?, path))
 }
 
 fn native_change(
@@ -1396,21 +2035,22 @@ fn native_json_change(
 }
 
 fn apply_native(plan: &ConfigPlan, native: &NativePlan) -> Result<AppliedConfig> {
+    let file = plan.state.file(0);
     for invocation in &native.invocations {
         if let Err(error) = run_native(&native.executable, invocation) {
-            let _ = transaction::restore_if_changed(&plan.state.path, &plan.state.snapshot);
+            let _ = transaction::restore_if_changed(&file.path, &file.snapshot);
             return Err(error);
         }
     }
-    transaction::reject_symlink(&plan.state.path)?;
-    let after = transaction::read_optional(&plan.state.path)?;
+    transaction::reject_symlink(&file.path)?;
+    let after = transaction::read_optional(&file.path)?;
     Ok(AppliedConfig {
         changed: true,
-        rollback: Some(Rollback::new(
-            plan.state.path.clone(),
-            plan.state.snapshot.clone(),
+        rollbacks: vec![Rollback::new(
+            file.path.clone(),
+            file.snapshot.clone(),
             after,
-        )),
+        )],
     })
 }
 

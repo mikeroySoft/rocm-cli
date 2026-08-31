@@ -34,7 +34,7 @@ impl Rollback {
         }
     }
 
-    pub(super) fn restore(&self) -> Result<()> {
+    fn ensure_restorable(&self) -> Result<()> {
         reject_symlink(&self.path)?;
         if read_optional(&self.path)? != self.after {
             bail!(
@@ -42,8 +42,44 @@ impl Rollback {
                 self.path.display()
             );
         }
+        Ok(())
+    }
+
+    fn restore(&self) -> Result<()> {
+        self.ensure_restorable()?;
         restore_snapshot(&self.path, &self.before)
     }
+}
+
+pub(super) fn restore_all(rollbacks: &[Rollback]) -> Result<()> {
+    for rollback in rollbacks {
+        rollback.ensure_restorable()?;
+    }
+    let failures = rollbacks
+        .iter()
+        .rev()
+        .filter_map(|rollback| rollback.restore().err().map(|error| format!("{error:#}")))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("failed to roll back configuration: {}", failures.join("; "))
+    }
+}
+
+pub(super) fn restore_failed_write(path: &Path, before: &Snapshot, intended: &[u8]) -> Result<()> {
+    reject_symlink(path)?;
+    let actual = read_optional(path)?;
+    if actual == before.raw {
+        return Ok(());
+    }
+    if actual.as_deref() != Some(intended) {
+        bail!(
+            "refusing to restore stale configuration {}; it changed during setup",
+            path.display()
+        );
+    }
+    restore_snapshot(path, before)
 }
 
 pub(super) fn snapshot(path: &Path) -> Result<Snapshot> {

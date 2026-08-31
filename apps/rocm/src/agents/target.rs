@@ -29,6 +29,7 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: u64 = 256 * 1024;
 const TEST_TIMEOUT_ENV: &str = "ROCM_CLI_AGENT_TEST_TIMEOUT_SECS";
+const TARGET_FALLBACK_URL_ENV: &str = "ROCM_CLI_AGENT_TARGET_FALLBACK_URL";
 
 pub(super) fn detect_version(
     harness: AgentHarness,
@@ -153,7 +154,8 @@ pub(super) fn resolve_target(
         });
     }
 
-    let fallback = format!("http://{DEFAULT_LOCAL_HOST}:{DEFAULT_LOCAL_PORT}");
+    let fallback = env::var(TARGET_FALLBACK_URL_ENV)
+        .unwrap_or_else(|_| format!("http://{DEFAULT_LOCAL_HOST}:{DEFAULT_LOCAL_PORT}"));
     let (origin, api_base) = normalize_loopback_url(&fallback)?;
     let model = match explicit_model {
         Some(model) => model.to_owned(),
@@ -238,7 +240,11 @@ pub(super) fn check_target(harness: AgentHarness, target: &ResolvedTarget) -> Re
     }
 }
 
-pub(super) fn run_harness_test(harness: AgentHarness, version: &VersionInfo) -> Result<()> {
+pub(super) fn run_harness_test(
+    harness: AgentHarness,
+    version: &VersionInfo,
+    configured_model: Option<&str>,
+) -> Result<()> {
     let executable = version.executable.as_deref().ok_or_else(|| {
         anyhow!(
             "{} executable `{}` is not installed",
@@ -370,6 +376,66 @@ pub(super) fn run_harness_test(harness: AgentHarness, version: &VersionInfo) -> 
                 "Fetch",
                 "--exclude",
                 "UploadArtifact",
+            ]));
+        }
+        AgentHarness::Pi => {
+            let configured_model = configured_model
+                .ok_or_else(|| anyhow!("pi harness test requires a configured model"))?;
+            owned_args.extend(strings(&[
+                "-p",
+                "--no-session",
+                "--no-approve",
+                "--no-context-files",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--tools",
+                "read",
+                "--provider",
+                "rocm-local",
+                "--model",
+                configured_model,
+                "--api-key",
+                "rocm-local",
+                "--",
+                prompt,
+            ]));
+            env_overrides.extend([
+                ("PI_OFFLINE", "1"),
+                ("PI_SKIP_VERSION_CHECK", "1"),
+                ("HTTP_PROXY", ""),
+                ("HTTPS_PROXY", ""),
+                ("ALL_PROXY", ""),
+                ("http_proxy", ""),
+                ("https_proxy", ""),
+                ("all_proxy", ""),
+                ("NO_PROXY", "*"),
+                ("no_proxy", "*"),
+            ]);
+        }
+        AgentHarness::Omp => {
+            let configured_model = configured_model
+                .ok_or_else(|| anyhow!("omp harness test requires a configured model"))?;
+            let model = format!("rocm-local/{configured_model}");
+            owned_args.extend(strings(&[
+                "-p",
+                "--cwd",
+                &workspace_text,
+                "--no-session",
+                "--no-title",
+                "--no-tools",
+                "--no-lsp",
+                "--no-pty",
+                "--no-extensions",
+                "--no-skills",
+                "--no-rules",
+                "--model",
+                &model,
+                "--max-time",
+                &timeout_secs,
+                "@probe.txt",
+                "Return exactly the contents of the attached probe.txt.",
             ]));
         }
     }
@@ -563,6 +629,15 @@ fn first_semantic_version(output: &str) -> Option<Version> {
         let token = token.trim_matches(|character: char| {
             !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '+')
         });
+        let token = token
+            .split_once('/')
+            .filter(|(prefix, _)| {
+                !prefix.is_empty()
+                    && prefix
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            })
+            .map_or(token, |(_, version)| version);
         let token = token
             .strip_prefix('v')
             .or_else(|| token.strip_prefix('V'))

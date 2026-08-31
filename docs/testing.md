@@ -151,8 +151,8 @@ rocm install sdk --channel release --format wheel --dry-run
 ## Agent Harness Setup E2E
 
 The `rocm agents` behavior spec is
-[`agents.feature`](../tests/e2e-cucumber/features/agents.feature). Run its 30
-mock scenarios through the existing E2E workflow:
+[`agents.feature`](../tests/e2e-cucumber/features/agents.feature). Run its 35
+default mock scenarios through the existing E2E workflow:
 
 ```bash
 E2E_ONLY_AGENTS=1 cargo xtask e2e
@@ -162,15 +162,17 @@ The focused selector stays inside the suite's expectation and capability
 resolver. Do not select this feature with cucumber `--tags` or `-n`; those
 filters bypass that resolver.
 
-The mock scenarios cover list and inspect output, managed-service detection and
-the default endpoint fallback, dry-run and approval behavior, safe config
-updates, rollback and `--no-check`, version selection, protocol routes, and
-isolated harness probes. Harness-binary coverage is deliberately narrower:
+The mock scenarios cover list and inspect output for all ten harnesses,
+managed-service detection and the default endpoint fallback, dry-run and
+approval behavior, safe config updates, rollback and `--no-check`, version
+selection, protocol routes, precedence warnings, and isolated harness probes.
+Harness-binary coverage is deliberately narrower:
 
-| Harnesses | Harness-binary coverage |
-|---|---|
-| Claude Code and Codex | Fake-harness coverage in the 30 mock scenarios, plus one gated real-binary scenario |
-| Hermes, OpenClaw, OpenCode, Qwen Code, Aider, and Continue | Fake-harness CLI argv coverage only; no real-binary lane exists yet |
+| Harnesses | Focused mock coverage | Real-binary coverage |
+|---|---|---|
+| Claude Code and Codex | Fake configuration, protocol, and CLI argv | One gated real-binary scenario |
+| Hermes, OpenClaw, OpenCode, Qwen Code, Aider, and Continue | Fake configuration, protocol, and CLI argv | None |
+| Pi `0.84.4` and OMP `18.0.11` (major-18 gate) | Fake version acceptance and rejection, two-file lossless setup and rollback, second-file safety, precedence warnings, Chat Completions, exact safe CLI argv, OMP relative config-root and profile resolution, and legacy-registry refusal | None; fake binaries only |
 
 The real Claude Code and Codex scenario uses a GPU-served vLLM model and is
 excluded unless both opt-ins are set:
@@ -183,6 +185,10 @@ It also requires Linux, a supported AMD GPU, an active managed runtime, vLLM,
 and real `claude` and `codex` executables on `PATH`. The presence of this gated
 scenario is not itself a coverage claim: count it as real-binary coverage only
 for a lane that meets those prerequisites and actually runs it.
+
+Pi and OMP remain fake-binary validation unless a qualifying opt-in real lane
+actually exercises setup and the nonce probe; executable detection alone is
+not real-binary coverage.
 
 ## TheRock SDK Install Test
 
