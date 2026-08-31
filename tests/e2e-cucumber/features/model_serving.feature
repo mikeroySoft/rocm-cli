@@ -164,3 +164,8 @@ Feature: Model serving
     When the user serves a model selecting both a runtime and an environment
     Then serving is refused before any engine starts
     And the user is told the two selectors cannot be combined
+
+  @id:model-list-ornith
+  Scenario: 16 - Ornith is listed as an available model
+    When the user lists recommended models
+    Then Ornith appears in the model list

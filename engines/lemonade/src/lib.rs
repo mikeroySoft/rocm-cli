@@ -5,10 +5,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
-    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_http_base_url, http_get_text_with_auth,
-    normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
-    runtime_is_windows,
+    AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_runtime_environment, download_file_to_path,
+    format_http_base_url, http_get_text_with_auth, normalize_runtime_path_for_host,
+    prepend_runtime_paths, require_nonempty, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -387,6 +386,9 @@ fn capabilities() -> EngineCapabilities {
 
 fn detect_response() -> DetectResponse {
     let runtime = resolve_runtime().ok();
+    let backend_ready = runtime
+        .as_ref()
+        .is_some_and(|runtime| find_llama_server_binary(&runtime.manifest).is_some());
     let mut notes = Vec::new();
     if let Some(runtime) = runtime.as_ref() {
         notes.push(format!(
@@ -394,10 +396,17 @@ fn detect_response() -> DetectResponse {
             runtime.manifest.version,
             runtime.manifest.runtime_dir.display()
         ));
-        notes.push(format!(
-            "Lemonade llama.cpp backend selected for this GPU: {}:{}",
-            runtime.manifest.backend_recipe, runtime.manifest.backend_name
-        ));
+        if backend_ready {
+            notes.push(format!(
+                "Lemonade llama.cpp backend selected for this GPU: {}:{}",
+                runtime.manifest.backend_recipe, runtime.manifest.backend_name
+            ));
+        } else {
+            notes.push(
+                "Lemonade's managed GPU llama.cpp backend is missing; run `rocm engines install lemonade`"
+                    .to_owned(),
+            );
+        }
     } else {
         notes.push(
             "Lemonade embeddable is not installed yet; run `rocm engines install lemonade`"
@@ -405,7 +414,7 @@ fn detect_response() -> DetectResponse {
         );
     }
     DetectResponse {
-        installed: runtime.is_some(),
+        installed: backend_ready,
         env_id: runtime
             .as_ref()
             .map(|runtime| runtime.manifest.env_id.clone()),
@@ -417,7 +426,7 @@ fn detect_response() -> DetectResponse {
         python_version: None,
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![gpu_availability_device(runtime.is_some())],
+        available_devices: vec![gpu_availability_device(backend_ready)],
         capabilities: capabilities(),
         notes,
     }
@@ -1131,6 +1140,13 @@ fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Resu
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
     manifest.backend_name = result?;
+    if find_llama_server_binary(manifest).is_none() {
+        bail!(
+            "Lemonade reported {LLAMACPP_RECIPE}:{} installed, but no GPU llama-server was written under {}",
+            manifest.backend_name,
+            manifest.runtime_dir.join("bin").join("llamacpp").display()
+        );
+    }
     Ok(())
 }
 
@@ -1142,7 +1158,7 @@ fn ensure_best_llamacpp_backend(
     port: u16,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<String> {
-    let listing = run_lemonade_backends_list(manifest, process_env)?;
+    let listing = run_lemonade_backends_list(manifest, host, port, process_env)?;
     let backends = parse_llamacpp_backend_statuses(&listing);
     let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
         bail!(
@@ -1235,12 +1251,20 @@ fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
         .join(", ")
 }
 
+/// Query the short-lived managed server explicitly. The Lemonade CLI is an HTTP
+/// client; without `--host`/`--port` it queries the default user server instead.
 fn run_lemonade_backends_list(
     manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<String> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
+        .arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
         .arg("backends")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2150,7 +2174,7 @@ fn child_process_path(path: &Path) -> String {
 fn lemonade_process_environment() -> Result<LemonadeProcessEnvironment> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    let Some(env) = active_managed_therock_environment(&paths, &config)? else {
+    let Some(env) = active_runtime_environment(&paths, &config)? else {
         return Ok(LemonadeProcessEnvironment::default());
     };
     Ok(LemonadeProcessEnvironment {
@@ -2934,6 +2958,7 @@ fn serve_direct_llama_server(
         .arg("999")
         .arg("--alias")
         .arg(&request.model_ref)
+        .arg("--metrics")
         .stdin(Stdio::null());
     if let Some(engine_recipe) = request.engine_recipe.as_ref() {
         command.args(&engine_recipe.required_flags);
