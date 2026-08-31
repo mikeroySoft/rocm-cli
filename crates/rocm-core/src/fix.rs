@@ -1037,11 +1037,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
-        // marker.
+        // marker. Go through the resolver seam with no system search dirs so the
+        // host's real /opt/rocm can't stand in for the empty ROCM_PATH.
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
@@ -1050,17 +1050,7 @@ mod tests {
         let empty = root.join("6.10");
         std::fs::create_dir_all(&empty).expect("create empty dir");
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &empty);
-        }
-        let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        let found = crate::discover_rocm_installs_in(&[], Some(&empty));
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
