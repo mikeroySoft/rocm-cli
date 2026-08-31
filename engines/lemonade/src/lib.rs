@@ -5584,10 +5584,14 @@ vllm                rocm        unsupported     Requires Linux                  
                 .map(|(_, value)| value.clone())
         }
 
+        // The tier-3 ancestry walk validates every component up to `/`, so the
+        // scratch must sit under a root with standard-safe (sticky) ancestry.
+        // The system temp dir provides that on any host; the checkout does not
+        // (a group-writable `$HOME` ancestor is legitimately refused).
         fn runtime_scratch() -> tempfile::TempDir {
             tempfile::Builder::new()
                 .prefix(".lemonade-runtime-test-")
-                .tempdir_in(std::env::current_dir().expect("current directory"))
+                .tempdir()
                 .expect("private-ancestry scratch")
         }
         fn vars_for(parent: &ParentRuntimeEnvironment) -> Vec<(&'static str, OsString)> {
