@@ -346,6 +346,25 @@ async fn managed_model_metrics_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("GPU, per-core CPU, VRAM, and combined I/O instruments are displayed")]
+async fn observe_hardware_instruments_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("GPU activity", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("GPU activity instrument did not appear: {e}"));
+    let screen = tui.screen_text();
+    for label in ["VRAM occupancy", "CPU ·", " cores", "C0", "Disk + Net"] {
+        assert!(
+            screen.contains(label),
+            "Observe hardware instrument {label:?} missing:\n{screen}"
+        );
+    }
+    assert!(
+        !screen.contains("Unknown CPU"),
+        "Observe did not display the collected CPU model:\n{screen}"
+    );
+}
+
 #[then("navigation and next-step guidance are displayed")]
 async fn navigation_guidance_displayed(world: &mut E2eWorld) {
     let tui = session(world);

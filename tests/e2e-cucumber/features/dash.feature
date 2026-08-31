@@ -38,6 +38,7 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then live serving metrics are displayed for the managed model
+    And GPU, per-core CPU, VRAM, and combined I/O instruments are displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
 

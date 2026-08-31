@@ -2,17 +2,14 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Hardware Observe sub-panel — full-screen detail of host CPU/memory + per-GPU panels.
+//! Hardware instrument cluster for Observe.
 //!
-//! Layout (vertical):
-//! 1. CPU panel (~10 rows): aggregate braille sparkline over history plus
-//!    per-core bars at the bottom.
-//! 2. Memory + Swap (~3 rows): two side-by-side gauges.
-//! 3. Per-GPU panels (remaining): one bordered block per GPU with stats,
-//!    firmware/partition info, and a util sparkline.
+//! A wide GPU column mirrors GPUFLO's paired activity/VRAM instruments. A
+//! narrower CPU column mirrors btop's overall meter and labeled per-core
+//! histories. Memory, swap, and combined disk/network I/O share one footer.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -20,7 +17,6 @@ use ratatui::widgets::Paragraph;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot};
 
 use crate::app::AppState;
-use crate::ui::core_bars::CoreBars;
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -31,13 +27,12 @@ use crate::ui::widgets::{
     temperature_style, trunc,
 };
 
-/// Rows consumed above the GPU section in [`draw`] (CPU 10 + mem/swap 3 + I/O 3).
-const ROWS_ABOVE_GPUS: u16 = 16;
+/// Rows outside the GPU column in [`draw`] (the shared host footer).
+const ROWS_ABOVE_GPUS: u16 = 3;
 /// Height of the GPU-section summary header (partition + efficiency).
 const GPU_HEADER_H: u16 = 1;
-/// Minimum slot height for a "full" GPU panel: border (2) + stats (1) +
-/// info (1) + sparkline (≥2).
-const FULL_PANEL_MIN_H: u16 = 6;
+/// Minimum slot height that still leaves one visible row in each paired instrument.
+const FULL_PANEL_MIN_H: u16 = 8;
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let Some(snap) = state.latest.as_ref() else {
@@ -52,129 +47,31 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+    let instruments = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
+        .split(rows[0]);
+    let host = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(10),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(2, 4),
         ])
-        .split(area);
+        .split(rows[1]);
 
-    draw_cpu(f, rows[0], state, snap, theme);
-    draw_memory_row(f, rows[1], snap, theme);
-    draw_io_row(f, rows[2], snap, theme);
-    draw_gpus(f, rows[3], state, snap, theme);
-}
-
-/// Disk and network throughput, side by side. These four fields
-/// (`disk_read_bps`, `disk_write_bps`, `net_rx_bps`, `net_tx_bps`) are
-/// collected by the host sampler but were not surfaced anywhere in the UI.
-fn draw_io_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    // Distinct roles so the two side-by-side boxes never read as one block.
-    draw_rate_block(
-        f,
-        cols[0],
-        "Disk",
-        ("read", snap.host.disk_read_bps),
-        ("write", snap.host.disk_write_bps),
-        BoxRole::Primary,
-        theme,
-    );
-    draw_rate_block(
-        f,
-        cols[1],
-        "Net",
-        ("rx", snap.host.net_rx_bps),
-        ("tx", snap.host.net_tx_bps),
-        BoxRole::Secondary,
-        theme,
-    );
-}
-
-/// A bordered block showing two labeled byte-rates on one line.
-fn draw_rate_block(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    a: (&str, u64),
-    b: (&str, u64),
-    role: BoxRole,
-    theme: &Theme,
-) {
-    let inner = panel::bento(f, area, Some(title), role, false, theme);
-    if inner.height == 0 {
-        return;
-    }
-    let line = Line::from(vec![
-        Span::styled(format!("{} ", a.0), Style::default().fg(theme.muted)),
-        Span::styled(format::bps(a.1 as f64), Style::default().fg(theme.accent)),
-        Span::styled(format!("   {} ", b.0), Style::default().fg(theme.muted)),
-        Span::styled(format::bps(b.1 as f64), Style::default().fg(theme.accent)),
-    ]);
-    f.render_widget(Paragraph::new(line), inner);
-}
-
-fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
-    let n_cores = snap.host.cpu_per_core_pct.len();
-    let title = format!(
-        "CPU · {} · {} cores",
-        format::pct(snap.host.cpu_overall_pct),
-        n_cores
-    );
-    let inner = panel::bento(f, area, Some(&title), BoxRole::Secondary, false, theme);
-    if inner.height == 0 {
-        return;
-    }
-
-    let split = if n_cores == 0 || inner.height < 4 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1)])
-            .split(inner)
-    } else {
-        let core_rows = 3u16.min(inner.height.saturating_sub(2));
-        let agg_rows = inner.height.saturating_sub(core_rows).max(1);
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(agg_rows), Constraint::Length(core_rows)])
-            .split(inner)
-    };
-
-    let data: Vec<u64> = state
-        .history
-        .iter()
-        .map(|s| s.host.cpu_overall_pct.clamp(0.0, 100.0) as u64)
-        .collect();
-    let spark = BrailleSparkline::new(&data)
-        .max(100)
-        .style(Style::default().fg(theme.accent))
-        .gradient(theme.ok, theme.warn, theme.err);
-    f.render_widget(spark, split[0]);
-
-    if split.len() == 2 {
-        let bars = CoreBars::new(&snap.host.cpu_per_core_pct)
-            .max(100.0)
-            .style(Style::default().fg(theme.ok))
-            .gradient(theme.ok, theme.warn, theme.err);
-        f.render_widget(bars, split[1]);
-    }
-}
-
-fn draw_memory_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    // Distinct roles so the two side-by-side gauges never read as one block.
+    draw_gpus(f, instruments[0], state, snap, theme);
+    let cpu_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(instruments[1]);
+    f.render_widget(Paragraph::new(cpu_section_header(snap, theme)), cpu_rows[0]);
+    draw_cpu(f, cpu_rows[1], state, snap, theme);
     draw_gauge_block(
         f,
-        cols[0],
+        host[0],
         "Memory",
         snap.host.memory_used_mb,
         snap.host.memory_total_mb,
@@ -183,13 +80,186 @@ fn draw_memory_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
     );
     draw_gauge_block(
         f,
-        cols[1],
+        host[1],
         "Swap",
         snap.host.swap_used_mb,
         snap.host.swap_total_mb,
         BoxRole::Secondary,
         theme,
     );
+    draw_io_row(f, host[2], snap, theme);
+}
+
+/// Disk and network throughput share one host-I/O box.
+fn draw_io_row(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
+    let inner = panel::bento(f, area, Some("Disk + Net"), BoxRole::Primary, false, theme);
+    if inner.height == 0 {
+        return;
+    }
+    let line = Line::from(vec![
+        Span::styled("read ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format::bps(snap.host.disk_read_bps as f64),
+            Style::default().fg(theme.accent),
+        ),
+        Span::styled("  write ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format::bps(snap.host.disk_write_bps as f64),
+            Style::default().fg(theme.accent),
+        ),
+        Span::styled("   rx ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format::bps(snap.host.net_rx_bps as f64),
+            Style::default().fg(theme.accent_2),
+        ),
+        Span::styled("  tx ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format::bps(snap.host.net_tx_bps as f64),
+            Style::default().fg(theme.accent_2),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), inner);
+}
+
+fn cpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
+    let model = snap.host.cpu_model.trim();
+    let model = if model.is_empty() {
+        "Unknown CPU".to_string()
+    } else {
+        trunc(model, 22)
+    };
+    Line::from(vec![
+        Span::styled(
+            "CPU",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {model}"), Style::default().fg(theme.fg)),
+        Span::styled(
+            format!(
+                " · {}c · {}",
+                snap.host.cpu_per_core_pct.len(),
+                format::pct(snap.host.cpu_overall_pct)
+            ),
+            Style::default().fg(theme.muted),
+        ),
+    ])
+}
+
+fn draw_cpu(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
+    let cores = &snap.host.cpu_per_core_pct;
+    let title = "CPU cores";
+    let inner = panel::bento(f, area, Some(title), BoxRole::Secondary, false, theme);
+    if inner.height == 0 {
+        return;
+    }
+
+    let ratio = f64::from(snap.host.cpu_overall_pct.clamp(0.0, 100.0)) / 100.0;
+    let meter_label = format!("CPU {}", format::pct(snap.host.cpu_overall_pct));
+    let meter = GradientGauge::new(ratio)
+        .stops(theme.ok, theme.warn, theme.err)
+        .track_bg(theme.surface_2)
+        .label(&meter_label)
+        .label_fg(theme.fg);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    f.render_widget(meter, rows[0]);
+    draw_cpu_cores(f, rows[1], cores, &state.history, theme);
+}
+
+fn draw_cpu_cores(
+    f: &mut Frame,
+    area: Rect,
+    cores: &[f32],
+    history: &std::collections::VecDeque<Snapshot>,
+    theme: &Theme,
+) {
+    const MIN_CELL_WIDTH: usize = 10;
+
+    if area.width == 0 || area.height == 0 || cores.is_empty() {
+        return;
+    }
+
+    let rows = area.height as usize;
+    let columns = cores
+        .len()
+        .div_ceil(rows)
+        .min((area.width as usize / MIN_CELL_WIDTH).max(1));
+    let grid_rows = rows - usize::from(rows * columns < cores.len());
+    let visible = cores.len().min(grid_rows * columns);
+    let cell_width = area.width / columns as u16;
+    let label_width = format!("C{} ", cores.len().saturating_sub(1)).len() as u16;
+    let mut samples = Vec::with_capacity(history.len());
+
+    for (index, value) in cores.iter().take(visible).enumerate() {
+        let column = index / grid_rows;
+        let row = index % grid_rows;
+        let x = area.x + column as u16 * cell_width;
+        let width = if column + 1 == columns {
+            area.right().saturating_sub(x)
+        } else {
+            cell_width
+        };
+        let cell = Rect::new(x, area.y + row as u16, width, 1);
+        let style = cpu_core_style(*value, theme);
+        if width < label_width + 4 {
+            f.render_widget(
+                Paragraph::new(format!("C{index} {:.0}%", value.clamp(0.0, 100.0))).style(style),
+                cell,
+            );
+            continue;
+        }
+
+        let graph_width = width - label_width - 4;
+        f.render_widget(
+            Paragraph::new(format!("C{index} ")).style(Style::default().fg(theme.fg)),
+            Rect::new(x, cell.y, label_width, 1),
+        );
+        samples.clear();
+        samples.extend(history.iter().filter_map(|snapshot| {
+            snapshot
+                .host
+                .cpu_per_core_pct
+                .get(index)
+                .map(|sample| sample.clamp(0.0, 100.0) as u64)
+        }));
+        f.render_widget(
+            BrailleSparkline::new(&samples).max(100).style(style),
+            Rect::new(x + label_width, cell.y, graph_width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(format!("{:.0}%", value.clamp(0.0, 100.0)))
+                .alignment(Alignment::Right)
+                .style(style),
+            Rect::new(x + width - 4, cell.y, 4, 1),
+        );
+    }
+
+    if visible < cores.len() {
+        let hidden = cores.len() - visible;
+        f.render_widget(
+            Paragraph::new(format!("+{hidden} cores")).style(Style::default().fg(theme.muted)),
+            Rect::new(
+                area.x,
+                area.y + area.height.saturating_sub(1),
+                area.width,
+                1,
+            ),
+        );
+    }
+}
+
+fn cpu_core_style(value: f32, theme: &Theme) -> Style {
+    Style::default().fg(if value >= 90.0 {
+        theme.err
+    } else if value >= 70.0 {
+        theme.warn
+    } else {
+        theme.ok
+    })
 }
 
 fn draw_gauge_block(
@@ -226,24 +296,25 @@ fn draw_gauge_block(
 
 fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme: &Theme) {
     if snap.gpus.is_empty() {
-        // Caution-yellow only when there is an actual warning to show; the benign
-        // "no GPUs reported" state is neutral chrome, not an alert.
-        let (lines, role): (Vec<Line>, BoxRole) = if snap.warnings.is_empty() {
-            (
-                vec![Line::from(Span::styled(
-                    "no GPUs reported",
-                    Style::default().fg(theme.muted),
-                ))],
-                BoxRole::Neutral,
-            )
+        // Keep the instrument labels visible in the unavailable state so the
+        // layout remains readable in plain output and on hosts without GPUs.
+        let mut lines = vec![Line::from(vec![
+            Span::styled("GPU activity · —", Style::default().fg(theme.muted)),
+            Span::styled("   VRAM occupancy · —", Style::default().fg(theme.muted)),
+        ])];
+        let role = if snap.warnings.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no GPUs reported",
+                Style::default().fg(theme.muted),
+            )));
+            BoxRole::Neutral
         } else {
-            (
+            lines.extend(
                 snap.warnings
                     .iter()
-                    .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn))))
-                    .collect(),
-                BoxRole::Warning,
-            )
+                    .map(|w| Line::from(Span::styled(w.clone(), Style::default().fg(theme.warn)))),
+            );
+            BoxRole::Warning
         };
         let inner = panel::bento(f, area, Some("GPUs"), role, false, theme);
         f.render_widget(Paragraph::new(lines), inner);
@@ -274,8 +345,7 @@ fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme
     }
 }
 
-/// One-line GPU-section summary: GPU count, physical/logical partitioning and
-/// per-logical VRAM (#5), total board power, and node energy efficiency (#6).
+/// One-line GPU identity and serving-efficiency summary.
 fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
     let n = snap.gpus.len();
     let mut spans = vec![Span::styled(
@@ -285,28 +355,34 @@ fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
             .add_modifier(Modifier::BOLD),
     )];
     if let Some(si) = snap.gpu_system_info.as_ref() {
-        spans.push(Span::styled(
-            format!(
-                "  ·  phys {} / logical {}",
-                si.physical_gpu_count, si.logical_gpu_count
-            ),
-            Style::default().fg(theme.muted),
-        ));
+        let model = si.gpu_model.trim();
+        if !model.is_empty() {
+            spans.push(Span::styled(
+                format!(" · {}", trunc(model, 24)),
+                Style::default().fg(theme.fg),
+            ));
+        }
+        if si.physical_gpu_count != n as u32 || si.logical_gpu_count != n as u32 {
+            spans.push(Span::styled(
+                format!(" · {}p/{}l", si.physical_gpu_count, si.logical_gpu_count),
+                Style::default().fg(theme.muted),
+            ));
+        }
         if si.vram_per_logical_gpu_mb > 0 {
             spans.push(Span::styled(
-                format!("  ·  {}/logical", format::mib(si.vram_per_logical_gpu_mb)),
+                format!(" · {}/l", format::mib(si.vram_per_logical_gpu_mb)),
                 Style::default().fg(theme.muted),
             ));
         }
     }
     let total_power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
     spans.push(Span::styled(
-        format!("  ·  {:.1} kW", total_power / 1000.0),
+        format!(" · {:.1}kW", total_power / 1000.0),
         Style::default().fg(theme.fg),
     ));
     let eff = node_efficiency(snap);
     spans.push(Span::styled(
-        format!("  ·  eff {}", format::tokens_per_watt(eff)),
+        format!(" · eff {}", format::tokens_per_watt(eff)),
         Style::default().fg(if eff.is_some() { theme.ok } else { theme.muted }),
     ));
     Line::from(spans)
@@ -423,8 +499,8 @@ pub fn gpu_compact_line(
     Line::from(spans)
 }
 
-/// Full-panel GPU rendering: one bordered block per GPU, equal vertical split,
-/// with a stats line, an info line, and a utilization sparkline.
+/// Full-panel GPU rendering: one bordered block per GPU with paired
+/// GPUFLO-style activity and VRAM occupancy instruments.
 fn draw_gpus_full(
     f: &mut Frame,
     area: Rect,
@@ -440,7 +516,6 @@ fn draw_gpus_full(
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-
     let sysinfo = snap.gpu_system_info.as_ref();
 
     for (i, g) in snap.gpus.iter().enumerate() {
@@ -448,10 +523,7 @@ fn draw_gpus_full(
         if slot.height == 0 {
             continue;
         }
-        let selected = i == sel;
-        // Selected GPU reads as the actionable focus (Primary); others are
-        // telemetry panels (Secondary) so adjacent panels differ.
-        let role = if selected {
+        let role = if i == sel {
             BoxRole::Primary
         } else {
             BoxRole::Secondary
@@ -464,7 +536,6 @@ fn draw_gpus_full(
 
         let stats_line = gpu_stats_line(g, theme);
         let info_line = gpu_info_line(g.clock_mhz, sysinfo, theme);
-
         if inner.height == 1 {
             f.render_widget(Paragraph::new(stats_line), inner);
             continue;
@@ -474,43 +545,43 @@ fn draw_gpus_full(
             continue;
         }
 
-        // Serving line (#4): which models run on this GPU. Shown only when the
-        // panel is tall enough to keep a ≥2-row sparkline beneath it.
         let serving = serving_line(
             &instances_on_gpu(&g.device_id, &snap.instances),
             inner.width,
             theme,
         );
-        let want_serving = serving.is_some() && inner.height >= 4;
-
-        let constraints: &[Constraint] = if want_serving {
-            &[
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ]
-        } else {
-            &[
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ]
-        };
-        let split = Layout::default()
+        let want_serving = serving.is_some() && inner.height >= 6;
+        let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints.to_vec())
+            .constraints(if want_serving {
+                vec![
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ]
+            } else {
+                vec![
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ]
+            })
             .split(inner);
-        f.render_widget(Paragraph::new(stats_line), split[0]);
-        f.render_widget(Paragraph::new(info_line), split[1]);
-        let spark_idx = if want_serving {
-            f.render_widget(Paragraph::new(serving.unwrap()), split[2]);
-            3
+        f.render_widget(Paragraph::new(stats_line), rows[0]);
+        f.render_widget(Paragraph::new(info_line), rows[1]);
+        let graphs = if want_serving {
+            f.render_widget(Paragraph::new(serving.unwrap()), rows[2]);
+            rows[3]
         } else {
-            2
+            rows[2]
         };
+        let graph_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(graphs);
 
-        let history: Vec<u64> = state
+        let activity_history: Vec<u64> = state
             .history
             .iter()
             .filter_map(|s| {
@@ -519,12 +590,61 @@ fn draw_gpus_full(
                     .map(|gpu| gpu.gpu_utilization_pct.clamp(0.0, 100.0) as u64)
             })
             .collect();
-        let spark = BrailleSparkline::new(&history)
+        let vram_history: Vec<u64> = state
+            .history
+            .iter()
+            .filter_map(|s| {
+                let gpu = s.gpus.get(i)?;
+                (gpu.vram_total_mb > 0)
+                    .then_some((100 * gpu.vram_used_mb / gpu.vram_total_mb).min(100))
+            })
+            .collect();
+        draw_gpu_metric(
+            f,
+            graph_rows[0],
+            &format!("GPU activity · {:.1}%", g.gpu_utilization_pct),
+            &activity_history,
+            BoxRole::Primary,
+            theme,
+        );
+        let vram_title = if g.vram_total_mb > 0 {
+            format!(
+                "VRAM occupancy · {:.1}%",
+                100.0 * g.vram_used_mb as f64 / g.vram_total_mb as f64
+            )
+        } else {
+            "VRAM occupancy · —".to_string()
+        };
+        draw_gpu_metric(
+            f,
+            graph_rows[1],
+            &vram_title,
+            &vram_history,
+            BoxRole::Secondary,
+            theme,
+        );
+    }
+}
+
+fn draw_gpu_metric(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    history: &[u64],
+    role: BoxRole,
+    theme: &Theme,
+) {
+    let inner = panel::bento(f, area, Some(title), role, false, theme);
+    if inner.height == 0 {
+        return;
+    }
+    f.render_widget(
+        BrailleSparkline::new(history)
             .max(100)
             .style(Style::default().fg(theme.accent))
-            .gradient(theme.ok, theme.warn, theme.err);
-        f.render_widget(spark, split[spark_idx]);
-    }
+            .gradient(theme.ok, theme.warn, theme.err),
+        inner,
+    );
 }
 
 /// "serving: model[, model]" line for a GPU's instances, or `None` when the
@@ -813,6 +933,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{GpuSystemInfo, SystemMetrics};
     use rocm_dash_core::partition::{ComputePartitionMode, MemoryPartitionMode};
+    use std::collections::VecDeque;
 
     /// Render `draw` to a TestBackend and return the buffer as a flat string.
     fn render_to_string(state: &AppState, cols: u16, rows: u16) -> String {
@@ -824,6 +945,24 @@ mod tests {
         buf.content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn render_cpu_cores_to_lines(cores: &[f32], cols: u16, rows: u16) -> Vec<String> {
+        let backend_cols = cols.max(1);
+        let backend = TestBackend::new(backend_cols, rows.max(1));
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Theme::default_dark();
+        let history = VecDeque::default();
+        term.draw(|f| {
+            draw_cpu_cores(f, Rect::new(0, 0, cols, rows), cores, &history, &theme);
+        })
+        .unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .chunks(backend_cols as usize)
+            .map(|line| line.iter().map(ratatui::buffer::Cell::symbol).collect())
             .collect()
     }
 
@@ -847,8 +986,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_to_string(&state_with_snapshot(snap), 120, 30);
-        assert!(out.contains("Disk"), "missing Disk label: {out:?}");
-        assert!(out.contains("Net"), "missing Net label");
+        assert!(
+            out.contains("Disk + Net"),
+            "missing combined Disk + Net label: {out:?}"
+        );
         assert!(out.contains("rx"), "missing rx label");
         assert!(out.contains("tx"), "missing tx label");
         assert!(out.contains("read"), "missing read label");
@@ -873,6 +1014,25 @@ mod tests {
         for h in [1u16, 2, 3, 14, 16] {
             let _ = render_to_string(&s, 80, h);
         }
+    }
+
+    #[test]
+    fn cpu_core_overflow_reserves_its_own_row() {
+        let lines = render_cpu_cores_to_lines(&[1.0; 7], 20, 3);
+
+        assert!(lines[0].contains("C0") && lines[0].contains("C2"));
+        assert!(lines[1].contains("C1") && lines[1].contains("C3"));
+        assert_eq!(lines[2].trim_end(), "+3 cores");
+    }
+
+    #[test]
+    fn cpu_core_overflow_handles_narrow_and_zero_sized_areas() {
+        let lines = render_cpu_cores_to_lines(&[1.0; 3], 9, 2);
+        assert!(lines[0].contains("C0"));
+        assert_eq!(lines[1].trim_end(), "+2 cores");
+
+        let _ = render_cpu_cores_to_lines(&[1.0], 0, 1);
+        let _ = render_cpu_cores_to_lines(&[1.0], 1, 0);
     }
 
     fn mk_gpu(id: &str, util: f32, temp: f32, power: f32) -> GpuMetrics {
@@ -973,10 +1133,10 @@ mod tests {
     #[test]
     fn draw_overflow_indicator_when_clipped() {
         let mut s = state_with_snapshot(snap_with_gpus(12));
-        s.last_body_area = Some(ratatui::layout::Rect::new(0, 0, 100, 22));
-        // select a GPU near the end so the window scrolls and clips above
-        s.select_last();
-        let out = render_to_string(&s, 100, 22);
+        s.gpu_sel = 11;
+        s.gpu_scroll = 5;
+        // Short height forces a compact window with hidden rows above.
+        let out = render_to_string(&s, 100, 12);
         assert!(out.contains("more"), "missing overflow affordance: {out:?}");
     }
 
@@ -1112,9 +1272,9 @@ mod tests {
         };
         let line = gpu_section_header(&snap, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("logical 8"), "missing logical count: {text}");
-        assert!(text.contains("phys 4"), "missing physical count");
-        assert!(text.contains("/logical"), "missing per-logical vram");
+        assert!(text.contains("MI355X"), "missing GPU model: {text}");
+        assert!(text.contains("4p/8l"), "missing partition counts: {text}");
+        assert!(text.contains("/l"), "missing per-logical VRAM");
         assert!(text.contains("kW"), "missing total power");
         // 250 tok / 500 W = 0.50 tok/W
         assert!(text.contains("0.50 tok/W"), "missing efficiency: {text}");
@@ -1150,8 +1310,9 @@ mod tests {
             "no serving line rendered: {out:?}"
         );
         assert!(out.contains("llama-70b"), "model not shown on its GPU");
-        // header surfaces partition + efficiency end-to-end
-        assert!(out.contains("logical 8"), "header logical missing");
+        // Header surfaces the GPU identity, partitioning, and efficiency end-to-end.
+        assert!(out.contains("MI355X"), "header GPU model missing");
+        assert!(out.contains("4p/8l"), "header partition counts missing");
         assert!(out.contains("tok/W"), "header efficiency missing");
     }
 
@@ -1162,12 +1323,15 @@ mod tests {
         s.active_tab = ActiveTab::Observe;
         let out = render_to_string(&s, 100, 30);
         assert!(out.contains("waiting"), "no waiting placeholder: {out:?}");
-
-        // 2) Snapshot with no GPUs → "no GPUs reported".
+        // 2) Snapshot with no GPUs → honest unavailable instruments.
         let no_gpus = state_with_snapshot(Snapshot::default());
         let out = render_to_string(&no_gpus, 100, 30);
         assert!(out.contains("no GPUs reported"), "missing no-GPU notice");
-
+        assert!(out.contains("GPU activity · —"), "missing GPU placeholder");
+        assert!(
+            out.contains("VRAM occupancy · —"),
+            "missing VRAM placeholder"
+        );
         // 3) GPUs but no sysinfo and no instances and zero power → header still
         //    renders with "eff -" and "?"-free crash-free panels.
         let mut snap = snap_with_gpus(2);

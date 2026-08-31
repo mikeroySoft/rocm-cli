@@ -32,6 +32,11 @@ pub const LEMONADE_PORT: u16 = 13305;
 pub const LEMONADE_STATS_PATH: &str = "/api/v1/stats";
 /// The health/liveness path on the canonical `/api/v1` base.
 pub const LEMONADE_HEALTH_PATH: &str = "/api/v1/health";
+const LLAMA_METRICS_PATH: &str = "/metrics";
+const LLAMA_KEY_RUNNING: &str = "llamacpp:requests_processing";
+const LLAMA_KEY_WAITING: &str = "llamacpp:requests_deferred";
+const LLAMA_KEY_GEN_TOKENS: &str = "llamacpp:tokens_predicted_total";
+const LLAMA_KEY_GEN_SECONDS: &str = "llamacpp:tokens_predicted_seconds_total";
 
 /// `/api/v1/stats` response — performance metrics from the most recent request.
 /// Every field is optional: the endpoint only populates them after an inference.
@@ -62,24 +67,34 @@ pub struct LemonadeHealth {
 
 /// PURE: parse a `/api/v1/stats` body into an [`InstanceSample`].
 ///
-/// Lemonade reports an instantaneous `tokens_per_second` rate (mapped to `gen_tps`) rather than a
-/// cumulative counter; it exposes no KV-cache / running / waiting metrics, so
-/// those stay `None`. Malformed/empty JSON → an all-`None` default, never panics.
+/// Lemonade reports point-in-time request statistics. Encode each latency as
+/// one observation so the runner's cumulative-histogram helper always falls
+/// back to that request's average instead of differencing unrelated requests.
 pub fn parse_stats(body: &str) -> InstanceSample {
-    let stats = parse_stats_struct(body);
+    sample_from_stats(parse_stats_struct(body))
+}
+
+fn sample_from_stats(stats: LemonadeStats) -> InstanceSample {
+    let valid = |value: f64| value.is_finite() && value >= 0.0;
+    let ttft = stats.time_to_first_token.filter(|value| valid(*value));
+    let gen_tps = stats.tokens_per_second.filter(|value| valid(*value));
+    let (decode_sum, decode_count) = stats
+        .decode_token_times
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| valid(*value))
+        .fold((0.0, 0_u64), |(sum, count), value| (sum + value, count + 1));
+    let mean_decode_time = (decode_count > 0).then(|| decode_sum / decode_count as f64);
     InstanceSample {
         kv_cache_usage_pct: None,
         running_reqs: None,
         waiting_reqs: None,
-        // Lemonade has no cumulative token counter; surface the rate directly.
         gen_tokens_total: None,
-        gen_tps: stats.tokens_per_second,
-        // TTFT/TPOT histograms are a vLLM-Prometheus concept; Lemonade leaves
-        // them None (Observe shows `—`).
-        ttft_sum_s: None,
-        ttft_count: None,
-        tpot_sum_s: None,
-        tpot_count: None,
+        gen_tps,
+        ttft_sum_s: ttft,
+        ttft_count: ttft.map(|_| 1.0),
+        tpot_sum_s: mean_decode_time,
+        tpot_count: mean_decode_time.map(|_| 1.0),
     }
 }
 
@@ -87,6 +102,83 @@ pub fn parse_stats(body: &str) -> InstanceSample {
 /// metric set (for callers that want TTFT / token counts). Malformed → default.
 pub fn parse_stats_struct(body: &str) -> LemonadeStats {
     object_or_default(body)
+}
+
+fn parse_stats_response(body: &str) -> Result<InstanceSample> {
+    const FIELDS: &[&str] = &[
+        "time_to_first_token",
+        "tokens_per_second",
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "decode_token_times",
+    ];
+    let value = known_object(body, FIELDS, "Lemonade stats")?;
+    let stats = serde_json::from_value(value)
+        .map_err(|e| CollectorError::Parse(format!("Lemonade stats: {e}")))?;
+    Ok(sample_from_stats(stats))
+}
+
+/// Parse metrics exported by Lemonade's packaged llama.cpp server.
+///
+/// llama.cpp exposes cumulative generation tokens and seconds plus live queue
+/// gauges. The daemon differences the token counter into tok/s and treats
+/// generation seconds/tokens as the cumulative TPOT histogram pair.
+pub fn parse_llama_metrics(body: &str) -> InstanceSample {
+    let gen_tokens_total = extract_prometheus(body, LLAMA_KEY_GEN_TOKENS);
+    InstanceSample {
+        kv_cache_usage_pct: None,
+        running_reqs: extract_prometheus(body, LLAMA_KEY_RUNNING).map(|v| v.round() as u32),
+        waiting_reqs: extract_prometheus(body, LLAMA_KEY_WAITING).map(|v| v.round() as u32),
+        gen_tokens_total,
+        gen_tps: None,
+        ttft_sum_s: None,
+        ttft_count: None,
+        tpot_sum_s: extract_prometheus(body, LLAMA_KEY_GEN_SECONDS),
+        tpot_count: gen_tokens_total,
+    }
+}
+
+fn extract_prometheus(body: &str, metric: &str) -> Option<f64> {
+    body.lines().find_map(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            return None;
+        }
+        let rest = line.strip_prefix(metric)?;
+        let value = match rest.chars().next() {
+            Some('{') => rest.get(rest.find('}')? + 1..)?.trim_start(),
+            Some(c) if c.is_whitespace() => rest.trim_start(),
+            _ => return None,
+        };
+        value
+            .split_whitespace()
+            .next()?
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    })
+}
+
+fn known_object(body: &str, fields: &[&str], schema: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| CollectorError::Parse(format!("{schema}: {e}")))?;
+    let Some(object) = value.as_object() else {
+        return Err(CollectorError::Parse(format!("{schema}: expected object")));
+    };
+    if !fields.iter().any(|field| object.contains_key(*field)) {
+        return Err(CollectorError::Parse(format!(
+            "{schema}: no recognized fields"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_health_response(body: &str) -> Result<Option<String>> {
+    let value = known_object(body, &["status", "model_loaded"], "Lemonade health")?;
+    let health: LemonadeHealth = serde_json::from_value(value)
+        .map_err(|e| CollectorError::Parse(format!("Lemonade health: {e}")))?;
+    Ok(health.model_loaded.filter(|model| !model.is_empty()))
 }
 
 /// PURE: extract the loaded model name from a `/api/v1/health` body, if present
@@ -196,14 +288,12 @@ impl LemonadeCollector {
 
     /// Scrape `/api/v1/stats` → an `InstanceSample` (rate → `gen_tps`).
     pub async fn fetch_stats(&self) -> Result<InstanceSample> {
-        Ok(parse_stats(&self.get_text(LEMONADE_STATS_PATH).await?))
+        parse_stats_response(&self.get_text(LEMONADE_STATS_PATH).await?)
     }
 
     /// Scrape `/api/v1/health` → the loaded model name (if any).
     pub async fn fetch_health_model(&self) -> Result<Option<String>> {
-        Ok(parse_health_model(
-            &self.get_text(LEMONADE_HEALTH_PATH).await?,
-        ))
+        parse_health_response(&self.get_text(LEMONADE_HEALTH_PATH).await?)
     }
 
     /// Probe the endpoint: if `/api/v1/health` answers, return a `DiscoveredService`
@@ -217,6 +307,76 @@ impl LemonadeCollector {
                 model.as_deref().unwrap_or(""),
             )),
             Err(_) => None,
+        }
+    }
+}
+
+/// Scraper for managed Lemonade services.
+///
+/// Direct GGUF serving uses llama.cpp `/metrics`; routed Lemonade serving uses
+/// `/api/v1/stats`. Try them in that order so one managed-service path covers
+/// both backends without requiring engine-state coupling in the daemon.
+#[derive(Debug, Clone)]
+pub struct ManagedLemonadeCollector {
+    host: String,
+    client: Client,
+}
+
+impl ManagedLemonadeCollector {
+    pub fn new(host: impl Into<String>, timeout: Duration) -> Self {
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self {
+            host: host.into(),
+            client,
+        }
+    }
+
+    async fn get_text(&self, port: u16, path: &str) -> Result<String> {
+        let url = format!("http://{}:{port}{path}", self.host);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CollectorError::Transport(format!("GET {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(CollectorError::Transport(format!(
+                "GET {url}: status {}",
+                resp.status()
+            )));
+        }
+        resp.text()
+            .await
+            .map_err(|e| CollectorError::Transport(format!("body {url}: {e}")))
+    }
+
+    pub async fn fetch_async(&self, svc: &DiscoveredService) -> Result<InstanceSample> {
+        let port = svc
+            .port
+            .ok_or_else(|| CollectorError::Unsupported("instance has no port".into()))?;
+        let metrics = self.get_text(port, LLAMA_METRICS_PATH).await;
+        if let Ok(body) = &metrics {
+            let sample = parse_llama_metrics(body);
+            if sample.gen_tokens_total.is_some()
+                || sample.running_reqs.is_some()
+                || sample.waiting_reqs.is_some()
+                || sample.tpot_sum_s.is_some()
+            {
+                return Ok(sample);
+            }
+        }
+        let stats = self.get_text(port, LEMONADE_STATS_PATH).await;
+        match stats {
+            Ok(body) => parse_stats_response(&body),
+            Err(stats_error) => Err(CollectorError::Other(format!(
+                "Lemonade metrics unavailable ({}); stats unavailable ({stats_error})",
+                metrics
+                    .err()
+                    .map_or_else(|| "no recognized fields".to_string(), |e| e.to_string())
+            ))),
         }
     }
 }
@@ -247,11 +407,38 @@ mod tests {
     fn parse_stats_maps_tokens_per_second_to_gen_tps() {
         let sample = parse_stats(STATS_FIXTURE);
         assert_eq!(sample.gen_tps, Some(33.33));
-        // Lemonade does not expose these — they must stay None (not zero).
+        // Lemonade does not expose KV/queue metrics — they must stay None.
         assert_eq!(sample.kv_cache_usage_pct, None);
         assert_eq!(sample.running_reqs, None);
         assert_eq!(sample.waiting_reqs, None);
         assert_eq!(sample.gen_tokens_total, None);
+        assert_eq!(sample.tpot_sum_s, Some(0.03));
+        assert_eq!(sample.tpot_count, Some(1.0));
+        assert_eq!(sample.ttft_sum_s, Some(2.14));
+        assert_eq!(sample.ttft_count, Some(1.0));
+    }
+
+    #[test]
+    fn parses_packaged_llama_metrics() {
+        let sample = parse_llama_metrics(
+            "llamacpp:tokens_predicted_total 120\n\
+             llamacpp:tokens_predicted_seconds_total 2.4\n\
+             llamacpp:requests_processing 3\n\
+             llamacpp:requests_deferred 2\n",
+        );
+        assert_eq!(sample.gen_tokens_total, Some(120.0));
+        assert_eq!(sample.running_reqs, Some(3));
+        assert_eq!(sample.waiting_reqs, Some(2));
+        assert_eq!(sample.tpot_sum_s, Some(2.4));
+        assert_eq!(sample.tpot_count, Some(120.0));
+        assert_eq!(sample.ttft_sum_s, None);
+    }
+
+    #[test]
+    fn stale_payloads_are_not_accepted_as_telemetry() {
+        assert!(parse_stats_response("{}").is_err());
+        assert!(parse_stats_response(r#"{"old_tokens_per_second": 12}"#).is_err());
+        assert!(parse_health_response(r#"{"healthy": true}"#).is_err());
     }
 
     #[test]
