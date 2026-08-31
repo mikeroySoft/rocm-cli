@@ -20,7 +20,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPO = "mikeroySoft/rocm-cli"
+ROOT = Path(__file__).resolve().parents[1]
+REPO = subprocess.run(
+    ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+    capture_output=True, text=True, check=True,
+).stdout.strip().rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
 LLM_URL = os.environ.get("FACTORY_LLM_URL", "http://127.0.0.1:11435/v1/chat/completions")
 LLM_MODEL = os.environ.get("FACTORY_LLM_MODEL", "ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M")
 LABELS_DOC = Path(__file__).resolve().parent.parent / "docs" / "agents" / "triage-labels.md"

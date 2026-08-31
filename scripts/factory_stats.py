@@ -12,11 +12,16 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 
-REPOSITORY = "mikeroySoft/rocm-cli"
+REPOSITORY = subprocess.run(
+    ["git", "-C", str(Path(__file__).resolve().parents[1]),
+     "remote", "get-url", "origin"],
+    capture_output=True, text=True, check=True,
+).stdout.strip().rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
 AGENT_BRANCH = re.compile(r"agent/(\d+)$")
 
 
