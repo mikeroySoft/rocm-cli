@@ -151,7 +151,7 @@ rocm install sdk --channel release --format wheel --dry-run
 ## Agent Harness Setup E2E
 
 The `rocm agents` behavior spec is
-[`agents.feature`](../tests/e2e-cucumber/features/agents.feature). Run its 35
+[`agents.feature`](../tests/e2e-cucumber/features/agents.feature). Run the
 default mock scenarios through the existing E2E workflow:
 
 ```bash
@@ -165,14 +165,15 @@ filters bypass that resolver.
 The mock scenarios cover list and inspect output for all ten harnesses,
 managed-service detection and the default endpoint fallback, dry-run and
 approval behavior, safe config updates, rollback and `--no-check`, version
-selection, protocol routes, precedence warnings, and isolated harness probes.
+selection, protocol routes, precedence warnings, isolated harness probes, and
+OMP's separate interactive default choice after registration.
 Harness-binary coverage is deliberately narrower:
 
 | Harnesses | Focused mock coverage | Real-binary coverage |
 |---|---|---|
 | Claude Code and Codex | Fake configuration, protocol, and CLI argv | One gated real-binary scenario |
 | Hermes, OpenClaw, OpenCode, Qwen Code, Aider, and Continue | Fake configuration, protocol, and CLI argv | None |
-| Pi `0.84.4` and OMP `18.0.11` (major-18 gate) | Fake version acceptance and rejection, two-file lossless setup and rollback, second-file safety, precedence warnings, Chat Completions, exact safe CLI argv, OMP relative config-root and profile resolution, and legacy-registry refusal | None; fake binaries only |
+| Pi `0.84.4` and OMP `18.0.11` (major-18 gate) | Fake version acceptance and rejection, lossless availability setup and rollback, file safety, precedence warnings, Chat Completions, exact safe CLI argv, OMP registration-before-default prompting, noninteractive and dry-run default preservation, relative config-root and profile resolution, and legacy-registry refusal | None; fake binaries only |
 
 The real Claude Code and Codex scenario uses a GPU-served vLLM model and is
 excluded unless both opt-ins are set:

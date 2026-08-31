@@ -175,7 +175,7 @@ pub(super) fn inspect(harness: AgentHarness) -> Result<ConfigState> {
             transaction::snapshot(&path).map(|snapshot| ConfigFileState { path, snapshot })
         })
         .transpose()?;
-    let (endpoint, model) = inspect_values(harness, &files, omp_legacy_models.as_ref())?;
+    let (endpoint, model) = inspect_values(harness, &files)?;
     Ok(ConfigState {
         path: paths[0].clone(),
         configured: endpoint.is_some() && model.is_some(),
@@ -193,33 +193,7 @@ pub(super) fn plan(
     target: &ResolvedTarget,
     state: ConfigState,
 ) -> Result<ConfigPlan> {
-    if !version.supported {
-        let rendered = version
-            .version
-            .as_ref()
-            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
-        bail!(
-            "{} version {rendered} has no supported configuration schema",
-            harness.canonical_name()
-        );
-    }
-    if let Some(file) = state
-        .omp_legacy_models
-        .as_ref()
-        .filter(|file| file.snapshot.raw.is_some() || file.snapshot.symlink)
-    {
-        bail!(
-            "legacy OMP model registry {} needs OMP's YAML migration; run OMP once to migrate models.json to models.yml, then rerun this setup",
-            file.path.display()
-        );
-    }
-    if let Some(file) = state.files.iter().find(|file| file.snapshot.symlink) {
-        bail!(
-            "refusing to configure {} through symlink {}; replace it with a regular file or configure it manually",
-            harness.canonical_name(),
-            file.path.display()
-        );
-    }
+    validate_plan(harness, version, &state)?;
 
     let (changes, payload) = match harness {
         AgentHarness::Claude => direct_json_plan(&state, |root, changes| {
@@ -349,6 +323,55 @@ pub(super) fn plan(
         changes,
         payload,
     })
+}
+
+pub(super) fn plan_default(
+    harness: AgentHarness,
+    version: &VersionInfo,
+    target: &ResolvedTarget,
+    state: ConfigState,
+) -> Result<ConfigPlan> {
+    if harness != AgentHarness::Omp {
+        bail!("default model planning is only supported for OMP");
+    }
+    validate_plan(harness, version, &state)?;
+    let (changes, payload) = direct_omp_default_plan(&state, target)?;
+    Ok(ConfigPlan {
+        state,
+        changes,
+        payload,
+    })
+}
+
+fn validate_plan(harness: AgentHarness, version: &VersionInfo, state: &ConfigState) -> Result<()> {
+    if !version.supported {
+        let rendered = version
+            .version
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
+        bail!(
+            "{} version {rendered} has no supported configuration schema",
+            harness.canonical_name()
+        );
+    }
+    if let Some(file) = state
+        .omp_legacy_models
+        .as_ref()
+        .filter(|file| file.snapshot.raw.is_some() || file.snapshot.symlink)
+    {
+        bail!(
+            "legacy OMP model registry {} needs OMP's YAML migration; run OMP once to migrate models.json to models.yml, then rerun this setup",
+            file.path.display()
+        );
+    }
+    if let Some(file) = state.files.iter().find(|file| file.snapshot.symlink) {
+        bail!(
+            "refusing to configure {} through symlink {}; replace it with a regular file or configure it manually",
+            harness.canonical_name(),
+            file.path.display()
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn apply(plan: &ConfigPlan) -> Result<AppliedConfig> {
@@ -651,13 +674,12 @@ fn precedence_warnings(harness: AgentHarness) -> Vec<String> {
 fn inspect_values(
     harness: AgentHarness,
     files: &[ConfigFileState],
-    omp_legacy_models: Option<&ConfigFileState>,
 ) -> Result<(Option<String>, Option<String>)> {
     if harness == AgentHarness::Pi {
         return inspect_pi_values(files);
     }
     if harness == AgentHarness::Omp {
-        return inspect_omp_values(files, omp_legacy_models);
+        return inspect_omp_values(files);
     }
     let file = &files[0];
     let path = &file.path;
@@ -769,19 +791,37 @@ fn inspect_pi_values(files: &[ConfigFileState]) -> Result<(Option<String>, Optio
     Ok((endpoint, model))
 }
 
-fn inspect_omp_values(
-    files: &[ConfigFileState],
-    legacy_models: Option<&ConfigFileState>,
-) -> Result<(Option<String>, Option<String>)> {
+fn inspect_omp_values(files: &[ConfigFileState]) -> Result<(Option<String>, Option<String>)> {
     let models = yaml_file_at(files, 0)?;
-    let settings = yaml_file_at(files, 1)?;
-    let legacy_endpoint = legacy_models
-        .and_then(|file| json_file_value(file).ok().flatten())
-        .and_then(|value| json_string_at(&value, &["providers", "rocm-local", "baseUrl"]));
-    let endpoint = yaml_path_string(&models, "providers.rocm-local.baseUrl").or(legacy_endpoint);
-    let model = yaml_path_string(&settings, "modelRoles.default")
+    let endpoint = yaml_path_string(&models, "providers.rocm-local.baseUrl");
+    let preferred = yaml_file_at(files, 1)
+        .ok()
+        .and_then(|settings| yaml_path_string(&settings, "modelRoles.default"))
         .and_then(|value| value.strip_prefix("rocm-local/").map(str::to_owned));
-    Ok((endpoint, model))
+    let registered = models
+        .document()
+        .and_then(|document| document.get_path("providers.rocm-local.models"))
+        .and_then(|node| node.as_sequence().cloned());
+    let mut first = None;
+    let mut selected = None;
+    if let Some(registered) = registered {
+        for entry in registered.values() {
+            let Some(id) = entry
+                .as_mapping()
+                .and_then(|model| yaml_mapping_string(model, "id"))
+            else {
+                continue;
+            };
+            if first.is_none() {
+                first = Some(id.clone());
+            }
+            if preferred.as_deref() == Some(id.as_str()) {
+                selected = Some(id);
+                break;
+            }
+        }
+    }
+    Ok((endpoint, selected.or(first)))
 }
 
 fn json_file_value(file: &ConfigFileState) -> Result<Option<Value>> {
@@ -1546,6 +1586,13 @@ fn direct_omp_plan(
         }
     };
 
+    Ok(direct_result(0, changes, models_after))
+}
+
+fn direct_omp_default_plan(
+    state: &ConfigState,
+    target: &ResolvedTarget,
+) -> Result<(Vec<SemanticChange>, PlanPayload)> {
     let config_file = yaml_file_at(&state.files, 1)?;
     let config_root = config_file
         .document()
@@ -1556,21 +1603,20 @@ fn direct_omp_plan(
                 state.file(1).path.display()
             )
         })?;
-    let mut config_changes = Vec::new();
-    let config_after = if config_root.get("modelRoles").is_none() {
+    let mut changes = Vec::new();
+    let desired = format!("rocm-local/{}", target.model);
+    let after = if config_root.get("modelRoles").is_none() {
         push_change(
-            &mut config_changes,
+            &mut changes,
             "modelRoles.default",
             None,
-            &Value::String(format!("rocm-local/{}", target.model)),
+            &Value::String(desired.clone()),
         );
         Some(yaml_append_mapping_entry(
             &config_file,
             &config_root,
             MappingBuilder::new()
-                .mapping("modelRoles", |roles| {
-                    roles.pair("default", format!("rocm-local/{}", target.model))
-                })
+                .mapping("modelRoles", |roles| roles.pair("default", desired))
                 .build()
                 .build(),
         )?)
@@ -1579,24 +1625,13 @@ fn direct_omp_plan(
         yaml_set_string(
             &roles,
             "default",
-            &format!("rocm-local/{}", target.model),
+            &desired,
             "modelRoles.default",
-            &mut config_changes,
+            &mut changes,
         );
-        (!config_changes.is_empty()).then(|| config_file.to_string().into_bytes())
+        (!changes.is_empty()).then(|| config_file.to_string().into_bytes())
     };
-    changes.extend(config_changes);
-
-    let writes = [(0, models_after), (1, config_after)]
-        .into_iter()
-        .filter_map(|(file, after)| after.map(|after| DirectWrite { file, after }))
-        .collect::<Vec<_>>();
-    let payload = if writes.is_empty() {
-        PlanPayload::None
-    } else {
-        PlanPayload::Direct(writes)
-    };
-    Ok((changes, payload))
+    Ok(direct_result(1, changes, after))
 }
 
 fn yaml_mapping(parent: &Mapping, key: &str) -> Result<Mapping> {

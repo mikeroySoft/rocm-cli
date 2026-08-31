@@ -112,7 +112,7 @@ Feature: Agent harness setup
     And representative global configurations for every harness
     And all supported fake agent harnesses are installed
     When the user applies offline setup to every supported harness
-    Then every global config visibly selects the exact local model and keeps unrelated settings
+    Then every global config registers the exact local model and keeps unrelated settings
 
   @id:agents-write-refuses-symlink
   @requires-os:linux
@@ -131,7 +131,7 @@ Feature: Agent harness setup
     And a representative Claude configuration
     And representative Pi and OMP configurations
     When the Claude configuration changes at the approval prompt
-    And the OMP second configuration changes at the approval prompt
+    And the OMP model registry changes at the approval prompt
     Then both stale plans are refused without losing either concurrent edit
 
   @id:agents-write-permissions-and-atomicity
@@ -243,11 +243,11 @@ Feature: Agent harness setup
     Then every invalid flag combination fails without creating a harness config
 
   @id:agents-multifile-plan-idempotence
-  Scenario: 32 - Pi and OMP plan and repeat setup treat both user configuration files as one edit
+  Scenario: 32 - Pi updates both user files while OMP registers models without changing defaults
     Given an isolated agents environment
     And representative Pi and OMP configurations
     When the user previews and applies the same Pi and OMP setup twice
-    Then both two-file dry runs write nothing and repeated setup rewrites neither file
+    Then dry runs write nothing and repeated setup rewrites no registered configuration
 
   @id:agents-multifile-partial-rollback
   @requires-os:linux
@@ -269,6 +269,24 @@ Feature: Agent harness setup
     And a legacy OMP models.json without a YAML registry
     When the user attempts offline OMP setup with the legacy registry
     Then OMP setup refuses migration and preserves the legacy registry
+
+  @id:agents-omp-default-declined
+  Scenario: Interactive OMP setup can retain the existing default after registration
+    Given an isolated agents environment
+    And a protocol-complete agent endpoint
+    And representative Pi and OMP configurations
+    And supported fake Pi and OMP harnesses are installed
+    When the user interactively registers OMP and declines the default
+    Then OMP setup and test use the registered model without changing the existing default
+
+  @id:agents-omp-default-accepted
+  Scenario: Interactive OMP setup can select the registered model as the default
+    Given an isolated agents environment
+    And a protocol-complete agent endpoint
+    And representative Pi and OMP configurations
+    And supported fake Pi and OMP harnesses are installed
+    When the user interactively registers OMP and accepts the default
+    Then only the OMP default role changes after registration
 
   # Explicit opt-in is required in addition to the nightly AMD GPU/vLLM gates:
   # E2E_INCLUDE_NIGHTLY=1 E2E_INCLUDE_REAL_AGENTS=1. Default CI never requires
