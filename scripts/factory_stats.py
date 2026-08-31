@@ -145,7 +145,7 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         ("hours", lambda row: format_hours(row["merge_hours"])),
     )
     values = [[render(row) for _, render in columns] for row in rows]
-    widths = [max(len(name), *(len(row[index]) for row in values)) for index, (name, _) in enumerate(columns)]
+    widths = [max([len(name), *(len(row[index]) for row in values)]) for index, (name, _) in enumerate(columns)]
 
     def line(cells: list[str]) -> str:
         return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths)).rstrip()
