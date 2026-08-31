@@ -277,3 +277,17 @@ This workflow is advisory and human-enforced. Violations are addressed through:
 - **Incident response**: If a leak or policy violation reaches upstream, document the root cause and adjust workflow
 
 This file defines OSS safety, verification, and publication guardrails for rocm-cli.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in the `mikeroySoft/rocm-cli` fork, not the upstream `ROCm/rocm-cli` repository. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default label names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo: use root `CONTEXT.md` and `docs/adr/`, created lazily. See `docs/agents/domain.md`.
