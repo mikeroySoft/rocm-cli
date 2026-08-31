@@ -19,7 +19,6 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +35,6 @@ def origin_repo() -> str:
 REPO = origin_repo()
 FACTORY = ROOT / ".factory"
 LOGS = FACTORY / "logs"
-GPU_LOCK = Path("/tmp/rocm-factory-gpu.lock")
 GATE = Path(__file__).resolve().parent / "agent_gate.py"
 MAX_ACTIVE = 2
 MAX_ATTEMPTS = 3
@@ -66,13 +64,6 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproce
 def gh_json(args: list[str]) -> object:
     out = run(["gh", *args]).stdout
     return json.loads(out)
-
-
-@contextmanager
-def gpu_lock():
-    with GPU_LOCK.open("w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yield
 
 
 def lock_held(lockfile: Path) -> bool:
@@ -186,11 +177,12 @@ def commit_leftovers(wt: Path, n: int, title: str) -> None:
 def run_gate(wt: Path, n: int) -> tuple[bool, str]:
     report_rel = f".factory/gate-report-{n}.md"
     (wt / ".factory").mkdir(exist_ok=True)
-    with gpu_lock():
-        proc = subprocess.run(
-            [sys.executable, str(GATE), "--base", "origin/main",
-             "--report", report_rel],
-            cwd=wt, capture_output=True, text=True)
+    # GPU serialization is the gate's job: agent_gate.py flocks the GPU lock
+    # itself. Locking here too deadlocks the gate subprocess (seen in run #7).
+    proc = subprocess.run(
+        [sys.executable, str(GATE), "--base", "origin/main",
+         "--report", report_rel],
+        cwd=wt, capture_output=True, text=True)
     report = wt / report_rel
     text = report.read_text() if report.exists() else proc.stdout + proc.stderr
     return proc.returncode == 0, text
