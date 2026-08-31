@@ -219,6 +219,7 @@ form works depends on the engine your GPU selects.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
+| `rocm runtimes adopt-system` | Use an already-installed system ROCm SDK (e.g. `/opt/rocm`) as a read-only runtime |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm agents [<agent>]` | List, inspect, configure, or test local agent harnesses |
@@ -275,17 +276,35 @@ rocm runtimes uninstall <runtime-key>
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
+rocm runtimes adopt-system [--root <path>] [--runtime-id ID]
+                           [--runtime-key KEY] [--activate] [--replace]
 ```
 
-`adopt` registers an existing TheRock-based Python environment as a managed
-runtime. It does not work with standard ROCm package installs (for example,
-`/opt/rocm`); use `rocm install sdk` instead.
+`adopt` registers an existing TheRock-based Python environment as a read-only
+runtime.
+
+`adopt-system` registers an already-installed system ROCm SDK (a standard
+package install such as `/opt/rocm`) as a read-only runtime, without
+downloading anything or writing into the SDK tree. The root is detected via
+`ROCM_PATH`, `ROCM_HOME`, or `HIP_PATH`, falling back to `/opt/rocm`; pass
+`--root` to override. `--activate` makes it the default runtime and completes
+first-time setup. Linux and WSL only in this release.
+
+System runtimes are owned by the OS package manager: implicit `rocm update`
+skips them, while `rocm update --runtime <system-key>` directs you to your
+distribution's tooling. After updating ROCm there, re-run `adopt-system`; pass
+the original `--runtime-key` with `--replace` to refresh that existing record.
+`rocm runtimes uninstall` only unregisters the record — the SDK itself is
+left untouched. A system SDK has no managed Python environment, so it is never
+auto-selected for engine installs: Lemonade installs into its own managed
+environment and works normally, while a vLLM install needs a runtime from
+`rocm install sdk` (or an existing external vLLM via `ROCM_CLI_VLLM_PYTHON`).
 
 ### Disk space
 
-Each ROCm install keeps its own multi-gigabyte folder, so installing or
-updating a few times adds up. `rocm storage` shows where the space went and
-frees the parts that are safe to remove:
+Each ROCm CLI-managed SDK install keeps its own multi-gigabyte folder, so
+installing or updating a few times adds up. `rocm storage` shows where the
+space went and frees the parts that are safe to remove:
 
 ```
 rocm storage [report] [--json]

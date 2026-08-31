@@ -390,6 +390,60 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## System ROCm SDK Adoption
+
+Focused unit coverage for the system-SDK probe and the `adopt-system` flow:
+
+```bash
+cargo test -p rocm-core system_sdk
+cargo test -p rocm --bin rocm adopt_system
+cargo test -p rocm --bin rocm system_runtime
+```
+
+Manual fixture procedure (no real ROCm install required, Linux/WSL). Build a
+minimal fixture tree, then adopt it with isolated state roots:
+
+```bash
+mkdir -p /tmp/rocm-fixture/.info /tmp/rocm-fixture/lib /tmp/rocm-fixture/bin
+echo 6.4.1 > /tmp/rocm-fixture/.info/version
+touch /tmp/rocm-fixture/lib/libamdhip64.so
+touch /tmp/rocm-fixture/bin/rocminfo
+
+rocm runtimes adopt-system --root /tmp/rocm-fixture --activate
+rocm runtimes list
+rocm update
+rocm runtimes uninstall <runtime_key>
+```
+
+Expected behavior throughout:
+
+- `adopt-system` prints `mode: read-only (system)` plus the version and root;
+  `--activate` makes it the default and marks setup complete.
+- `rocm runtimes list` shows the runtime as read-only and ready.
+- `rocm update` reports the system runtime as `not_applicable` with source
+  `system package manager` and performs no network I/O;
+  `rocm update --apply --runtime <runtime_key>` refuses with an
+  OS-package-manager message.
+- `rocm engines install` never auto-selects a system runtime, and an explicit
+  `--runtime-id <runtime_key>` fails early (system SDKs have no managed
+  Python).
+- `uninstall` unregisters the record only.
+- The fixture tree stays byte-identical for the whole sequence — rocm-cli
+  never writes under an adopted SDK root.
+
+Real-host acceptance (package-managed ROCm host with `/opt/rocm`):
+
+```bash
+rocm runtimes adopt-system --activate
+rocm examine
+rocm engines install lemonade
+rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --device gpu_required --managed
+```
+
+`examine` must show the adopted runtime as active and ready; serving must run
+on the GPU through the adopted SDK's `bin`/`lib` paths with no CPU fallback and
+no TheRock download.
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity
