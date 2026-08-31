@@ -113,10 +113,12 @@ enum Command {
     /// whose model exactly matches --model. If neither resolves, it falls back to
     /// http://127.0.0.1:11435/v1.
     #[command(after_help = "EXAMPLES:\n  \
-rocm agents                              List supported agent harnesses\n  \
+rocm agents                              List all ten supported agent harnesses\n  \
 rocm agents claude --setup --dry-run     Preview setup without writing configuration\n  \
 rocm agents claude --setup --yes         Approve and apply setup without prompting\n  \
-rocm agents claude --test                Test the harness in an isolated workspace")]
+rocm agents claude --test                Test the harness in an isolated workspace\n  \
+rocm agents pi --setup --yes             Configure Pi as a distinct harness\n  \
+rocm agents omp --test                   Test OMP as a distinct harness")]
     Agents {
         #[command(flatten)]
         args: agents::AgentsArgs,
