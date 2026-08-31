@@ -21,6 +21,8 @@ const MODEL: &str = "org/agent-model";
 const SECOND_MODEL: &str = "org/second-model";
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11435/v1";
 const SECRET: &str = "e2e-real-credential-must-not-leak";
+const OMP_CONFIG_ORIGINAL: &str = "# retained omp config comment\nmodelRoles:\n  default: upstream/existing-model\n  commit: upstream/commit-model\n  title: upstream/title-model\nunrelatedConfig: keep-omp-config\n";
+const OMP_CONFIG_DEFAULT: &str = "# retained omp config comment\nmodelRoles:\n  default: rocm-local/org/agent-model\n  commit: upstream/commit-model\n  title: upstream/title-model\nunrelatedConfig: keep-omp-config\n";
 const INVALID_PI_OMP_ALIASES: [&str; 3] = ["pi-coding-agent", "oh-my-pi", "omp-agent"];
 
 #[derive(Clone, Copy)]
@@ -771,6 +773,16 @@ async fn setup_every_harness(world: &mut E2eWorld) {
     }
 }
 
+#[when("the user interactively registers OMP and declines the default")]
+async fn register_omp_and_decline_default(world: &mut E2eWorld) {
+    run_interactive_omp_setup(world, false, true).await;
+}
+
+#[when("the user interactively registers OMP and accepts the default")]
+async fn register_omp_and_accept_default(world: &mut E2eWorld) {
+    run_interactive_omp_setup(world, true, false).await;
+}
+
 #[when("the user attempts offline Claude setup")]
 async fn attempt_claude_setup(world: &mut E2eWorld) {
     run_offline_setup(world, "claude", Some(DEFAULT_BASE_URL), Some("2.1.0"));
@@ -794,15 +806,15 @@ async fn change_during_approval(world: &mut E2eWorld) {
     .await;
 }
 
-#[when("the OMP second configuration changes at the approval prompt")]
-async fn change_omp_second_during_approval(world: &mut E2eWorld) {
-    let path = secondary_config_path(world, "omp").expect("OMP has a second config");
+#[when("the OMP model registry changes at the approval prompt")]
+async fn change_omp_registry_during_approval(world: &mut E2eWorld) {
+    let path = config_path(world, "omp");
     change_file_during_approval(
         world,
         "omp",
         "18.0.11",
         &path,
-        "# concurrent OMP edit\nmodelRoles:\n  default: concurrent/keep-this-edit\n",
+        "# concurrent OMP registry edit\nunrelatedModels: keep-this-edit\n",
     )
     .await;
 }
@@ -1455,17 +1467,31 @@ async fn redacted_and_idempotent(world: &mut E2eWorld) {
     assert_checkpoint_files_unchanged(world);
 }
 
-#[then("both two-file dry runs write nothing and repeated setup rewrites neither file")]
+#[then("dry runs write nothing and repeated setup rewrites no registered configuration")]
 async fn pi_omp_dry_run_and_idempotence(world: &mut E2eWorld) {
     let results = &state(world).results;
     assert_eq!(results.len(), 6);
-    for (result, agent) in results[..2].iter().zip(["pi", "omp"]) {
-        assert_eq!(result.rc, 0, "two-file dry run failed: {}", result.output());
+    for result in &results[..2] {
+        assert_eq!(result.rc, 0, "dry run failed: {}", result.output());
         assert_contains(&result.output(), "dry run: no changes written");
-        for path in config_paths(world, agent) {
-            assert_contains(&result.output(), &path.to_string_lossy());
-        }
     }
+    for path in config_paths(world, "pi") {
+        assert_contains(&results[0].output(), &path.to_string_lossy());
+    }
+    let omp_models = config_path(world, "omp");
+    assert_contains(&results[1].output(), &omp_models.to_string_lossy());
+    assert_contains(&results[1].output(), "providers.rocm-local");
+    assert!(
+        !results[1].output().contains("modelRoles.default"),
+        "OMP dry run planned a default change: {}",
+        results[1].output()
+    );
+    assert_contains(
+        &results[1].output(),
+        &format!(
+            "dry run: after registration, setup will ask whether to use {MODEL} as the default for new OMP sessions"
+        ),
+    );
     for (first, repeat, agent) in [(2, 3, "pi"), (4, 5, "omp")] {
         assert_eq!(
             results[first].rc,
@@ -1481,10 +1507,11 @@ async fn pi_omp_dry_run_and_idempotence(world: &mut E2eWorld) {
         );
         assert_contains(&results[repeat].output(), "configuration already correct");
     }
+    assert_eq!(read_secondary_config(world, "omp"), OMP_CONFIG_ORIGINAL);
     assert_checkpoint_files_unchanged(world);
 }
 
-#[then("every global config visibly selects the exact local model and keeps unrelated settings")]
+#[then("every global config registers the exact local model and keeps unrelated settings")]
 async fn all_adapters_persist_safely(world: &mut E2eWorld) {
     for harness in HARNESSES
         .into_iter()
@@ -1545,22 +1572,56 @@ async fn all_adapters_persist_safely(world: &mut E2eWorld) {
     ] {
         assert_contains(&omp_models, value);
     }
-    for value in [
-        "modelRoles:",
-        "default:",
-        "rocm-local/",
-        MODEL,
-        "keep-omp-config",
-    ] {
-        assert_contains(&omp_config, value);
-    }
+    assert_eq!(omp_config, OMP_CONFIG_ORIGINAL);
+    assert_contains(
+        &last_result(world).output(),
+        "default for new OMP sessions remains unchanged",
+    );
     assert_exact_line(&omp_models, "# retained omp models comment", "omp models");
-    assert_exact_line(&omp_config, "# retained omp config comment", "omp config");
     assert!(
         state(world).results.iter().all(|result| result.rc == 0),
         "adapter setup failed: {:#?}",
         state(world).results
     );
+}
+
+#[then("OMP setup and test use the registered model without changing the existing default")]
+async fn omp_declined_default_is_unchanged(world: &mut E2eWorld) {
+    let outputs = &state(world).interactive_outputs;
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert_contains(output, "protocol check passed");
+    assert_contains(output, &format!("Use {MODEL} as the default"));
+    assert_contains(output, "[y/N]:");
+    assert_contains(output, "default for new OMP sessions remains unchanged");
+    assert_contains(output, "harness test passed");
+    assert_eq!(read_secondary_config(world, "omp"), OMP_CONFIG_ORIGINAL);
+    assert_omp_model_registered(world, &world.mock.as_ref().expect("no mock").base_url());
+    let capture = std::fs::read_to_string(capture_path(world, "omp"))
+        .expect("OMP setup test invocation was not captured");
+    assert_safe_fake_args("omp", &capture);
+    assert!(
+        !world
+            .mock
+            .as_ref()
+            .expect("no mock")
+            .protocol_requests()
+            .is_empty(),
+        "OMP default prompt appeared before the protocol check"
+    );
+}
+
+#[then("only the OMP default role changes after registration")]
+async fn omp_accepted_default_changes_only_default(world: &mut E2eWorld) {
+    let outputs = &state(world).interactive_outputs;
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert_contains(output, "protocol check passed");
+    assert_contains(output, &format!("Use {MODEL} as the default"));
+    assert_contains(output, "[y/N]:");
+    assert_contains(output, &format!("default for new OMP sessions: {MODEL}"));
+    assert_eq!(read_secondary_config(world, "omp"), OMP_CONFIG_DEFAULT);
+    assert_omp_model_registered(world, &world.mock.as_ref().expect("no mock").base_url());
 }
 
 #[then("the symlink targets are unchanged and both setups explain the refusal")]
@@ -1585,18 +1646,13 @@ async fn stale_plan_refused(world: &mut E2eWorld) {
         "{\"concurrent\":\"keep-this-edit\"}\n"
     );
     assert_eq!(
-        read_secondary_config(world, "omp"),
-        "# concurrent OMP edit\nmodelRoles:\n  default: concurrent/keep-this-edit\n"
+        read_config(world, "omp"),
+        "# concurrent OMP registry edit\nunrelatedModels: keep-this-edit\n"
     );
     assert_eq!(
-        read_config(world, "omp"),
-        state(world)
-            .original_files
-            .iter()
-            .find(|(path, _)| path == &config_path(world, "omp"))
-            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-            .expect("no original OMP models snapshot"),
-        "stale second-file plan changed the first file"
+        read_secondary_config(world, "omp"),
+        OMP_CONFIG_ORIGINAL,
+        "stale registry plan changed the OMP default configuration"
     );
 }
 
@@ -1700,8 +1756,19 @@ async fn direct_setup_and_managed_refusal(world: &mut E2eWorld) {
         let config = read_config(world, agent);
         assert_contains(&config, DEFAULT_BASE_URL);
         assert_contains(&config, MODEL);
-        if matches!(agent, "pi" | "omp") {
+        if agent == "pi" {
             assert_contains(&read_secondary_config(world, agent), MODEL);
+        } else if agent == "omp" {
+            assert!(
+                !secondary_config_path(world, agent)
+                    .expect("OMP has a second config")
+                    .exists(),
+                "noninteractive OMP setup created a default configuration"
+            );
+            assert_contains(
+                &result.output(),
+                "default for new OMP sessions remains unchanged",
+            );
         }
     }
     for (result, managed_mode) in results[5..]
@@ -1795,6 +1862,16 @@ async fn fake_harness_evidence(world: &mut E2eWorld) {
         );
         assert_safe_fake_args(harness.name, &capture);
     }
+    assert_omp_model_registered(world, DEFAULT_BASE_URL);
+    let omp_config = secondary_config_path(world, "omp").expect("OMP has a second config");
+    assert!(
+        !omp_config.exists(),
+        "noninteractive OMP setup created a default configuration"
+    );
+    assert_contains(
+        &last_result(world).output(),
+        "default for new OMP sessions remains unchanged",
+    );
     assert_eq!(
         std::fs::read(state(world).project.join("caller.txt"))
             .expect("caller repository marker was removed"),
@@ -1873,6 +1950,12 @@ async fn project_warning_without_mutation(world: &mut E2eWorld) {
     for agent in ["aider", "pi", "omp"] {
         assert_contains(&read_config(world, agent), MODEL);
     }
+    assert!(
+        !secondary_config_path(world, "omp")
+            .expect("OMP has a second config")
+            .exists(),
+        "global OMP default configuration was created"
+    );
     assert_project_files_unchanged(world);
 }
 
@@ -2022,11 +2105,7 @@ fn plant_pi_omp_configs(world: &E2eWorld) {
         "omp",
         "# retained omp models comment\nunrelatedModels: keep-omp-models\n",
     );
-    plant_secondary_config(
-        world,
-        "omp",
-        "# retained omp config comment\nunrelatedConfig: keep-omp-config\n",
-    );
+    plant_secondary_config(world, "omp", OMP_CONFIG_ORIGINAL);
 }
 
 fn read_config(world: &E2eWorld, agent: &str) -> String {
@@ -2252,6 +2331,64 @@ async fn change_file_during_approval(
     drop(session);
 }
 
+async fn run_interactive_omp_setup(world: &mut E2eWorld, accept_default: bool, test: bool) {
+    let base_url = world.mock.as_ref().expect("no mock").base_url();
+    let mut args = vec![
+        "agents",
+        "omp",
+        "--setup",
+        "--base-url",
+        base_url.as_str(),
+        "--model",
+        MODEL,
+    ];
+    if test {
+        args.push("--test");
+    }
+    let mut session = crate::e2e::tui_driver::TuiSession::spawn(world, &args)
+        .expect("failed to spawn interactive OMP setup");
+    session
+        .wait_for_screen("agent setup plan", Duration::from_secs(10))
+        .await
+        .expect("OMP registration plan was not shown");
+    let mut transcript = session.screen_text();
+    session
+        .send("y\r")
+        .expect("failed to approve OMP registration");
+    session
+        .wait_for_screen("protocol check passed", Duration::from_secs(10))
+        .await
+        .expect("OMP protocol check did not pass before default selection");
+    transcript.push_str(&session.screen_text());
+    session
+        .wait_for_screen(
+            &format!("Use {MODEL} as the default"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("OMP default selection prompt was not shown");
+    transcript.push_str(&session.screen_text());
+    session
+        .send(if accept_default { "y\r" } else { "n\r" })
+        .expect("failed to answer OMP default selection");
+    let completion = if accept_default {
+        format!("default for new OMP sessions: {MODEL}")
+    } else {
+        "harness test passed".to_owned()
+    };
+    session
+        .wait_for_screen(&completion, Duration::from_secs(10))
+        .await
+        .expect("interactive OMP setup did not complete");
+    transcript.push_str(&session.screen_text());
+    session
+        .wait_for_exit(Duration::from_secs(10))
+        .await
+        .expect("interactive OMP setup did not exit successfully");
+    world.cli_output = Some(transcript.clone());
+    state_mut(world).interactive_outputs.push(transcript);
+}
+
 fn run_agents_with_file_limit(world: &mut E2eWorld, args: &[&str]) {
     #[cfg(unix)]
     {
@@ -2404,6 +2541,13 @@ fn assert_contains(haystack: &str, needle: &str) {
             .contains(&needle.to_ascii_lowercase()),
         "expected output to contain {needle:?}\n--- output ---\n{haystack}\n--- end ---"
     );
+}
+
+fn assert_omp_model_registered(world: &E2eWorld, base_url: &str) {
+    let models = read_config(world, "omp");
+    for expected in [base_url, "rocm-local", MODEL] {
+        assert_contains(&models, expected);
+    }
 }
 
 fn assert_fake_arg_pair(capture: &str, flag: &str, value: &str) {

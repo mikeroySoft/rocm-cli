@@ -342,6 +342,12 @@ fn setup(harness: AgentHarness, version: &VersionInfo, args: &AgentsArgs) -> Res
 
     if args.dry_run {
         println!("dry run: no changes written");
+        if harness == AgentHarness::Omp {
+            println!(
+                "dry run: after registration, setup will ask whether to use {} as the default for new OMP sessions",
+                target.model
+            );
+        }
         return Ok(true);
     }
     if plan.changes.is_empty() {
@@ -351,6 +357,7 @@ fn setup(harness: AgentHarness, version: &VersionInfo, args: &AgentsArgs) -> Res
                 .with_context(|| format!("{} protocol check failed", harness.canonical_name()))?;
             println!("protocol check passed");
         }
+        configure_omp_default(harness, version, &target)?;
         return Ok(true);
     }
     if !args.yes && !confirm()? {
@@ -382,7 +389,35 @@ fn setup(harness: AgentHarness, version: &VersionInfo, args: &AgentsArgs) -> Res
     } else {
         println!("configuration already correct");
     }
+    configure_omp_default(harness, version, &target)?;
     Ok(true)
+}
+
+fn configure_omp_default(
+    harness: AgentHarness,
+    version: &VersionInfo,
+    target: &ResolvedTarget,
+) -> Result<()> {
+    if harness != AgentHarness::Omp {
+        return Ok(());
+    }
+    if !interactive_terminal() {
+        println!("default for new OMP sessions remains unchanged");
+        return Ok(());
+    }
+    if !confirm_omp_default(&target.model)? {
+        println!("default for new OMP sessions remains unchanged");
+        return Ok(());
+    }
+
+    let state = config::inspect(harness)
+        .context("failed to re-inspect omp configuration before selecting the default")?;
+    let plan = config::plan_default(harness, version, target, state)
+        .context("failed to plan omp default")?;
+    render_plan(harness, version, target, &plan);
+    config::apply(&plan).context("failed to configure omp default")?;
+    println!("default for new OMP sessions: {}", target.model);
+    Ok(())
 }
 
 fn render_plan(
@@ -483,6 +518,19 @@ fn confirm() -> Result<bool> {
     io::stdin()
         .read_line(&mut answer)
         .context("failed to read setup approval")?;
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+fn confirm_omp_default(model: &str) -> Result<bool> {
+    print!("Use {model} as the default for new OMP sessions? [y/N]: ");
+    io::stdout()
+        .flush()
+        .context("failed to write default selection prompt")?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read default selection")?;
     let answer = answer.trim();
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }

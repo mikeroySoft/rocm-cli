@@ -459,21 +459,27 @@ the placeholder local API key `rocm-local`, and the selected model;
 `.pi/settings.json` or an explicit CLI/session selection has higher precedence,
 so setup warns about project settings and changes only the user files.
 
-OMP setup updates the active profile's user-level `models.yml` and `config.yml`:
-the former gets the unauthenticated `rocm-local` Chat Completions provider and
-model, while the latter sets `modelRoles.default` to
-`rocm-local/<model>`. The default agent root is `~/.omp/agent`;
-`PI_CONFIG_DIR` changes the `.omp` root, and `PI_CODING_AGENT_DIR` replaces the
-default profile's full agent directory. A profile selected by `--profile` or
-`OMP_PROFILE` (preferred over legacy `PI_PROFILE`) instead uses
-`<root>/profiles/<name>/agent`. Setup changes only that active profile's user
-files. Project `.omp/config.yml`, `PI_CONFIG_FILES` overlays, repeated
-`--config` overlays, and runtime `--model` can override the effective model;
-later overlays win, so OMP setup warns when they may take precedence.
+OMP setup always adds the unauthenticated `rocm-local` Chat Completions
+provider and model to the active profile's user-level `models.yml`. After a
+successful registration and protocol check, interactive setup asks whether to
+set `modelRoles.default` in `config.yml` to `rocm-local/<model>` for new OMP
+sessions. Declining, running noninteractively with `--yes`, or using
+`--dry-run` leaves the existing default unchanged; rerun setup interactively
+to choose it later. Dry-run reports that default selection follows an applied
+setup. The default agent root is `~/.omp/agent`; `PI_CONFIG_DIR` changes the
+`.omp` root, and `PI_CODING_AGENT_DIR` replaces the default profile's full
+agent directory. A profile selected by `--profile` or `OMP_PROFILE` (preferred
+over legacy `PI_PROFILE`) instead uses `<root>/profiles/<name>/agent`. Setup
+changes only that active profile's user files. Project `.omp/config.yml`,
+`PI_CONFIG_FILES` overlays, repeated `--config` overlays, and runtime `--model`
+can override the effective model; later overlays win, so OMP setup warns when
+they may take precedence.
 
-Each Pi or OMP setup is one two-file transaction. Both targets are checked for
-symlinks and stale plans, replacements are atomic and ordered, a partial apply
-restores earlier files, and full rollback restores files in reverse order.
+Pi setup applies its two user files as one transaction. Both targets are
+checked for symlinks and stale plans, replacements are atomic and ordered, a
+partial apply restores earlier files, and full rollback restores files in
+reverse order. OMP registers `models.yml` first and applies the optional
+`config.yml` default separately only after the interactive choice.
 
 Setup automatically uses the unique ready loopback service managed by
 rocm-cli. `--model` selects a matching service when several are ready. If no
@@ -485,10 +491,10 @@ unambiguous model.
 
 `--dry-run` prints the target and file changes without writing them. A normal
 setup prompts before writing; `--yes` supplies that approval for scripts and
-other non-interactive use. After writing, setup probes the harness's native
-API route with the exact model and restores the previous configuration if the
-check fails. `--no-check` deliberately keeps the configuration without making
-that protocol request.
+other non-interactive use, but does not select OMP's optional default. After
+writing, setup probes the harness's native API route with the exact model and
+restores the previous configuration if the check fails. `--no-check`
+deliberately keeps the configuration without making that protocol request.
 
 `--test` runs the installed harness against a nonce probe in an isolated
 temporary workspace using harness-specific safe arguments and the configured
