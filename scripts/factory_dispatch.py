@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FACTORY = ROOT / ".factory"
 LOGS = FACTORY / "logs"
 GPU_LOCK = Path("/tmp/rocm-factory-gpu.lock")
+GATE = Path(__file__).resolve().parent / "agent_gate.py"
 MAX_ACTIVE = 2
 MAX_ATTEMPTS = 3
 
@@ -36,7 +37,7 @@ STANDING_INSTRUCTIONS = """
 - Implement exactly what the ticket above asks for; nothing more.
 - Use TDD where practical: failing test first, then the fix.
 - Commit incrementally with `git commit -s`.
-- Finish by running `python scripts/agent_gate.py --report .factory/gate-report-{n}.md`
+- Finish by running `python {gate} --report .factory/gate-report-{n}.md`
   and fixing any failures it reports.
 """
 
@@ -129,7 +130,7 @@ def build_prompt(n: int, extra: str = "") -> str:
     for c in issue.get("comments") or []:
         author = (c.get("author") or {}).get("login", "unknown")
         parts += ["", f"## Comment by {author}", "", c.get("body", "")]
-    parts.append(STANDING_INSTRUCTIONS.format(n=n))
+    parts.append(STANDING_INSTRUCTIONS.format(n=n, gate=GATE))
     if extra:
         parts += ["", extra]
     return "\n".join(parts) + "\n"
@@ -172,7 +173,7 @@ def run_gate(wt: Path, n: int) -> tuple[bool, str]:
     (wt / ".factory").mkdir(exist_ok=True)
     with gpu_lock():
         proc = subprocess.run(
-            [sys.executable, "scripts/agent_gate.py", "--base", "origin/main",
+            [sys.executable, str(GATE), "--base", "origin/main",
              "--report", report_rel],
             cwd=wt, capture_output=True, text=True)
     report = wt / report_rel
