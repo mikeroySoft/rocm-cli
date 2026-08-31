@@ -46,7 +46,7 @@ const TRACKED_ENV_VARS: &[&str] = &[
 
 /// Repo files dropped by the `amdgpu-install` pipeline; their presence marks an
 /// amdgpu-install-managed ROCm.
-const AMDGPU_INSTALL_MARKERS: &[&str] = &[
+pub(crate) const AMDGPU_INSTALL_MARKERS: &[&str] = &[
     "/etc/apt/sources.list.d/amdgpu.list",
     "/etc/apt/sources.list.d/rocm.list",
     "/etc/apt/sources.list.d/radeon.list",
