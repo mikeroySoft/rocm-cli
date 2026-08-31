@@ -22,8 +22,18 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-REPO = "mikeroySoft/rocm-cli"
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def origin_repo() -> str:
+    url = subprocess.run(
+        ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return url.rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
+
+
+REPO = origin_repo()
 FACTORY = ROOT / ".factory"
 LOGS = FACTORY / "logs"
 GPU_LOCK = Path("/tmp/rocm-factory-gpu.lock")
