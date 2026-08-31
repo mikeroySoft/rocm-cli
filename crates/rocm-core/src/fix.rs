@@ -1038,10 +1038,10 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-    fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
+    fn the_path_fix_does_not_report_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
-        // marker.
+        // marker, but may still find a real install in the default locations.
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
@@ -1063,9 +1063,10 @@ mod tests {
         }
         std::fs::remove_dir_all(&root).ok();
 
-        assert!(
-            found.is_empty(),
-            "an empty directory is not an install, but {found:?} was returned"
+        assert_ne!(
+            found,
+            empty.to_string_lossy(),
+            "an empty directory is not an install"
         );
     }
 

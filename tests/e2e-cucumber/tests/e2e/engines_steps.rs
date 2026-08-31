@@ -96,12 +96,13 @@ async fn open_engine_shell(world: &mut E2eWorld) {
 async fn assert_prompt_marked(world: &mut E2eWorld) {
     let session = world.tui.as_mut().expect("no engine shell session");
     let marker = format!("(rocm:{ENGINE})");
-    // The marker must be on the rendered prompt line, which is what the user
-    // actually sees — not merely somewhere in the informational block above it.
+    // The handover banner also names the marker, so wait for bash's prompt
+    // character before inspecting the line. Otherwise this returns on the
+    // banner and races the shell startup.
     session
-        .wait_for_screen(&marker, SCREEN_TIMEOUT)
+        .wait_for_screen("$", SCREEN_TIMEOUT)
         .await
-        .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
+        .unwrap_or_else(|e| panic!("engine shell prompt never appeared: {e}"));
 
     let screen = session.screen_text();
     let on_a_prompt_line = screen

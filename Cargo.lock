@@ -1260,7 +1260,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-cucumber"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "axum",
  "cucumber",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-report"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "maud",
  "serde",
@@ -3576,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "rocm"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-core"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "cc",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-dash-collectors"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "bollard",
  "chrono",
@@ -3653,7 +3653,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-dash-core"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "chrono",
  "dirs",
@@ -3666,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-dash-daemon"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-dash-tui"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3714,14 +3714,14 @@ dependencies = [
 
 [[package]]
 name = "rocm-deps"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "toml",
 ]
 
 [[package]]
 name = "rocm-engine-lemonade"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "clap",
@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-protocol"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "rocm-core",
  "serde",
@@ -3750,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "rocm-engine-vllm"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "clap",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "rocmd"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "axum",
@@ -5971,7 +5971,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.0-mrs"
 dependencies = [
  "anyhow",
  "clap",
