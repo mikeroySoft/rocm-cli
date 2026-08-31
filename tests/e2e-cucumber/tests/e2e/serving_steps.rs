@@ -707,6 +707,11 @@ async fn user_lists_services(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user lists recommended models")]
+async fn user_lists_recommended_models(world: &mut E2eWorld) {
+    world.cli_output = Some(crate::run_rocm_ok(world, &["model"]));
+}
+
 #[when("the user serves a model without specifying an engine")]
 async fn user_serves_default_engine(world: &mut E2eWorld) {
     // This scenario tests automatic *engine selection* — a platform-agnostic
@@ -960,6 +965,15 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
             && (output.contains("out of range") || output.contains("not available")),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
+    );
+}
+
+#[then("Ornith appears in the model list")]
+async fn assert_ornith_in_model_list(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no CLI output");
+    assert!(
+        output.contains("ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M"),
+        "Ornith missing from model list:\n{output}"
     );
 }
 

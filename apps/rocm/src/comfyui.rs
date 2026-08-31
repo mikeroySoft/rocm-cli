@@ -827,7 +827,7 @@ fn strip_ansi_sequences(text: &str) -> String {
 
 fn evaluate_running_state(state: &ComfyUiState) -> ComfyUiRunReport {
     let process_running = process_is_running(state.pid);
-    let endpoint_reachable = endpoint_is_reachable(&state.host, state.port);
+    let endpoint_reachable = process_running && endpoint_is_reachable(&state.host, state.port);
     let state = if endpoint_reachable {
         ComfyUiRunState::Running
     } else if process_running {
@@ -1810,11 +1810,6 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unused_local_port() -> Result<u16> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        Ok(listener.local_addr()?.port())
-    }
-
     #[test]
     fn requirements_filter_preserves_therock_torch_stack() {
         let text = "torch torchvision>=1 torchaudio\nnumpy>=1.25\n# comment\naiohttp\n";
@@ -2032,11 +2027,12 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_stopped_when_saved_comfyui_pid_is_gone() -> Result<()> {
+    fn status_ignores_reused_port_when_saved_comfyui_pid_is_gone() -> Result<()> {
         let paths = test_paths("comfyui-stale-state");
         let logs = app_root(&paths).join("logs");
         fs::create_dir_all(&logs)?;
-        let port = unused_local_port()?;
+        let unrelated_listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = unrelated_listener.local_addr()?.port();
         save_state(
             &paths,
             &ComfyUiState {
@@ -2053,6 +2049,7 @@ mod tests {
         )?;
 
         let rendered = render_status(&paths, &RocmCliConfig::default())?;
+        assert!(endpoint_is_reachable("127.0.0.1", port));
 
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("next step: rocm comfyui start"));
@@ -2113,6 +2110,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms: 100,
         };
 
@@ -2178,6 +2176,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms: 100,
         };
 
@@ -2274,6 +2273,7 @@ mod tests {
             }),
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms: 100,
         })
     }
