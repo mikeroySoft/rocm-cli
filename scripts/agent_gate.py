@@ -23,7 +23,7 @@ LEAK_RE = re.compile(
     r"internal|confidential|proprietary|private|jira|confluence|\.corp|\.internal",
     re.IGNORECASE,
 )
-TAIL_LINES = 40
+TAIL_LINES = 80
 
 
 def run(cmd: list[str]) -> tuple[bool, str]:
@@ -60,6 +60,7 @@ def check_smoke() -> tuple[bool, str]:
 def check_leaks(base: str) -> tuple[bool, str]:
     # ponytail: excludes fork-local agent-harness paths that never go upstream;
     # tighten the pathspec if those dirs ever feed a push.
+    # agent_gate.py itself is excluded: its LEAK_RE literal matches the scan.
     proc = subprocess.run(
         [
             "git",
@@ -69,6 +70,7 @@ def check_leaks(base: str) -> tuple[bool, str]:
             ":(exclude).agents",
             ":(exclude)skills",
             ":(exclude)skills-lock.json",
+            ":(exclude)scripts/agent_gate.py",
         ],
         capture_output=True,
         text=True,
