@@ -60,6 +60,8 @@ pub(super) enum AgentHarness {
     QwenCode,
     Aider,
     Continue,
+    Pi,
+    Omp,
 }
 
 impl AgentHarness {
@@ -73,6 +75,8 @@ impl AgentHarness {
             Self::QwenCode,
             Self::Aider,
             Self::Continue,
+            Self::Pi,
+            Self::Omp,
         ]
     }
 
@@ -86,6 +90,8 @@ impl AgentHarness {
             "qwen-code" | "qwen" | "qwencode" => Some(Self::QwenCode),
             "aider" | "aider-chat" => Some(Self::Aider),
             "continue" | "continue-dev" | "cn" => Some(Self::Continue),
+            "pi" => Some(Self::Pi),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -100,6 +106,8 @@ impl AgentHarness {
             Self::QwenCode => "qwen-code",
             Self::Aider => "aider",
             Self::Continue => "continue",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
         }
     }
 
@@ -113,6 +121,7 @@ impl AgentHarness {
             Self::QwenCode => &["qwen", "qwencode"],
             Self::Aider => &["aider-chat"],
             Self::Continue => &["continue-dev", "cn"],
+            Self::Pi | Self::Omp => &[],
         }
     }
 
@@ -126,6 +135,8 @@ impl AgentHarness {
             Self::QwenCode => "qwen",
             Self::Aider => "aider",
             Self::Continue => "cn",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
         }
     }
 
@@ -138,16 +149,20 @@ impl AgentHarness {
             | Self::OpenCode
             | Self::QwenCode
             | Self::Aider
-            | Self::Continue => AgentProtocol::ChatCompletions,
+            | Self::Continue
+            | Self::Pi
+            | Self::Omp => AgentProtocol::ChatCompletions,
         }
     }
 
-    pub(super) const fn supports_version(self, version: &Version) -> bool {
+    pub(super) fn supports_version(self, version: &Version) -> bool {
         match self {
             Self::Claude => version.major == 1 || version.major == 2,
             Self::Hermes | Self::Codex | Self::QwenCode | Self::Aider => version.major == 0,
             Self::OpenClaw => version.major == 2026,
             Self::OpenCode | Self::Continue => version.major == 1,
+            Self::Pi => version == &Version::new(0, 84, 4),
+            Self::Omp => version.major == 18,
         }
     }
 }
@@ -193,7 +208,7 @@ pub(super) fn run(args: AgentsArgs) -> Result<()> {
     };
     let harness = AgentHarness::parse(agent_name).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown agent '{agent_name}'; valid agents and aliases: claude (claude-code), hermes (hermes-agent), openclaw (open-claw), codex (codex-cli), opencode (open-code), qwen-code (qwen, qwencode), aider (aider-chat), continue (continue-dev, cn)"
+            "unknown agent '{agent_name}'; valid agents and aliases: claude (claude-code), hermes (hermes-agent), openclaw (open-claw), codex (codex-cli), opencode (open-code), qwen-code (qwen, qwencode), aider (aider-chat), continue (continue-dev, cn), pi, omp"
         )
     })?;
 
@@ -214,7 +229,28 @@ pub(super) fn run(args: AgentsArgs) -> Result<()> {
 
     if args.test {
         require_testable_version(harness, &version)?;
-        target::run_harness_test(harness, &version)
+        let configured_model = if matches!(harness, AgentHarness::Pi | AgentHarness::Omp) {
+            Some(
+                config::inspect(harness)
+                    .with_context(|| {
+                        format!(
+                            "failed to re-inspect {} configuration before testing",
+                            harness.canonical_name()
+                        )
+                    })?
+                    .model
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} has no configured model; run `rocm agents {} --setup` before testing",
+                            harness.canonical_name(),
+                            harness.canonical_name()
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        target::run_harness_test(harness, &version, configured_model.as_deref())
             .with_context(|| format!("{} harness test failed", harness.canonical_name()))?;
         println!("harness test passed");
     }
@@ -266,7 +302,9 @@ fn inspect(harness: AgentHarness, version: &VersionInfo) -> Result<()> {
     }
     println!("  version source: {}", version.source);
     println!("  supported: {}", version.supported);
-    println!("  config: {}", state.path.display());
+    for path in state.paths() {
+        println!("  config: {}", path.display());
+    }
     println!("  configured: {}", state.configured);
     println!(
         "  endpoint: {}",
@@ -360,7 +398,9 @@ fn render_plan(
         None => println!("  version: unavailable"),
     }
     println!("  version source: {}", version.source);
-    println!("  config: {}", plan.state.path.display());
+    for path in plan.state.paths() {
+        println!("  config: {}", path.display());
+    }
     println!("  endpoint: {}", target.api_base);
     println!("  model: {}", target.model);
     if let Some(service_id) = &target.service_id {

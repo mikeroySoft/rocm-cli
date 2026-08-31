@@ -439,12 +439,41 @@ rocm agents <agent> --test [--agent-version VERSION]
 ```
 
 Supported harness names are `claude`, `hermes`, `openclaw`, `codex`,
-`opencode`, `qwen-code`, `aider`, and `continue`; `rocm agents` lists them
-with installation and configuration status. `rocm agents <agent>` inspects
-one harness without changing it, including its detected executable, version,
-configuration path, endpoint, and model. Use `--agent-version` to select a
-supported configuration schema explicitly, including when preparing setup
-before the harness is installed.
+`opencode`, `qwen-code`, `aider`, `continue`, `pi`, and `omp`; `rocm agents`
+lists all ten with installation and configuration status. Pi is the Earendil
+Works Pi coding agent (`pi` executable), while OMP is Oh My Pi (`omp`
+executable): they are separate canonical harnesses and neither name is an
+alias for the other. Pi setup supports exactly version `0.84.4`; OMP setup
+supports major version `18`.
+
+`rocm agents <agent>` inspects one harness without changing it, including its
+detected executable, version, configuration paths, endpoint, and model. Use
+`--agent-version` to select a supported configuration schema explicitly,
+including when preparing setup before the harness is installed.
+
+Pi setup updates two user-level files under
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}`. `models.json` gets a
+`providers.rocm-local` Chat Completions provider with the loopback base URL,
+the placeholder local API key `rocm-local`, and the selected model;
+`settings.json` gets `defaultProvider` and `defaultModel`. A project
+`.pi/settings.json` or an explicit CLI/session selection has higher precedence,
+so setup warns about project settings and changes only the user files.
+
+OMP setup updates the active profile's user-level `models.yml` and `config.yml`:
+the former gets the unauthenticated `rocm-local` Chat Completions provider and
+model, while the latter sets `modelRoles.default` to
+`rocm-local/<model>`. The default agent root is `~/.omp/agent`;
+`PI_CONFIG_DIR` changes the `.omp` root, and `PI_CODING_AGENT_DIR` replaces the
+default profile's full agent directory. A profile selected by `--profile` or
+`OMP_PROFILE` (preferred over legacy `PI_PROFILE`) instead uses
+`<root>/profiles/<name>/agent`. Setup changes only that active profile's user
+files. Project `.omp/config.yml`, `PI_CONFIG_FILES` overlays, repeated
+`--config` overlays, and runtime `--model` can override the effective model;
+later overlays win, so OMP setup warns when they may take precedence.
+
+Each Pi or OMP setup is one two-file transaction. Both targets are checked for
+symlinks and stale plans, replacements are atomic and ordered, a partial apply
+restores earlier files, and full rollback restores files in reverse order.
 
 Setup automatically uses the unique ready loopback service managed by
 rocm-cli. `--model` selects a matching service when several are ready. If no
@@ -462,10 +491,14 @@ check fails. `--no-check` deliberately keeps the configuration without making
 that protocol request.
 
 `--test` runs the installed harness against a nonce probe in an isolated
-temporary workspace using harness-specific safe arguments. It verifies the
-probe remains intact and the nonce appears in the harness's final output,
-without exposing the caller's repository. Harnesses may create ordinary
-cache or session files inside that temporary workspace.
+temporary workspace using harness-specific safe arguments and the configured
+model. It verifies the probe remains intact and the nonce appears in the
+harness's final output, without exposing the caller's repository. Pi is pinned
+to the selected provider, model, and placeholder API key with offline and
+resource-discovery restrictions. OMP uses noninteractive print mode with an
+`@probe.txt` prompt, disables tools, sessions, titles, LSP, PTY, extensions,
+skills, and rules, and applies a bounded maximum time. Harnesses may create
+ordinary cache or session files inside the temporary workspace.
 
 ### ComfyUI
 
