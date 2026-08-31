@@ -1,0 +1,13 @@
+# Not installed automatically. To use:
+#   systemctl --user link /home/mike/dev/mikeroysoft/rocm-cli/scripts/systemd/rocm-factory.timer
+#   systemctl --user enable --now rocm-factory.timer
+
+[Unit]
+Description=Run the ROCm CLI AI-factory dispatcher every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
