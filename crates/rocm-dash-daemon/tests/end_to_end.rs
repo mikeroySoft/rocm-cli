@@ -28,6 +28,52 @@ const HEADER: &str = "cell,run,wall_s,n_requests,main_prompt_n,prompt_tokens,pro
 const ROW: &str = "O-arch,1,42.3,8,512,4096,1240.5,2048,68.2,8,2,8192,0,true,0,all-pass,\
     4.5,pass,claude,deepseek-r1,http://vllm:8000,8,1,fp8,32,triton,1,,true,0\n";
 
+async fn spawn_http_server(
+    responder: fn(&str) -> (u16, &'static str),
+) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0_u8; 2048];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..read]).unwrap();
+                let (status, body) = responder(request);
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (port, handle)
+}
+
+const fn unavailable(_: &str) -> (u16, &'static str) {
+    (503, "")
+}
+
+fn lemonade_stats(request: &str) -> (u16, &'static str) {
+    if request.starts_with("GET /metrics ") {
+        (200, "# unrelated exporter\n")
+    } else {
+        (
+            200,
+            r#"{"tokens_per_second":42.0,"time_to_first_token":0.12,"decode_token_times":[0.02,0.04]}"#,
+        )
+    }
+}
+
 #[tokio::test]
 async fn runner_broadcasts_snapshots_and_bench_rows() {
     let mut path = std::env::temp_dir();
@@ -265,13 +311,16 @@ async fn socket_is_created_with_restricted_permissions() {
 #[tokio::test]
 async fn scrape_warning_persists_between_scrape_ticks() {
     let dir = tempfile::tempdir().unwrap();
-    // A "running" managed vLLM service on a port nothing listens on: every
-    // scrape fails, so the warning must be present on EVERY snapshot.
+    // A deterministic failing endpoint: keeping a listener alive avoids
+    // assuming a fixed port is unused while still returning a scrape error.
+    let (port, server) = spawn_http_server(unavailable).await;
     std::fs::write(
         dir.path().join("svc.json"),
-        r#"{"service_id":"svc-dead","engine":"vllm","model_ref":"m","canonical_model_id":"m",
-            "host":"127.0.0.1","port":1,"endpoint_url":"http://127.0.0.1:1/v1","mode":"managed",
-            "status":"running","created_at_unix_ms":1}"#,
+        format!(
+            r#"{{"service_id":"svc-dead","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+                "host":"127.0.0.1","port":{port},"endpoint_url":"http://127.0.0.1:{port}/v1","mode":"managed",
+                "status":"running","created_at_unix_ms":1}}"#
+        ),
     )
     .unwrap();
 
@@ -303,19 +352,88 @@ async fn scrape_warning_persists_between_scrape_ticks() {
             .expect("event timeout")
             .expect("recv");
         let Event::Snapshot(snap) = ev else { continue };
-        let warned = snap.warnings.iter().any(|w| w.starts_with("vllm scrape:"));
+        let warned = snap
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("instance scrape:"));
         if !seen_warned {
             seen_warned = warned;
             continue;
         }
         assert!(
             warned,
-            "vllm scrape warning dropped on a non-scrape tick: {:?}",
+            "instance scrape warning dropped on a non-scrape tick: {:?}",
             snap.warnings
         );
         checked += 1;
     }
 
     handle.abort();
+    server.abort();
     let _ = handle.await;
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn managed_lemonade_falls_back_from_stale_metrics_to_live_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, server) = spawn_http_server(lemonade_stats).await;
+    std::fs::write(
+        dir.path().join("svc.json"),
+        format!(
+            r#"{{"service_id":"svc-lemon","engine":"lemonade","model_ref":"m","canonical_model_id":"m",
+                "host":"127.0.0.1","port":{port},"status":"ready","gpu_indices":[0],
+                "created_at_unix_ms":1}}"#
+        ),
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let services_dir = dir.path().to_path_buf();
+    let runner = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            services_dir: Some(services_dir),
+            discovery_tick: Duration::from_millis(50),
+            instance_tick: Duration::from_millis(50),
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(16))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("recv");
+        if let Event::Snapshot(snapshot) = event
+            && let Some(instance) = snapshot
+                .instances
+                .iter()
+                .find(|instance| instance.container_id == "svc-lemon")
+            && instance.gen_tps == Some(42.0)
+        {
+            assert_eq!(instance.ttft_ms, Some(120.0));
+            assert_eq!(instance.tpot_ms, Some(30.0));
+            assert_eq!(instance.gpu_ids, vec!["0"]);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "managed Lemonade telemetry never reached a snapshot"
+        );
+    }
+
+    runner.abort();
+    server.abort();
+    let _ = runner.await;
+    let _ = server.await;
 }
