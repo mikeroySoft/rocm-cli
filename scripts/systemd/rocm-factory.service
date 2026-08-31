@@ -1,0 +1,12 @@
+# Not installed automatically. To use:
+#   systemctl --user link /home/mike/dev/mikeroysoft/rocm-cli/scripts/systemd/rocm-factory.service
+#   systemctl --user link /home/mike/dev/mikeroysoft/rocm-cli/scripts/systemd/rocm-factory.timer
+#   systemctl --user enable --now rocm-factory.timer
+
+[Unit]
+Description=ROCm CLI AI-factory dispatcher (one pass)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/mike/dev/mikeroysoft/rocm-cli
+ExecStart=/usr/bin/python scripts/factory_dispatch.py
