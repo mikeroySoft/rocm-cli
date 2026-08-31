@@ -253,6 +253,25 @@ impl TuiSession {
         (p.screen().contents(), p.screen().size())
     }
 
+    /// Find the first visible cell containing `symbol`, returning zero-based
+    /// terminal coordinates.
+    pub fn find_cell(&self, symbol: &str) -> Option<(u16, u16)> {
+        let parser = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows).find_map(|row| {
+            (0..cols).find_map(|col| {
+                screen
+                    .cell(row, col)
+                    .is_some_and(|cell| cell.contents() == symbol)
+                    .then_some((row, col))
+            })
+        })
+    }
+
     fn framed_screen(&self) -> String {
         let (screen, (rows, cols)) = self.screen_snapshot();
         format!("--- last screen ({cols}x{rows}) ---\n{screen}\n--- end screen ---")

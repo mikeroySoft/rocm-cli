@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     let body = outer[1];
     let footer_area = outer[2];
 
-    draw_header(f, outer[0], state, &theme);
+    state.last_warning_area = draw_header(f, outer[0], state, &theme);
 
     // The body is framed by the outlined folder-tab panel (the live chrome). On
     // a wide screen the panel wraps only the CENTER column so the tabs read as
@@ -123,6 +123,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     match state.modal {
         Modal::None => {}
         Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
+        Modal::Warnings => modal::draw_warnings(f, body, &state.warning_details, &theme),
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
@@ -298,7 +299,7 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
     Some((left, center_outer, right))
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Option<Rect> {
     // In demo/replay the data is not live, so never present the session as
     // "connected" to a real daemon — the Connected case shows a simulated label
     // instead, and the SIMULATED DATA chip below makes the state unmistakable.
@@ -316,6 +317,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ),
         ConnState::Disconnected { reason } => (format!("disconnected · {reason}"), theme.err),
     };
+    let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
 
     let mut spans: Vec<Span> = vec![
         Span::styled(
@@ -343,16 +345,26 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(status_text, Style::default().fg(status_color)));
     let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
-    if warning_count > 0 {
+    let warning_area = if warning_count > 0 {
         spans.push(Span::raw("   "));
-        spans.push(Span::styled(
+        let badge = Span::styled(
             format!(" ⚠ {warning_count} "),
             Style::default()
                 .bg(theme.warn)
                 .fg(theme.surface_2)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
+        );
+        let area = Rect::new(
+            inner.x + spans.iter().map(Span::width).sum::<usize>() as u16,
+            inner.y,
+            badge.width() as u16,
+            1,
+        );
+        spans.push(badge);
+        Some(area)
+    } else {
+        None
+    };
     if let Some(r) = state.replay.as_ref() {
         spans.push(Span::raw("   "));
         let (icon, fg) = if r.paused {
@@ -390,8 +402,8 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         "Esc menu · t theme · ? help",
         Style::default().fg(theme.muted),
     ));
-    let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
     f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
+    warning_area
 }
 
 /// One footer-legend segment: a key chip (optionally clickable) or plain text.
@@ -550,5 +562,53 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+    #[test]
+    fn warning_modal_renders_captured_error() {
+        let mut state = AppState::new("test".into(), "default-dark".into());
+        state.modal = Modal::Warnings;
+        state.warning_details = vec!["collector failed: permission denied".into()];
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(screen.contains("Warnings"));
+        assert!(screen.contains("collector failed: permission denied"));
+    }
+
+    #[test]
+    fn warning_hit_area_covers_rendered_badge() {
+        let mut state = AppState::new("test".into(), "default-dark".into());
+        state.latest = Some(rocm_dash_core::metrics::Snapshot {
+            warnings: vec!["collector failed".into()],
+            ..Default::default()
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let index = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .position(|cell| cell.symbol() == "⚠")
+            .expect("warning badge was not rendered");
+        let (column, row) = ((index % 120) as u16, (index / 120) as u16);
+        let area = state.last_warning_area.expect("warning hit area missing");
+        assert!(
+            column >= area.x
+                && column < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height,
+            "badge at ({column}, {row}) outside hit area {area:?}"
+        );
     }
 }

@@ -448,6 +448,7 @@ pub enum Modal {
     #[default]
     None,
     Help,
+    Warnings,
     Detail,
     ThemePicker,
     /// btop-style Esc main menu (Options / Help / Quit).
@@ -584,6 +585,12 @@ pub struct AppState {
     pub last_body_area: Option<ratatui::layout::Rect>,
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
+    /// Warning badge from the most recent header draw. Left-clicking it opens
+    /// the warning details modal.
+    pub last_warning_area: Option<ratatui::layout::Rect>,
+    /// Warning messages captured when the header badge is opened, so a newer
+    /// telemetry snapshot cannot replace the modal's contents.
+    pub warning_details: Vec<String>,
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
     pub last_footer_chips: Vec<FooterChip>,
@@ -720,6 +727,8 @@ impl AppState {
             simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_warning_area: None,
+            warning_details: Vec::new(),
             last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
@@ -2532,6 +2541,15 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 Modal::Help
             };
         }
+        KeyAction::OpenWarnings => {
+            state.warning_details = state
+                .latest
+                .as_ref()
+                .map_or_else(Vec::new, |snapshot| snapshot.warnings.clone());
+            if !state.warning_details.is_empty() {
+                state.modal = Modal::Warnings;
+            }
+        }
         KeyAction::CloseModal => state.modal = Modal::None,
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
@@ -2770,6 +2788,13 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // bar), so a click on the bar grabs it instead of falling through.
         if let Some(a) = scrollbar_hit(state, me.column, me.row) {
             return a;
+        }
+        if state.modal == Modal::None
+            && state
+                .last_warning_area
+                .is_some_and(|area| point_in(area, me.column, me.row))
+        {
+            return KeyAction::OpenWarnings;
         }
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
@@ -3097,6 +3122,7 @@ pub enum KeyAction {
     SelectLast,
     OpenDetail,
     ToggleHelp,
+    OpenWarnings,
     CloseModal,
     OpenThemePicker,
     ApplyThemePick,
@@ -3267,6 +3293,14 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
                 }
             }
         }
+    }
+    // Warning details are close-only.
+    if *modal == Modal::Warnings {
+        return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
+            KeyCode::Esc | KeyCode::Enter => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
     }
     // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
     if *modal == Modal::ThemePicker {
@@ -3707,6 +3741,32 @@ mod tests {
         // Manager open → the body click is swallowed (no click-through).
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn warning_badge_click_opens_current_warning_details() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            warnings: vec!["collector failed: permission denied".into()],
+            ..Default::default()
+        });
+        s.last_warning_area = Some(Rect::new(20, 1, 5, 1));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 22,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let action = resolve_mouse(click, &s);
+        assert_eq!(action, KeyAction::OpenWarnings);
+        apply_action(&mut s, action);
+        assert_eq!(s.modal, Modal::Warnings);
+        assert_eq!(
+            s.warning_details,
+            ["collector failed: permission denied"],
+            "the modal keeps the error that produced the clicked warning"
+        );
     }
 
     /// Build a ScrollDown/Up/Left/Right event at a pointer position.

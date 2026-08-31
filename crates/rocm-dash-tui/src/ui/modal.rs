@@ -144,6 +144,16 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     f.render_widget(p, inner);
 }
 
+/// Render the warning messages captured when the header badge was clicked.
+pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
+    let popup = centered_rect(70, 60, 90, 20, area);
+    let lines = warnings
+        .iter()
+        .map(|warning| Line::from(Span::styled(warning, Style::default().fg(theme.warn))))
+        .collect();
+    draw_scrollable_lines(f, popup, "Warnings", lines, 0, theme);
+}
+
 fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(vec![
         Span::styled(

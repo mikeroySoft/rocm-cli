@@ -70,9 +70,18 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
+  @id:dash-warning-details @requires-os:linux
+  Scenario: 8 - A user opens the error behind a dashboard warning
+    When the user opens a dashboard replay containing a warning
+    Then the warning indicator is displayed
+    When the user clicks the warning indicator
+    Then the warning error is displayed in a modal
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
 
   @id:eai-7960-gen-tps-held-after-scrape-failure @requires-os:linux
-  Scenario: 8 - Gen throughput stays visible for the validity window after a scrape failure
+  Scenario: 9 - Gen throughput stays visible for the validity window after a scrape failure
     # EAI-7960 principal regression: after establishing a positive gen_tps
     # baseline through the scripted mock, a single /metrics transport failure
     # must NOT immediately clear the displayed "tok/s" value.  The contract
@@ -90,7 +99,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:eai-7960-gen-tps-expiry-boundary @requires-os:linux
-  Scenario: 9 - Gen throughput expires after the validity window following sustained failure
+  Scenario: 10 - Gen throughput expires after the validity window following sustained failure
     # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
     #
     # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,

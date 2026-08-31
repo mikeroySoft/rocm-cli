@@ -9,6 +9,9 @@
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use rocm_dash_core::metrics::Snapshot;
+use rocm_dash_core::persist::PersistedEntry;
+use rocm_dash_core::protocol::Event;
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -108,6 +111,47 @@ async fn open_dashboard(world: &mut E2eWorld) {
     world.tui = Some(tui);
 }
 
+#[when("the user opens a dashboard replay containing a warning")]
+async fn open_dashboard_warning_replay(world: &mut E2eWorld) {
+    let replay = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("warning.ndjson");
+    let entry = PersistedEntry {
+        ts_us: 0,
+        event: Event::Snapshot(Snapshot {
+            warnings: vec!["collector failed: permission denied".into()],
+            ..Default::default()
+        }),
+    };
+    let later = PersistedEntry {
+        ts_us: 60_000_000,
+        event: entry.event.clone(),
+    };
+    std::fs::write(
+        &replay,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&entry).unwrap(),
+            serde_json::to_string(&later).unwrap()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("failed to write warning replay: {e}"));
+    let replay = replay.to_string_lossy();
+    let mut tui = TuiSession::spawn(world, &["dash", "--replay", &replay])
+        .unwrap_or_else(|e| panic!("failed to open warning replay: {e}"));
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge warning replay: {e}"));
+    tui.wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("warning replay did not start: {e}"));
+    tui.send(" ")
+        .unwrap_or_else(|e| panic!("failed to pause warning replay: {e}"));
+    world.tui = Some(tui);
+}
+
 #[when("the user opens the ROCm view")]
 async fn open_rocm_view(world: &mut E2eWorld) {
     // Dashboard tabs are currently ordered Home, ROCm, Serving, Observe; these
@@ -166,6 +210,20 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
 }
 
+#[when("the user clicks the warning indicator")]
+async fn click_warning_indicator(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("warning indicator did not appear: {e}"));
+    let (row, column) = tui
+        .find_cell("⚠")
+        .expect("warning indicator disappeared before click");
+    let x = char::from_u32(u32::from(column) + 33).expect("warning column exceeds X10 range");
+    let y = char::from_u32(u32::from(row) + 33).expect("warning row exceeds X10 range");
+    tui.send(&format!("\u{1b}[M {x}{y}\u{1b}[M#{x}{y}"))
+        .unwrap_or_else(|e| panic!("failed to click warning indicator: {e}"));
+}
 #[when("the user accepts the local endpoint")]
 async fn accept_local_endpoint(world: &mut E2eWorld) {
     let tui = session(world);
@@ -241,6 +299,22 @@ async fn home_view_displayed(world: &mut E2eWorld) {
         screen.contains("Running") && screen.contains("Health"),
         "home summary cards missing:\n{screen}"
     );
+}
+
+#[then("the warning indicator is displayed")]
+async fn warning_indicator_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("warning indicator did not appear: {e}"));
+}
+
+#[then("the warning error is displayed in a modal")]
+async fn warning_error_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("collector failed: permission denied", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("warning modal did not show the error: {e}"));
 }
 
 #[then("ROCm setup actions are displayed")]

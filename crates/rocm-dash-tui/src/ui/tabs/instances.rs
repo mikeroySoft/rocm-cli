@@ -948,6 +948,8 @@ mod tests {
             simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_warning_area: None,
+            warning_details: Vec::new(),
             last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
