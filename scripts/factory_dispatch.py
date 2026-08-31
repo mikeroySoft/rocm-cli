@@ -36,7 +36,10 @@ STANDING_INSTRUCTIONS = """
 
 - Implement exactly what the ticket above asks for; nothing more.
 - Use TDD where practical: failing test first, then the fix.
-- Commit incrementally with `git commit -s`.
+- Commit incrementally with `git commit -s`. Stage only files you created or
+  edited for the ticket; never `git add -A`, and never commit
+  `.factory-prompt.md`, `.lock`, or gate reports.
+- NEVER use `git stash` — the stash is shared with the user's other worktrees.
 - Finish by running `python {gate} --report .factory/gate-report-{n}.md`
   and fixing any failures it reports.
 """
@@ -164,7 +167,9 @@ def ensure_worktree(n: int) -> Path:
 
 def commit_leftovers(wt: Path, n: int, title: str) -> None:
     if run(["git", "status", "--porcelain"], cwd=wt).stdout.strip():
-        run(["git", "add", "-A"], cwd=wt)
+        run(["git", "add", "-A", "--",
+             ":(exclude).factory-prompt.md", ":(exclude).lock",
+             ":(exclude).factory"], cwd=wt)
         run(["git", "commit", "-s", "-m", f"agent/{n}: {title}"], cwd=wt)
 
 
