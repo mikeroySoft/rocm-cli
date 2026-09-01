@@ -23,5 +23,11 @@ A clear and concise description of what you want to happen.
 **Describe alternatives you've considered**
 A clear and concise description of any alternative solutions or features you've considered.
 
+**Acceptance criteria**
+Observable outcome that means this is done
+
+**Verification**
+Exact command(s) that demonstrate the feature works
+
 **Additional context**
 Add any other context or screenshots about the feature request here.

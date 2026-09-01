@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -30,6 +31,24 @@ LLM_MODEL = os.environ.get("FACTORY_LLM_MODEL", "ornith-ai/Ornith-1.5-35B-A3B-GG
 LABELS_DOC = Path(__file__).resolve().parent.parent / "docs" / "agents" / "triage-labels.md"
 
 DECISIONS = ("ready-for-agent", "needs-info", "ready-for-human", "wontfix-proposal")
+
+ACCEPTANCE_HINTS = re.compile(
+    r"acceptance|exit gate|verification|expected behavior|steps to reproduce",
+    re.IGNORECASE,
+)
+
+
+def deterministic_needs_info(body: str, comments: str) -> str | None:
+    """Cheap lint before the LLM: obviously under-specified -> needs-info."""
+    if len(body.strip()) < 80:
+        return ("The issue body is too short to act on. Describe the problem and "
+                "add acceptance criteria (an observable done-condition) plus the "
+                "command that verifies it.")
+    text = f"{body}\n{comments}"
+    if not ACCEPTANCE_HINTS.search(text) and "```" not in text:
+        return ("No acceptance criteria found. Add an observable done-condition "
+                "and the exact command that verifies it.")
+    return None
 
 
 def gh(*args: str) -> str:
@@ -56,13 +75,13 @@ Label reference:
 {label_table}
 
 Choose exactly one decision for the issue:
-- "ready-for-agent": the issue is fully specified — it has a problem statement AND acceptance criteria or an observable done-condition.
+- "ready-for-agent": the issue is fully specified — it has a problem statement AND acceptance criteria or an observable done-condition. Also fill "brief": a short restatement of the acceptance criteria and the exact verification command, for the implementing agent.
 - "needs-info": information is missing; state the specific missing information as a question.
 - "ready-for-human": needs design judgment, touches release/signing/upstream policy, or has blast radius beyond the fork.
 - "wontfix-proposal": the issue should not be actioned; explain why.
 
 Respond with strict JSON only, no markdown, no prose outside the JSON:
-{{"decision": "<one of ready-for-agent|needs-info|ready-for-human|wontfix-proposal>", "rationale": "<one short paragraph>", "question": "<the question for the reporter, or empty string if decision is not needs-info>"}}"""
+{{"decision": "<one of ready-for-agent|needs-info|ready-for-human|wontfix-proposal>", "rationale": "<one short paragraph>", "question": "<the question for the reporter, or empty string if decision is not needs-info>", "brief": "<agent brief for ready-for-agent, else empty string>"}}"""
 
 
 def call_llm(messages: list[dict]) -> str:
@@ -101,6 +120,7 @@ def parse_decision(text: str) -> dict | None:
         return None
     obj.setdefault("rationale", "")
     obj.setdefault("question", "")
+    obj.setdefault("brief", "")
     return obj
 
 
@@ -115,9 +135,18 @@ def triage_issue(issue: dict) -> dict | None:
         f"Comment by {c.get('author', {}).get('login', '?')}:\n{c.get('body', '')}"
         for c in issue.get("comments", [])
     )
+    body = issue.get("body") or ""
+    question = deterministic_needs_info(body, comments)
+    if question:
+        return {
+            "decision": "needs-info",
+            "rationale": "Deterministic pre-check: under-specified for the factory.",
+            "question": question,
+            "brief": "",
+        }
     user_msg = (
         f"Issue #{issue['number']}: {issue['title']}\n\n"
-        f"Body:\n{issue.get('body') or '(empty)'}\n\n"
+        f"Body:\n{body or '(empty)'}\n\n"
         f"Comments:\n{comments or '(none)'}"
     )
     messages = [
@@ -143,6 +172,8 @@ def apply_decision(number: int, decision: dict, dry_run: bool) -> None:
     rationale = decision["rationale"]
     if label == "needs-info" and decision["question"]:
         comment = f"Triage: {rationale}\n\nQuestion: {decision['question']}"
+    elif label == "ready-for-agent" and decision.get("brief"):
+        comment = f"Triage: {rationale}\n\nAgent brief: {decision['brief']}"
     elif label == "wontfix-proposal":
         comment = f"Triage proposal: wontfix — {rationale}"
     else:
