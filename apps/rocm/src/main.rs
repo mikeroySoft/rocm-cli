@@ -25050,6 +25050,7 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // system ROCm runtimes are Linux/WSL-only
     fn self_managed_engine_uses_system_runtime_as_process_environment() -> Result<()> {
         let (root, paths) = test_paths("engine-selection-system-runtime");
         let manifest = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
