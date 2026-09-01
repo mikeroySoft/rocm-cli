@@ -290,9 +290,10 @@ downloading anything or writing into the SDK tree. The root is detected via
 `--root` to override. `--activate` makes it the default runtime and completes
 first-time setup. Linux and WSL only in this release.
 
-`rocm update` checks and upgrades installed TheRock ROCm runtimes only. It does
-not update the `rocm` binary itself; to upgrade the CLI, re-run the installer
-from [Installation](#installation).
+`rocm update` reports update status for installed TheRock ROCm runtimes plus the
+CLI, engine, and model-recipe feeds. `rocm update --apply` installs runtime
+updates only; it does not update the `rocm` binary itself. To upgrade the CLI,
+re-run the installer from [Installation](#installation).
 
 System runtimes are owned by the OS package manager: implicit `rocm update`
 skips them, while `rocm update --runtime <system-key>` directs you to your
