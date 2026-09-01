@@ -12,16 +12,29 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-
-REPOSITORY = subprocess.run(
-    ["git", "-C", str(Path(__file__).resolve().parents[1]),
-     "remote", "get-url", "origin"],
-    capture_output=True, text=True, check=True,
-).stdout.strip().rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
+REPOSITORY = (
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(Path(__file__).resolve().parents[1]),
+            "remote",
+            "get-url",
+            "origin",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    .stdout.strip()
+    .rsplit("github.com", 1)[-1]
+    .strip(":/")
+    .removesuffix(".git")
+)
 AGENT_BRANCH = re.compile(r"agent/(\d+)$")
 
 
@@ -30,8 +43,7 @@ def gh(*args: str) -> Any:
     completed = subprocess.run(
         ["gh", *args, "--repo", REPOSITORY],
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if completed.returncode:
@@ -107,7 +119,10 @@ def collect_rows() -> list[dict[str, Any]]:
             merged_at=pull_request["mergedAt"],
         )
 
-    for label, state in (("ready-for-human", "escalated"), ("ready-for-agent", "queued")):
+    for label, state in (
+        ("ready-for-human", "escalated"),
+        ("ready-for-agent", "queued"),
+    ):
         issues = gh(
             "issue",
             "list",
@@ -145,10 +160,15 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         ("hours", lambda row: format_hours(row["merge_hours"])),
     )
     values = [[render(row) for _, render in columns] for row in rows]
-    widths = [max([len(name), *(len(row[index]) for row in values)]) for index, (name, _) in enumerate(columns)]
+    widths = [
+        max([len(name), *(len(row[index]) for row in values)])
+        for index, (name, _) in enumerate(columns)
+    ]
 
     def line(cells: list[str]) -> str:
-        return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths)).rstrip()
+        return "  ".join(
+            cell.ljust(width) for cell, width in zip(cells, widths, strict=True)
+        ).rstrip()
 
     print(line([name for name, _ in columns]))
     print(line(["-" * width for width in widths]))

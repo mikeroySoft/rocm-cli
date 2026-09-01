@@ -46,7 +46,9 @@ def check_conflict_markers() -> tuple[bool, str]:
 
 
 def check_clippy() -> tuple[bool, str]:
-    return run(["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])
+    return run(
+        ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+    )
 
 
 def check_tests() -> tuple[bool, str]:
@@ -118,7 +120,7 @@ def main() -> int:
             results.append((name, "SKIP", ""))
             continue
         if name in GPU_CHECKS and gpu_lock is None:
-            gpu_lock = open(GPU_LOCK, "w")
+            gpu_lock = open(GPU_LOCK, "w")  # noqa: SIM115 — lock must outlive the loop
             fcntl.flock(gpu_lock, fcntl.LOCK_EX)
         passed, output = fn()
         results.append((name, "PASS" if passed else "FAIL", output))
