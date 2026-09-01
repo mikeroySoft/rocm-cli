@@ -133,8 +133,8 @@ pub fn build_plan(m: &SkillManifest) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in skills (compiled in). External teams can drop additional `.toml`
-// manifests in the user skills dir; discovery merges them in (in the binary).
+// Built-in skills (compiled in). These two manifests are the only skills;
+// loading external `.toml` manifests from a user skills dir is not implemented.
 // ---------------------------------------------------------------------------
 
 /// install-lemonade: install AMD's Lemonade local LLM server from the official **embeddable SDK** release.
