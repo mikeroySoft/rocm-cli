@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -21,21 +22,58 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = subprocess.run(
-    ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
-    capture_output=True, text=True, check=True,
-).stdout.strip().rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
-LLM_URL = os.environ.get("FACTORY_LLM_URL", "http://127.0.0.1:11435/v1/chat/completions")
-LLM_MODEL = os.environ.get("FACTORY_LLM_MODEL", "ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M")
-LABELS_DOC = Path(__file__).resolve().parent.parent / "docs" / "agents" / "triage-labels.md"
+REPO = (
+    subprocess.run(
+        ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    .stdout.strip()
+    .rsplit("github.com", 1)[-1]
+    .strip(":/")
+    .removesuffix(".git")
+)
+LLM_URL = os.environ.get(
+    "FACTORY_LLM_URL", "http://127.0.0.1:11435/v1/chat/completions"
+)
+LLM_MODEL = os.environ.get(
+    "FACTORY_LLM_MODEL", "ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M"
+)
+LABELS_DOC = (
+    Path(__file__).resolve().parent.parent / "docs" / "agents" / "triage-labels.md"
+)
 
 DECISIONS = ("ready-for-agent", "needs-info", "ready-for-human", "wontfix-proposal")
+
+ACCEPTANCE_HINTS = re.compile(
+    r"acceptance|exit gate|verification|expected behavior|steps to reproduce",
+    re.IGNORECASE,
+)
+
+
+def deterministic_needs_info(body: str, comments: str) -> str | None:
+    """Cheap lint before the LLM: obviously under-specified -> needs-info."""
+    if len(body.strip()) < 80:
+        return (
+            "The issue body is too short to act on. Describe the problem and "
+            "add acceptance criteria (an observable done-condition) plus the "
+            "command that verifies it."
+        )
+    text = f"{body}\n{comments}"
+    if not ACCEPTANCE_HINTS.search(text) and "```" not in text:
+        return (
+            "No acceptance criteria found. Add an observable done-condition "
+            "and the exact command that verifies it."
+        )
+    return None
 
 
 def gh(*args: str) -> str:
     result = subprocess.run(
         ["gh", *args, "--repo", REPO],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         print(f"gh {' '.join(args)} failed: {result.stderr.strip()}", file=sys.stderr)
@@ -48,7 +86,7 @@ def system_prompt() -> str:
         label_table = LABELS_DOC.read_text()
     except OSError as exc:
         print(f"cannot read {LABELS_DOC}: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
     return f"""You are the triage bot for the rocm-cli fork issue tracker.
 
 Label reference:
@@ -56,23 +94,26 @@ Label reference:
 {label_table}
 
 Choose exactly one decision for the issue:
-- "ready-for-agent": the issue is fully specified — it has a problem statement AND acceptance criteria or an observable done-condition.
+- "ready-for-agent": the issue is fully specified — it has a problem statement AND acceptance criteria or an observable done-condition. Also fill "brief": a short restatement of the acceptance criteria and the exact verification command, for the implementing agent.
 - "needs-info": information is missing; state the specific missing information as a question.
 - "ready-for-human": needs design judgment, touches release/signing/upstream policy, or has blast radius beyond the fork.
 - "wontfix-proposal": the issue should not be actioned; explain why.
 
 Respond with strict JSON only, no markdown, no prose outside the JSON:
-{{"decision": "<one of ready-for-agent|needs-info|ready-for-human|wontfix-proposal>", "rationale": "<one short paragraph>", "question": "<the question for the reporter, or empty string if decision is not needs-info>"}}"""
+{{"decision": "<one of ready-for-agent|needs-info|ready-for-human|wontfix-proposal>", "rationale": "<one short paragraph>", "question": "<the question for the reporter, or empty string if decision is not needs-info>", "brief": "<agent brief for ready-for-agent, else empty string>"}}"""
 
 
 def call_llm(messages: list[dict]) -> str:
-    payload = json.dumps({
-        "model": LLM_MODEL,
-        "messages": messages,
-        "temperature": 0.1,
-    }).encode()
+    payload = json.dumps(
+        {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+        }
+    ).encode()
     req = urllib.request.Request(
-        LLM_URL, data=payload,
+        LLM_URL,
+        data=payload,
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -84,7 +125,7 @@ def call_llm(messages: list[dict]) -> str:
             "Is rocmd serving? Set FACTORY_LLM_URL if the endpoint differs.",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     return body["choices"][0]["message"]["content"]
 
 
@@ -101,11 +142,18 @@ def parse_decision(text: str) -> dict | None:
         return None
     obj.setdefault("rationale", "")
     obj.setdefault("question", "")
+    obj.setdefault("brief", "")
     return obj
 
 
 def fetch_issue(number: int) -> dict:
-    raw = gh("issue", "view", str(number), "--json", "number,title,body,comments,labels,state")
+    raw = gh(
+        "issue",
+        "view",
+        str(number),
+        "--json",
+        "number,title,body,comments,labels,state",
+    )
     return json.loads(raw)
 
 
@@ -115,26 +163,37 @@ def triage_issue(issue: dict) -> dict | None:
         f"Comment by {c.get('author', {}).get('login', '?')}:\n{c.get('body', '')}"
         for c in issue.get("comments", [])
     )
+    body = issue.get("body") or ""
+    question = deterministic_needs_info(body, comments)
+    if question:
+        return {
+            "decision": "needs-info",
+            "rationale": "Deterministic pre-check: under-specified for the factory.",
+            "question": question,
+            "brief": "",
+        }
     user_msg = (
         f"Issue #{issue['number']}: {issue['title']}\n\n"
-        f"Body:\n{issue.get('body') or '(empty)'}\n\n"
+        f"Body:\n{body or '(empty)'}\n\n"
         f"Comments:\n{comments or '(none)'}"
     )
     messages = [
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": user_msg},
     ]
-    for attempt in range(2):
+    for _attempt in range(2):
         reply = call_llm(messages)
         decision = parse_decision(reply)
         if decision is not None:
             return decision
         messages.append({"role": "assistant", "content": reply})
-        messages.append({
-            "role": "user",
-            "content": "That was not valid JSON matching the required schema. "
-                       "Reply with ONLY the JSON object.",
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": "That was not valid JSON matching the required schema. "
+                "Reply with ONLY the JSON object.",
+            }
+        )
     return None
 
 
@@ -143,6 +202,8 @@ def apply_decision(number: int, decision: dict, dry_run: bool) -> None:
     rationale = decision["rationale"]
     if label == "needs-info" and decision["question"]:
         comment = f"Triage: {rationale}\n\nQuestion: {decision['question']}"
+    elif label == "ready-for-agent" and decision.get("brief"):
+        comment = f"Triage: {rationale}\n\nAgent brief: {decision['brief']}"
     elif label == "wontfix-proposal":
         comment = f"Triage proposal: wontfix — {rationale}"
     else:
@@ -156,19 +217,42 @@ def apply_decision(number: int, decision: dict, dry_run: bool) -> None:
     gh("issue", "comment", str(number), "--body", comment)
     if label == "wontfix-proposal":
         return  # never apply wontfix; leave needs-triage for a human
-    gh("issue", "edit", str(number), "--remove-label", "needs-triage", "--add-label", label)
+    gh(
+        "issue",
+        "edit",
+        str(number),
+        "--remove-label",
+        "needs-triage",
+        "--add-label",
+        label,
+    )
 
 
 def list_needs_triage() -> list[int]:
-    raw = gh("issue", "list", "--label", "needs-triage", "--state", "open", "--json", "number")
+    raw = gh(
+        "issue",
+        "list",
+        "--label",
+        "needs-triage",
+        "--state",
+        "open",
+        "--json",
+        "number",
+    )
     return [item["number"] for item in json.loads(raw)]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Triage needs-triage issues with the local model.")
+    parser = argparse.ArgumentParser(
+        description="Triage needs-triage issues with the local model."
+    )
     parser.add_argument("--issue", type=int, help="triage a single issue")
-    parser.add_argument("--replay", help="comma-separated issue numbers: print decisions, no writes")
-    parser.add_argument("--dry-run", action="store_true", help="print decisions instead of applying")
+    parser.add_argument(
+        "--replay", help="comma-separated issue numbers: print decisions, no writes"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print decisions instead of applying"
+    )
     args = parser.parse_args()
 
     replay = bool(args.replay)
@@ -188,7 +272,10 @@ def main() -> int:
         issue = fetch_issue(number)
         decision = triage_issue(issue)
         if decision is None:
-            print(f"#{number}: model returned unparseable JSON twice; skipping", file=sys.stderr)
+            print(
+                f"#{number}: model returned unparseable JSON twice; skipping",
+                file=sys.stderr,
+            )
             exit_code = 1
             continue
         if replay:
