@@ -2020,14 +2020,14 @@ fn initialize_agents_state(world: &mut E2eWorld, test_timeout_secs: u64) {
     });
 }
 
-fn state(world: &E2eWorld) -> &AgentsState {
+const fn state(world: &E2eWorld) -> &AgentsState {
     world
         .agents
         .as_ref()
         .expect("agents environment was not initialized")
 }
 
-fn state_mut(world: &mut E2eWorld) -> &mut AgentsState {
+const fn state_mut(world: &mut E2eWorld) -> &mut AgentsState {
     world
         .agents
         .as_mut()
@@ -2438,7 +2438,12 @@ fn assert_no_replacement_debris(world: &E2eWorld, agent: &str) {
         .expect("failed to inspect config directory")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name.contains(".rocm") || name.ends_with(".tmp"))
+        .filter(|name| {
+            name.contains(".rocm")
+                || Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        })
         .collect();
     assert!(
         leftovers.is_empty(),

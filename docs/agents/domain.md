@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Domain Docs
 
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.

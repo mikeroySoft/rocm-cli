@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Issue tracker: GitHub
 
 Issues and specs for this repo live in the `mikeroySoft/rocm-cli` fork's GitHub Issues, not the upstream `ROCm/rocm-cli` tracker. Use the `gh` CLI with `--repo mikeroySoft/rocm-cli` for all operations.
