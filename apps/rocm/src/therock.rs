@@ -270,6 +270,10 @@ pub(crate) struct InstalledRuntimeManifest {
     pub read_only: bool,
     #[serde(default)]
     pub imported_from: Option<PathBuf>,
+    /// Probe snapshot for `format == "system"` runtimes adopted from an
+    /// OS-managed ROCm SDK (for example /opt/rocm).
+    #[serde(default)]
+    pub system_sdk: Option<rocm_core::SystemSdkProbe>,
     pub installed_at_unix_ms: u128,
 }
 
@@ -287,6 +291,8 @@ impl InstalledRuntimeManifest {
         if let Some(probe) = self.rocm_sdk.as_mut() {
             probe.normalize_host_paths();
         }
+        // `system_sdk` is intentionally not normalized: system SDK adoption is
+        // Linux-only in v1, so no host path-text normalization applies.
         self
     }
 
@@ -309,6 +315,8 @@ impl InstalledRuntimeManifest {
         if let Some(probe) = self.rocm_sdk.as_mut() {
             probe.normalize_storage_paths();
         }
+        // `system_sdk` is intentionally not normalized: system SDK adoption is
+        // Linux-only in v1, so no storage path-text normalization applies.
         self
     }
 }
@@ -580,6 +588,17 @@ pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
 ) -> Result<RuntimeUpdatePlan> {
+    // System ROCm runtimes are updated by the OS package manager; there is no
+    // index to consult, so the plan resolves locally without any network call.
+    if manifest.format == "system" {
+        return Ok(RuntimeUpdatePlan {
+            latest_version: manifest.version.clone(),
+            latest_source: "system package manager".to_owned(),
+            format: "system".to_owned(),
+            status: "not_applicable".to_owned(),
+            update_available: false,
+        });
+    }
     let (latest_version, latest_source, format) =
         resolve_latest_for_manifest(paths, manifest, None)?;
     let status = match compare_version_strings(&manifest.version, &latest_version) {
@@ -696,13 +715,19 @@ fn select_startup_update_manifest<'a>(
     manifests: &'a [InstalledRuntimeManifest],
     active_runtime_key: Option<&str>,
 ) -> Option<&'a InstalledRuntimeManifest> {
+    // System ROCm runtimes never participate in the startup update check:
+    // their updates come from the OS package manager, not our indexes. An
+    // active key naming a system runtime falls through to the first managed
+    // manifest; an all-system registry yields no candidate at all.
+    let updatable = |manifest: &&InstalledRuntimeManifest| manifest.format != "system";
     active_runtime_key
         .and_then(|key| {
             manifests
                 .iter()
+                .filter(updatable)
                 .find(|manifest| manifest.runtime_key == key)
         })
-        .or_else(|| manifests.first())
+        .or_else(|| manifests.iter().find(updatable))
 }
 
 fn build_startup_update_check_record(
@@ -979,6 +1004,7 @@ fn install_wheel_runtime(
         rocm_sdk: Some(rocm_sdk_probe.clone()),
         read_only: false,
         imported_from: None,
+        system_sdk: None,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -1108,6 +1134,7 @@ fn install_tarball_runtime(
         rocm_sdk: None,
         read_only: false,
         imported_from: None,
+        system_sdk: None,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -4892,6 +4919,69 @@ echo Python 3.12.10
         );
     }
 
+    fn test_system_runtime_manifest(
+        runtime_key: &str,
+        installed_at_unix_ms: u128,
+    ) -> InstalledRuntimeManifest {
+        let mut manifest =
+            test_runtime_manifest(runtime_key, "system:gfx120X-all", installed_at_unix_ms);
+        manifest.format = "system".to_owned();
+        manifest.channel = "system".to_owned();
+        manifest.version = "6.4.1".to_owned();
+        manifest.read_only = true;
+        manifest.python_launcher = None;
+        manifest.python_executable = None;
+        manifest.index_url = None;
+        manifest
+    }
+
+    #[test]
+    fn runtime_update_plan_marks_system_runtime_not_applicable() -> Result<()> {
+        // Fully offline: a system manifest must never reach the release index.
+        let (root, paths) = test_paths("system-update-plan");
+        let manifest = test_system_runtime_manifest("system-rocm-6-4-1", 1);
+
+        let plan = runtime_update_plan(&paths, &manifest)?;
+
+        assert_eq!(plan.status, "not_applicable");
+        assert!(!plan.update_available);
+        assert_eq!(plan.latest_version, "6.4.1");
+        assert_eq!(plan.latest_source, "system package manager");
+        assert_eq!(plan.format, "system");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_update_selection_skips_system_runtimes() {
+        let system = test_system_runtime_manifest("system-rocm-6-4-1", 2);
+        let wheel = test_runtime_manifest("wheel-key", "therock-release:gfx120X-all", 1);
+        let manifests = vec![system, wheel];
+
+        let selected = select_startup_update_manifest(&manifests, Some("system-rocm-6-4-1"))
+            .expect("a non-system manifest should be selected");
+        assert_eq!(selected.runtime_key, "wheel-key");
+
+        let all_system = vec![test_system_runtime_manifest("system-rocm-6-4-1", 2)];
+        assert!(select_startup_update_manifest(&all_system, None).is_none());
+        assert!(select_startup_update_manifest(&all_system, Some("system-rocm-6-4-1")).is_none());
+    }
+
+    #[test]
+    fn startup_update_check_skips_all_system_registry_without_creating_cache() -> Result<()> {
+        let (root, paths) = test_paths("startup-all-system");
+        let manifest = test_system_runtime_manifest("system-rocm-6-4-1", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let record =
+            maybe_refresh_startup_update_check_at(&paths, Some("system-rocm-6-4-1"), 1_000)?;
+
+        assert!(record.is_none());
+        assert!(!paths.cache_dir.exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn startup_update_check_uses_recent_record_without_network() -> Result<()> {
         let (root, paths) = test_paths("startup-recent-record");
@@ -5192,6 +5282,7 @@ echo Python 3.12.10
             rocm_sdk: None,
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms,
         }
     }

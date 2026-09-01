@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+mod agents;
 mod automations;
 mod bootstrap;
 mod comfyui;
@@ -106,6 +107,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Configure local model agent harnesses.
+    ///
+    /// Setup auto-detects the unique ready managed service, or selects a ready service
+    /// whose model exactly matches --model. If neither resolves, it falls back to
+    /// http://127.0.0.1:11435/v1.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm agents                              List all ten supported agent harnesses\n  \
+rocm agents claude --setup --dry-run     Preview setup without writing configuration\n  \
+rocm agents claude --setup --yes         Approve and apply setup without prompting\n  \
+rocm agents claude --test                Test the harness in an isolated workspace\n  \
+rocm agents pi --setup --yes             Configure Pi as a distinct harness\n  \
+rocm agents omp --test                   Test OMP as a distinct harness")]
+    Agents {
+        #[command(flatten)]
+        args: agents::AgentsArgs,
+    },
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
@@ -695,6 +712,24 @@ enum RuntimesCommand {
         /// Channel label to assign.
         #[arg(long)]
         channel: Option<String>,
+        /// Replace an existing record with the same key.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Use this computer's installed ROCm SDK (for example /opt/rocm) without modifying it.
+    AdoptSystem {
+        /// System ROCm SDK root; detected via ROCM_PATH/ROCM_HOME/HIP_PATH or /opt/rocm when omitted.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Runtime id to assign.
+        #[arg(long)]
+        runtime_id: Option<String>,
+        /// Runtime key to assign.
+        #[arg(long)]
+        runtime_key: Option<String>,
+        /// Make the adopted system runtime the default afterward.
+        #[arg(long)]
+        activate: bool,
         /// Replace an existing record with the same key.
         #[arg(long)]
         replace: bool,
@@ -1600,6 +1635,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         cli.command,
         Some(
             Command::Update { .. }
+                | Command::Agents { .. }
                 | Command::Bootstrap { .. }
                 | Command::Completions { .. }
                 | Command::Storage { .. }
@@ -1893,6 +1929,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
         Some(Command::Automations { command }) => automations(command),
+        Some(Command::Agents { args }) => agents::run(args),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
@@ -3582,7 +3619,11 @@ fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
 }
 
 fn read_os_release() -> Result<String> {
-    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
+    let path = std::env::var_os("ROCM_CLI_OS_RELEASE_PATH")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| OsString::from("/etc/os-release"));
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", Path::new(&path).display()))
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
@@ -3759,6 +3800,12 @@ fn resolve_engine_install_runtime_id(
     runtime_id: Option<String>,
 ) -> Result<String> {
     if engine_manages_own_runtime(engine) {
+        if let Some(selector) = runtime_id.as_deref() {
+            let manifests = therock::load_runtime_manifests(paths)?;
+            if let Some(manifest) = runtime_manifest_for_selector(&manifests, selector) {
+                ensure_engine_manifest_is_managed(manifest, engine)?;
+            }
+        }
         return Ok(runtime_id.unwrap_or_else(|| managed_engine_runtime_id(engine)));
     }
     let Some(selector) = runtime_id
@@ -3769,7 +3816,13 @@ fn resolve_engine_install_runtime_id(
             "no active ROCm runtime is configured; run `rocm runtimes list` and `rocm runtimes activate <runtime_key>`, or pass --runtime-id"
         );
     };
-    resolve_runtime_selector_to_exact_key(paths, &selector, "engine install runtime selection")
+    let runtime_key = resolve_runtime_selector_to_exact_key(
+        paths,
+        &selector,
+        "engine install runtime selection",
+    )?;
+    ensure_engine_runtime_is_managed(paths, engine, &runtime_key)?;
+    Ok(runtime_key)
 }
 
 fn engine_manages_own_runtime(engine: &str) -> bool {
@@ -3786,6 +3839,12 @@ fn env_root_for_runtime(
     }
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, runtime_id)?;
+    // A system SDK root is owned by the OS package manager; engine
+    // environments must never be created inside it. `None` sends the engine
+    // to its default data-dir env root.
+    if manifest.format == "system" {
+        return Ok(None);
+    }
     Ok(Some(manifest.install_root.join("engines")))
 }
 
@@ -3815,12 +3874,20 @@ fn env_root_for_self_managed_engine(
     .flatten()
     {
         if let Some(manifest) = runtime_manifest_for_selector(&manifests, selector) {
+            // System SDK roots are not ours to write engine environments
+            // into; fall through so lemonade installs under the data dir.
+            if manifest.format == "system" {
+                continue;
+            }
             return Ok(Some(manifest.install_root.join("engines")));
         }
     }
     let ready = manifests
         .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
+        .filter(|manifest| {
+            manifest.format != "system"
+                && validate_runtime_manifest_for_activation(manifest).is_ok()
+        })
         .collect::<Vec<_>>();
     Ok(match ready.as_slice() {
         [manifest] => Some(manifest.install_root.join("engines")),
@@ -4205,6 +4272,7 @@ fn resolve_engine_env(
 ) -> Result<ResolvedEngineEnv> {
     let selection = validate_engine_selection_runtime(
         paths,
+        engine,
         resolve_engine_selection(config, engine, runtime_id, env_id),
     )?;
     if let Some(env_id) = selection.env_id.as_deref() {
@@ -4882,7 +4950,8 @@ fn serve(args: ServeArgs) -> Result<()> {
         runtime_id.as_deref(),
         env_id.as_deref(),
     );
-    let resolved_selection = validate_engine_selection_runtime(&paths, resolved_selection)?;
+    let resolved_selection =
+        validate_engine_selection_runtime(&paths, &selected_engine, resolved_selection)?;
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
         && resolved_selection.env_id.is_none()
@@ -6445,6 +6514,60 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
+        RuntimesCommand::AdoptSystem {
+            root,
+            runtime_id,
+            runtime_key,
+            activate,
+            replace,
+        } => {
+            let adopted = adopt_system_runtime(
+                &paths,
+                &mut config,
+                AdoptSystemOptions {
+                    root,
+                    runtime_id,
+                    runtime_key,
+                    activate,
+                    replace,
+                },
+            )?;
+            println!("system runtime adopted");
+            println!("  runtime_id: {}", adopted.runtime_id);
+            println!("  runtime_key: {}", adopted.runtime_key);
+            println!("  mode: read-only (system)");
+            println!(
+                "  version: {}",
+                therock::runtime_version_display(&adopted.version)
+            );
+            println!("  root: {}", adopted.install_root.display());
+            println!(
+                "  registry: {}",
+                runtime_manifest_path(&paths, &adopted.runtime_key).display()
+            );
+            if activate {
+                println!("  activated: yes");
+            } else {
+                println!(
+                    "  next step: rocm runtimes activate {}",
+                    adopted.runtime_key
+                );
+            }
+            record_cli_audit_event(
+                &paths,
+                "runtime",
+                "runtime_adopt_system",
+                "info",
+                format!(
+                    "adopted system runtime_key={} runtime_id={} root={} activated={}",
+                    adopted.runtime_key,
+                    adopted.runtime_id,
+                    adopted.install_root.display(),
+                    activate
+                ),
+                None,
+            );
+        }
     }
 
     Ok(())
@@ -6757,6 +6880,11 @@ fn uninstall_runtime(
         .is_some_and(|path| paths_equivalent(path, &manifest.install_root))
     {
         config.setup.therock_venv = None;
+        config.setup.completed = false;
+        config.onboarding_dismissed = false;
+        config_changed = true;
+    }
+    if was_active && manifest.format == "system" && config.setup.completed {
         config.setup.completed = false;
         config.onboarding_dismissed = false;
         config_changed = true;
@@ -7739,11 +7867,96 @@ fn adopt_runtime_from_probe(
         rocm_sdk: Some(probe),
         read_only: true,
         imported_from: Some(install_root),
+        system_sdk: None,
         installed_at_unix_ms: rocm_core::unix_time_millis(),
     };
     validate_runtime_manifest_for_activation(&manifest)
         .with_context(|| format!("adopted runtime `{}` is not usable", manifest.runtime_key))?;
     write_runtime_registry_manifest(paths, &manifest, request.replace)?;
+    Ok(manifest)
+}
+
+#[derive(Debug, Clone)]
+struct AdoptSystemOptions {
+    root: Option<PathBuf>,
+    runtime_id: Option<String>,
+    runtime_key: Option<String>,
+    activate: bool,
+    replace: bool,
+}
+
+/// Adopt this computer's OS-managed ROCm SDK as a read-only runtime.
+///
+/// The SDK root is probed, never modified: the only writes are the registry
+/// manifest under the app data dir and (with `activate`) the config and
+/// active-runtime marker.
+fn adopt_system_runtime(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    options: AdoptSystemOptions,
+) -> Result<therock::InstalledRuntimeManifest> {
+    if !rocm_core::runtime_is_linux() {
+        bail!(
+            "system HIP SDK adoption is supported only on Linux (including WSL); use `rocm install sdk` instead"
+        );
+    }
+    let root = match options.root {
+        Some(root) => root,
+        None => rocm_core::detect_system_rocm_root().context(
+            "no system ROCm SDK found: none of ROCM_PATH, ROCM_HOME, or HIP_PATH name an existing directory and /opt/rocm does not exist; pass --root to name the SDK folder",
+        )?,
+    };
+    let probe = rocm_core::probe_system_rocm_sdk(&root)?;
+
+    let family = probe
+        .gfx_targets
+        .first()
+        .and_then(|target| rocm_core::normalize_therock_family(target))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let runtime_id = match options.runtime_id {
+        Some(value) if !value.trim().is_empty() => value,
+        Some(_) => bail!("runtime_id must not be empty"),
+        None => format!("system:{family}"),
+    };
+    let runtime_key = match options.runtime_key {
+        Some(value) if !value.trim().is_empty() => value,
+        Some(_) => bail!("runtime_key must not be empty"),
+        None => format!("system-rocm-{}", runtime_key_component(&probe.version)),
+    };
+
+    let manifest = therock::InstalledRuntimeManifest {
+        runtime_key,
+        runtime_id,
+        channel: "system".to_owned(),
+        format: "system".to_owned(),
+        family,
+        family_source: "system-probe".to_owned(),
+        version: probe.version.clone(),
+        install_root: probe.root.clone(),
+        selected_artifact_url: "system-read-only".to_owned(),
+        index_url: None,
+        tarball_file_name: None,
+        python_launcher: None,
+        python_executable: None,
+        pip_cache_dir: None,
+        rocm_sdk: None,
+        read_only: true,
+        imported_from: Some(probe.root.clone()),
+        system_sdk: Some(probe),
+        installed_at_unix_ms: rocm_core::unix_time_millis(),
+    };
+    validate_runtime_manifest_for_activation(&manifest).with_context(|| {
+        format!(
+            "adopted system runtime `{}` is not usable",
+            manifest.runtime_key
+        )
+    })?;
+    write_runtime_registry_manifest(paths, &manifest, options.replace)?;
+    if options.activate {
+        activate_runtime(paths, config, &manifest.runtime_key)?;
+        config.setup.completed = true;
+        config.save(paths)?;
+    }
     Ok(manifest)
 }
 
@@ -7974,6 +8187,7 @@ fn validate_runtime_manifest_for_activation(
     match manifest.format.as_str() {
         "wheel" => validate_wheel_runtime_manifest(manifest),
         "tarball" => validate_tarball_runtime_manifest(manifest),
+        "system" => validate_system_runtime_manifest(manifest),
         other => bail!("unsupported runtime format in manifest: {other}"),
     }
 }
@@ -8003,6 +8217,32 @@ fn validate_tarball_runtime_manifest(manifest: &therock::InstalledRuntimeManifes
             manifest.install_root.display()
         )
     }
+}
+
+/// Cheap re-check for `format == "system"` manifests: the stored probe must
+/// describe the same read-only Linux/WSL SDK root and still be plausible.
+fn validate_system_runtime_manifest(manifest: &therock::InstalledRuntimeManifest) -> Result<()> {
+    if !rocm_core::runtime_is_linux() {
+        bail!("system ROCm runtimes are supported only on Linux (including WSL)");
+    }
+    if !manifest.read_only {
+        bail!("system runtime manifest must be read-only");
+    }
+    let probe = manifest
+        .system_sdk
+        .as_ref()
+        .context("system runtime manifest is missing system_sdk probe data")?;
+    if !paths_equivalent(&manifest.install_root, &probe.root) {
+        bail!(
+            "system runtime install root {} does not match probed SDK root {}",
+            manifest.install_root.display(),
+            probe.root.display()
+        );
+    }
+    if probe.version.trim().is_empty() || probe.version != manifest.version {
+        bail!("system runtime manifest version does not match its SDK probe");
+    }
+    rocm_core::validate_system_sdk_probe(probe)
 }
 
 fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
@@ -12147,21 +12387,25 @@ fn render_examine_plain_header(summary: &ExamineSummary) -> String {
     } else {
         "AMD GPU not detected yet"
     };
-    // This line counted only CLI-managed runtimes, so a machine with ROCm
-    // already installed was greeted with "No ROCm installs saved yet" -- read,
-    // reasonably, as "nothing is installed". Now that the resolver finds those
-    // installs and their versions, say what is actually on the machine, and that
-    // a pre-existing install is left alone on purpose rather than missed.
+    // Report a pre-existing install without implying it is still unmanaged
+    // after `adopt-system` has registered it.
     let managed = match summary.managed_runtime_count {
         0 => None,
         1 => Some("1 ROCm install saved".to_owned()),
         count => Some(format!("{count} ROCm installs saved")),
     };
     let existing = (summary.legacy_rocm.status != "not_detected").then(|| {
-        summary.legacy_rocm.version.as_deref().map_or_else(
-            || "existing ROCm install found, left unmanaged by design".to_owned(),
-            |version| format!("existing ROCm {version} found, left unmanaged by design"),
-        )
+        match (
+            summary.legacy_rocm.version.as_deref(),
+            summary.managed_runtime_count == 0,
+        ) {
+            (Some(version), true) => {
+                format!("existing ROCm {version} found, left unmanaged by design")
+            }
+            (None, true) => "existing ROCm install found, left unmanaged by design".to_owned(),
+            (Some(version), false) => format!("existing ROCm {version} found on disk"),
+            (None, false) => "existing ROCm install found on disk".to_owned(),
+        }
     });
     let runtime = match (managed, existing) {
         (Some(managed), Some(existing)) => format!("{managed}; {existing}"),
@@ -12270,22 +12514,26 @@ fn append_examine_runtime_state(
             "  active_runtime_root: {}",
             manifest.install_root.display()
         );
-        let pip_cache_dir = manifest
-            .pip_cache_dir
-            .clone()
-            .unwrap_or_else(|| managed_pip_cache_dir(&manifest.install_root));
-        let _ = writeln!(
-            output,
-            "  active_runtime_pip_cache_dir: {}",
-            pip_cache_dir.display()
-        );
+        if manifest.format != "system" {
+            let pip_cache_dir = manifest
+                .pip_cache_dir
+                .clone()
+                .unwrap_or_else(|| managed_pip_cache_dir(&manifest.install_root));
+            let _ = writeln!(
+                output,
+                "  active_runtime_pip_cache_dir: {}",
+                pip_cache_dir.display()
+            );
+        }
         let _ = writeln!(
             output,
             "  active_runtime_version: {}",
             therock::runtime_version_display(&manifest.version)
         );
         let _ = writeln!(output, "  active_runtime_family: {}", manifest.family);
-        let mode = if manifest.read_only {
+        let mode = if manifest.format == "system" {
+            "read-only (system)"
+        } else if manifest.read_only {
             "read-only"
         } else {
             "managed"
@@ -14448,16 +14696,31 @@ fn select_runtime_update_source<'a>(
     runtime_selector: Option<&str>,
 ) -> Result<&'a therock::InstalledRuntimeManifest> {
     if let Some(selector) = runtime_selector {
-        return select_runtime_manifest(manifests, selector);
+        let manifest = select_runtime_manifest(manifests, selector)?;
+        if manifest.format == "system" {
+            bail!(
+                "runtime {} is a system ROCm runtime managed by the OS package manager; update it with your distribution's package tooling instead of `rocm update --apply`",
+                manifest.runtime_key
+            );
+        }
+        return Ok(manifest);
     }
-    if let Some(active) = current_runtime_manifest(config, manifests) {
+    // Implicit selection skips system runtimes: the OS package manager owns
+    // their updates, so they are never an update source.
+    if let Some(active) = current_runtime_manifest(config, manifests)
+        && active.format != "system"
+    {
         return Ok(active);
     }
-    match manifests {
+    let updatable = manifests
+        .iter()
+        .filter(|manifest| manifest.format != "system")
+        .collect::<Vec<_>>();
+    match updatable.as_slice() {
         [] => bail!(
             "no managed runtimes are registered; run `rocm install sdk --channel release --format wheel` first"
         ),
-        [only] => Ok(only),
+        [only] => Ok(*only),
         _ => bail!(
             "multiple runtimes are registered and no active runtime is configured; pass `--runtime <runtime-key>`"
         ),
@@ -17313,13 +17576,22 @@ fn resolve_engine_selection(
 
 fn validate_engine_selection_runtime(
     paths: &AppPaths,
+    engine: &str,
     mut selection: EngineSelection,
 ) -> Result<EngineSelection> {
     if let Some(runtime_id) = selection.runtime_id.as_deref() {
         let source = selection.source.as_deref().unwrap_or("runtime selection");
-        selection.runtime_id = Some(resolve_runtime_selector_to_exact_key(
-            paths, runtime_id, source,
-        )?);
+        let runtime_key = resolve_runtime_selector_to_exact_key(paths, runtime_id, source)?;
+        let manifests = therock::load_runtime_manifests(paths)?;
+        let manifest = select_runtime_manifest(&manifests, &runtime_key)?;
+        if manifest.format == "system" && engine_manages_own_runtime(engine) {
+            validate_runtime_manifest_for_activation(manifest)?;
+            selection.runtime_id = Some(managed_engine_runtime_id(engine));
+            selection.source = Some("system_runtime_environment".to_owned());
+        } else {
+            ensure_engine_manifest_is_managed(manifest, engine)?;
+            selection.runtime_id = Some(runtime_key);
+        }
     } else if selection.env_id.is_none()
         && let Some(runtime_key) = single_ready_runtime_key(paths)?
     {
@@ -17333,14 +17605,48 @@ fn single_ready_runtime_key(paths: &AppPaths) -> Result<Option<String>> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
     recover_setup_runtime_registration(paths, &config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
+    // System ROCm runtimes are never auto-selected for engines: they carry no
+    // managed Python runtime, so engine installs cannot target them.
     let ready = manifests
         .iter()
-        .filter(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok())
+        .filter(|manifest| {
+            manifest.format != "system"
+                && validate_runtime_manifest_for_activation(manifest).is_ok()
+        })
         .collect::<Vec<_>>();
     Ok(match ready.as_slice() {
         [manifest] => Some(manifest.runtime_key.clone()),
         _ => None,
     })
+}
+
+fn ensure_engine_runtime_is_managed(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_key: &str,
+) -> Result<()> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, runtime_key)?;
+    ensure_engine_manifest_is_managed(manifest, engine)
+}
+
+fn ensure_engine_manifest_is_managed(
+    manifest: &therock::InstalledRuntimeManifest,
+    engine: &str,
+) -> Result<()> {
+    if manifest.format != "system" {
+        return Ok(());
+    }
+    if engine_manages_own_runtime(engine) {
+        bail!(
+            "runtime {} is a system ROCm runtime without a managed Python runtime; omit --runtime-id when installing {engine} because it manages its own environment",
+            manifest.runtime_key
+        );
+    }
+    bail!(
+        "runtime {} is a system ROCm runtime without a managed Python runtime; engine installs need a runtime installed by `rocm install sdk`, or set ROCM_CLI_VLLM_PYTHON to a Python environment that already has the engine installed",
+        manifest.runtime_key
+    )
 }
 
 fn resolve_runtime_selector_to_exact_key(
@@ -17716,6 +18022,7 @@ fn service_model_names_match(left: &str, right: &str) -> bool {
 fn treat_as_natural_language(args: &[String]) -> bool {
     const STRUCTURED: &[&str] = &[
         "examine",
+        "agents",
         "diagnose",
         "fix",
         "status",
@@ -18046,8 +18353,12 @@ mod tests {
             "the managed count must survive:\n{header}"
         );
         assert!(
-            header.contains("existing ROCm 6.4.1 found"),
-            "the unmanaged install must be reported alongside it:\n{header}"
+            header.contains("existing ROCm 6.4.1 found on disk"),
+            "the existing install must be reported alongside it:\n{header}"
+        );
+        assert!(
+            !header.contains("left unmanaged"),
+            "a saved system runtime must not be described as unmanaged:\n{header}"
         );
     }
 
@@ -20930,6 +21241,35 @@ model recipes
         };
         let error = validate_chat_tool_call(&shell).unwrap_err().to_string();
         assert!(error.contains("unsupported rocm command"));
+    }
+
+    #[test]
+    fn chat_runtimes_adopt_system_is_not_read_only() {
+        let adopt = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["runtimes", "adopt-system", "--root", "/opt/rocm"]
+            }),
+        };
+        validate_chat_tool_call(&adopt).expect("adopt-system should validate for review");
+        assert!(
+            !chat_tool_call_is_read_only(&adopt),
+            "runtimes adopt-system mutates the registry and must route through approval"
+        );
+    }
+
+    #[test]
+    fn run_rocm_read_only_in_process_rejects_runtimes_adopt_system() {
+        let (root, paths) = test_paths("readonly-in-process-adopt-system");
+        let args = vec!["runtimes".to_owned(), "adopt-system".to_owned()];
+
+        let error = run_rocm_read_only_in_process(&paths, &args)
+            .expect_err("adopt-system must not run on the read-only in-process path")
+            .to_string();
+
+        assert!(error.contains("unsupported in-process read-only rocm command"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -24599,6 +24939,7 @@ ID_LIKE="suse opensuse"
         )?;
         let selection = validate_engine_selection_runtime(
             &paths,
+            "vllm",
             resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
         )?;
 
@@ -24630,12 +24971,107 @@ ID_LIKE="suse opensuse"
         )?;
         let selection = validate_engine_selection_runtime(
             &paths,
+            "vllm",
             resolve_engine_selection(&RocmCliConfig::default(), "vllm", None, None),
         )?;
 
         assert!(selection.runtime_id.is_none());
         assert!(selection.env_id.is_none());
         assert!(selection.source.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn single_ready_runtime_excludes_system_runtimes() -> Result<()> {
+        let (root, paths) = test_paths("single-ready-system-runtime");
+        write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+
+        // A lone ready system runtime is never auto-selected.
+        assert!(single_ready_runtime_key(&paths)?.is_none());
+
+        // One system + one ready wheel: the wheel wins.
+        let wheel = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        assert_eq!(
+            single_ready_runtime_key(&paths)?.as_deref(),
+            Some(wheel.runtime_key.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn engine_install_refuses_system_runtime() -> Result<()> {
+        let (root, paths) = test_paths("engine-install-system-runtime");
+        let manifest = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+
+        let error = resolve_engine_install_runtime_id(
+            &paths,
+            &RocmCliConfig::default(),
+            "vllm",
+            Some(manifest.runtime_key.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("managed Python runtime"));
+        assert!(error.contains("rocm install sdk"));
+        assert!(error.contains("ROCM_CLI_VLLM_PYTHON"));
+        let lemonade_error = resolve_engine_install_runtime_id(
+            &paths,
+            &RocmCliConfig::default(),
+            "lemonade",
+            Some(manifest.runtime_key.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(lemonade_error.contains("managed Python runtime"));
+
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            "vllm",
+            EngineSelection {
+                runtime_id: Some(manifest.runtime_key),
+                env_id: None,
+                source: Some("test".to_owned()),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(selection.contains("managed Python runtime"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")] // system ROCm runtimes are Linux/WSL-only
+    fn self_managed_engine_uses_system_runtime_as_process_environment() -> Result<()> {
+        let (root, paths) = test_paths("engine-selection-system-runtime");
+        let manifest = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            "lemonade",
+            EngineSelection {
+                runtime_id: Some(manifest.runtime_key),
+                env_id: None,
+                source: Some("config_active_runtime_key".to_owned()),
+            },
+        )?;
+
+        assert_eq!(
+            selection.runtime_id.as_deref(),
+            Some(managed_engine_runtime_id("lemonade").as_str())
+        );
+        assert_eq!(
+            selection.source.as_deref(),
+            Some("system_runtime_environment")
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -24858,6 +25294,46 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
+    /// The regression that motivated the rule: with a system runtime active,
+    /// `engines install lemonade` derived its env root from the runtime's
+    /// `install_root` and wrote `engines/lemonade/...` INTO the distro-owned
+    /// SDK tree. Engine environments for system runtimes must fall back to
+    /// the default data-dir location (`None`).
+    #[test]
+    fn env_root_for_lemonade_never_points_into_a_system_sdk_root() -> Result<()> {
+        let (root, paths) = test_paths("lemonade-engine-env-root-system");
+        let manifest = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let engine_root =
+            env_root_for_engine_install(&paths, &config, "lemonade", "lemonade-embeddable")?;
+
+        assert_eq!(engine_root, None);
+        // The single-ready fallback must not resurrect the system root either.
+        let no_active = RocmCliConfig::default();
+        assert_eq!(
+            env_root_for_engine_install(&paths, &no_active, "lemonade", "lemonade-embeddable")?,
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn env_root_for_runtime_returns_none_for_system_runtime() -> Result<()> {
+        let (root, paths) = test_paths("engine-env-root-system-runtime");
+        let manifest = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+
+        assert_eq!(
+            env_root_for_runtime(&paths, "vllm", &manifest.runtime_key)?,
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
 
     #[test]
     fn engine_runtime_selection_rejects_ambiguous_default_runtime_id() -> Result<()> {
@@ -24888,14 +25364,14 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("rocm runtimes activate <runtime_key>"));
 
         let selection = resolve_engine_selection(&config, "vllm", None, None);
-        let error = validate_engine_selection_runtime(&paths, selection)
+        let error = validate_engine_selection_runtime(&paths, "vllm", selection)
             .unwrap_err()
             .to_string();
         assert!(error.contains("matches multiple installed runtimes"));
 
         let selection =
             resolve_engine_selection(&config, "vllm", Some("release-pip-gfx120x-all"), None);
-        let selection = validate_engine_selection_runtime(&paths, selection)?;
+        let selection = validate_engine_selection_runtime(&paths, "vllm", selection)?;
         assert_eq!(
             selection.runtime_id.as_deref(),
             Some("release-pip-gfx120x-all")
@@ -26048,6 +26524,7 @@ ID_LIKE="suse opensuse"
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
+        assert!(rendered.contains("ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Qwen/Qwen3.6-27B"));
         assert!(rendered.contains("BF16"));
         // Multi-GPU-only models are not featured (single-GPU serving only).
@@ -26351,6 +26828,268 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    /// Minimal system ROCm SDK fixture tree under `root`: `.info/version`
+    /// (6.4.1), an empty `lib/libamdhip64.so`, and an empty `bin/rocminfo`.
+    #[cfg(target_os = "linux")]
+    fn system_sdk_fixture(root: &Path) -> PathBuf {
+        let fixture = root.join("rocm-fixture");
+        fs::create_dir_all(fixture.join(".info")).unwrap();
+        fs::write(fixture.join(".info").join("version"), "6.4.1\n").unwrap();
+        fs::create_dir_all(fixture.join("lib")).unwrap();
+        fs::write(fixture.join("lib").join("libamdhip64.so"), b"").unwrap();
+        fs::create_dir_all(fixture.join("bin")).unwrap();
+        fs::write(fixture.join("bin").join("rocminfo"), b"").unwrap();
+        fixture
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_system_options(fixture: &Path, activate: bool, replace: bool) -> AdoptSystemOptions {
+        AdoptSystemOptions {
+            root: Some(fixture.to_path_buf()),
+            runtime_id: None,
+            runtime_key: None,
+            activate,
+            replace,
+        }
+    }
+
+    /// Recursive `(path, mtime)` snapshot used to prove adoption never writes
+    /// under the SDK root.
+    #[cfg(target_os = "linux")]
+    fn dir_snapshot(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, std::time::SystemTime)>) {
+            out.push((
+                dir.to_path_buf(),
+                fs::metadata(dir).unwrap().modified().unwrap(),
+            ));
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push((
+                        path.clone(),
+                        fs::metadata(&path).unwrap().modified().unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        walk(root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    // A Windows-refusal unit test is deliberately absent: `runtime_is_windows()`
+    // is a compile-time host constant with no test override, so the bail branch
+    // is unreachable from a Linux test run.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_registers_read_only_system_manifest() {
+        let (root, paths) = test_paths("adopt-system-happy");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+
+        let manifest = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, false),
+        )
+        .expect("adopt system runtime");
+
+        assert_eq!(manifest.runtime_key, "system-rocm-6-4-1");
+        assert_eq!(manifest.runtime_id, "system:unknown");
+        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).is_file());
+
+        let canonical = fixture.canonicalize().unwrap();
+        let manifests = therock::load_runtime_manifests(&paths).unwrap();
+        let loaded = manifests
+            .iter()
+            .find(|entry| entry.runtime_key == manifest.runtime_key)
+            .expect("registry round-trip");
+        assert_eq!(loaded.format, "system");
+        assert_eq!(loaded.channel, "system");
+        assert_eq!(loaded.family_source, "system-probe");
+        assert!(loaded.read_only);
+        assert_eq!(loaded.version, "6.4.1");
+        assert_eq!(loaded.install_root, canonical);
+        assert_eq!(loaded.imported_from.as_deref(), Some(canonical.as_path()));
+        assert!(loaded.python_executable.is_none());
+        let probe = loaded.system_sdk.as_ref().expect("system_sdk round-trip");
+        assert_eq!(probe.version, "6.4.1");
+        assert_eq!(probe.root, canonical);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_explicit_root_wins_over_detection() {
+        // With --root passed, detection (env vars, /opt/rocm) is never
+        // consulted: the adopted root is exactly the requested fixture even on
+        // hosts where a real /opt/rocm exists. No env vars are touched.
+        let (root, paths) = test_paths("adopt-system-explicit-root");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+
+        let manifest = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, false),
+        )
+        .expect("adopt system runtime");
+
+        assert_eq!(manifest.install_root, fixture.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_rejects_sdk_without_hip_runtime() {
+        let (root, paths) = test_paths("adopt-system-no-hip");
+        let fixture = system_sdk_fixture(&root);
+        fs::remove_file(fixture.join("lib").join("libamdhip64.so")).unwrap();
+        let mut config = RocmCliConfig::default();
+
+        let error = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, false),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("libamdhip64"),
+            "error must name the missing HIP library, got: {error}"
+        );
+        let registry = runtime_registry_dir(&paths);
+        let has_entries = registry.is_dir() && fs::read_dir(&registry).unwrap().next().is_some();
+        assert!(!has_entries, "a failed adopt must not register anything");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_never_writes_under_sdk_root() {
+        let (root, paths) = test_paths("adopt-system-zero-writes");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+
+        let before = dir_snapshot(&fixture);
+        adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, true, false),
+        )
+        .expect("adopt system runtime");
+        let after = dir_snapshot(&fixture);
+
+        assert_eq!(
+            before, after,
+            "the SDK root must be byte-for-byte untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_activate_makes_it_the_default() -> Result<()> {
+        let (root, paths) = test_paths("adopt-system-activate");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+
+        let manifest = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, true, false),
+        )?;
+
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(manifest.runtime_key.as_str())
+        );
+        assert!(config.setup.completed);
+        assert!(config.setup.therock_venv.is_none());
+        assert!(active_runtime_marker_path(&paths).is_file());
+        assert_eq!(runtime_usability_status(&manifest), "ready");
+
+        let listing = render_runtimes_text(&paths, &config)?;
+        assert!(listing.contains(&manifest.runtime_key));
+        assert!(listing.contains("read-only"));
+        let mut examine = String::new();
+        append_examine_runtime_state(&mut examine, &paths, &config)?;
+        assert!(examine.contains("active_runtime_status: ready"));
+        assert!(examine.contains("active_runtime_mode: read-only (system)"));
+        assert!(examine.contains(&format!(
+            "active_runtime_root: {}",
+            manifest.install_root.display()
+        )));
+        assert!(!examine.contains("active_runtime_pip_cache_dir"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_adopted_system_runtime_leaves_sdk_intact() -> Result<()> {
+        let (root, paths) = test_paths("adopt-system-uninstall");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+        let manifest = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, true, false),
+        )?;
+
+        let result = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
+
+        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+        assert!(result.removed_install_root.is_none());
+        assert!(result.read_only);
+        assert!(result.was_active);
+        assert!(config.active_runtime_key.is_none());
+        assert!(config.default_runtime_id.is_none());
+        assert!(!config.setup.completed);
+        assert!(!active_runtime_marker_path(&paths).exists());
+        assert!(fixture.join("lib").join("libamdhip64.so").is_file());
+        assert!(fixture.join(".info").join("version").is_file());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_system_runtime_duplicate_requires_replace() {
+        let (root, paths) = test_paths("adopt-system-duplicate");
+        let fixture = system_sdk_fixture(&root);
+        let mut config = RocmCliConfig::default();
+        adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, false),
+        )
+        .expect("first adopt");
+
+        let error = adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, false),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--replace"),
+            "duplicate adopt must point at --replace, got: {error}"
+        );
+
+        adopt_system_runtime(
+            &paths,
+            &mut config,
+            adopt_system_options(&fixture, false, true),
+        )
+        .expect("adopt with --replace");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn examine_engine_inventory_reports_config_without_engine_detect() {
         let (root, paths) = test_paths("examine-engine-inventory");
@@ -26637,6 +27376,36 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn runtime_update_refuses_explicit_system_runtime_and_skips_it_implicitly() -> Result<()> {
+        let (root, paths) = test_paths("runtime-update-system-runtime");
+        let system = write_test_system_runtime(&paths, "system-rocm-6-4-1")?;
+        let wheel = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all",
+            "therock-release:gfx120X-all",
+            "7.13.0a20260416",
+            2,
+        )?;
+        let manifests = therock::load_runtime_manifests(&paths)?;
+
+        let error = select_runtime_update_source(
+            &manifests,
+            &RocmCliConfig::default(),
+            Some(&system.runtime_key),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("managed by the OS package manager"));
+        assert!(error.contains(&system.runtime_key));
+
+        // Implicit selection skips the system manifest and finds the lone wheel.
+        let selected = select_runtime_update_source(&manifests, &RocmCliConfig::default(), None)?;
+        assert_eq!(selected.runtime_key, wheel.runtime_key);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn installed_update_runtime_matches_latest_version_and_family() {
         let mut source = test_runtime_manifest_for_update(
             "old-gfx120",
@@ -26737,6 +27506,7 @@ ID_LIKE="suse opensuse"
             }),
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms,
         };
         fs::create_dir_all(runtime_registry_dir(paths))?;
@@ -26746,6 +27516,59 @@ ID_LIKE="suse opensuse"
         )?;
         fs::write(
             install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(manifest)
+    }
+
+    /// System ROCm runtime registered from the shared SDK fixture tree
+    /// (`.info/version`, `lib/libamdhip64.so`, `bin/rocminfo`).
+    fn write_test_system_runtime(
+        paths: &AppPaths,
+        runtime_key: &str,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let install_root = paths.data_dir.join("rocm-fixture");
+        let info_dir = install_root.join(".info");
+        let lib_dir = install_root.join("lib");
+        let bin_dir = install_root.join("bin");
+        fs::create_dir_all(&info_dir)?;
+        fs::create_dir_all(&lib_dir)?;
+        fs::create_dir_all(&bin_dir)?;
+        fs::write(info_dir.join("version"), "6.4.1")?;
+        fs::write(lib_dir.join("libamdhip64.so"), "")?;
+        fs::write(bin_dir.join("rocminfo"), "")?;
+
+        let manifest = therock::InstalledRuntimeManifest {
+            runtime_key: runtime_key.to_owned(),
+            runtime_id: "system:gfx120X-all".to_owned(),
+            channel: "system".to_owned(),
+            format: "system".to_owned(),
+            family: "gfx120X-all".to_owned(),
+            family_source: "system-probe".to_owned(),
+            version: "6.4.1".to_owned(),
+            install_root: install_root.clone(),
+            selected_artifact_url: "system-read-only".to_owned(),
+            index_url: None,
+            tarball_file_name: None,
+            python_launcher: None,
+            python_executable: None,
+            pip_cache_dir: None,
+            rocm_sdk: None,
+            read_only: true,
+            imported_from: Some(install_root.clone()),
+            system_sdk: Some(rocm_core::SystemSdkProbe {
+                root: install_root,
+                version: "6.4.1".to_owned(),
+                install_method: None,
+                bin_paths: vec![bin_dir],
+                library_paths: vec![lib_dir],
+                gfx_targets: vec!["gfx120X-all".to_owned()],
+            }),
+            installed_at_unix_ms: 1,
+        };
+        fs::create_dir_all(runtime_registry_dir(paths))?;
+        fs::write(
+            runtime_manifest_path(paths, runtime_key),
             serde_json::to_vec_pretty(&manifest)?,
         )?;
         Ok(manifest)
@@ -26775,6 +27598,7 @@ ID_LIKE="suse opensuse"
             rocm_sdk: None,
             read_only: false,
             imported_from: None,
+            system_sdk: None,
             installed_at_unix_ms: 1,
         }
     }

@@ -16,6 +16,7 @@ clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
 flate2 = "1.1"
+jsonc-parser = { version = "0.33.1", features = ["cst"] }
 keyring-core.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 rocm-deps = { path = "../../crates/rocm-deps" }
@@ -31,13 +32,16 @@ rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 rocmd = { path = "../rocmd" }
 rocm-engine-vllm = { path = "../../engines/vllm" }
 rpassword.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tar = "0.4"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml_edit = "0.22.27"
 ureq = { version = "2.12", features = ["native-certs"] }
+yaml-edit = "0.2.3"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

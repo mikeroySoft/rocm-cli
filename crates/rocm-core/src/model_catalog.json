@@ -444,6 +444,36 @@
       ]
     },
     {
+      "canonical_model_id": "ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M",
+      "aliases": [
+        "ornith",
+        "ornith-1.5",
+        "ornith-1.5-35b-a3b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "llamacpp",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 22,
+      "recommended_system_ram_gb": 32,
+      "quantization": "Q4_K_M GGUF, ~21 GiB",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [
+        "qwen3.6"
+      ],
+      "featured": true,
+      "chat_template_mode": "lemonade",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": []
+    },
+    {
       "canonical_model_id": "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
       "aliases": [
         "qwen3.6",

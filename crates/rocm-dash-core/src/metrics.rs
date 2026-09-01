@@ -22,6 +22,8 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SystemMetrics {
+    #[serde(default)]
+    pub cpu_model: String,
     pub cpu_overall_pct: f32,
     pub cpu_per_core_pct: Vec<f32>,
     pub memory_used_mb: u64,

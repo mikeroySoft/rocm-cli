@@ -59,6 +59,8 @@ pub struct ServiceRecord {
     #[serde(default)]
     pub port: u16,
     #[serde(default)]
+    pub gpu_indices: Vec<u32>,
+    #[serde(default)]
     pub status: String,
     /// Coarse startup stage (`downloading`/`loading`/`warmup`) the rocm-cli
     /// supervisor parsed from the serve logs while the service was coming up.
@@ -143,13 +145,11 @@ pub fn load_service_records(services_dir: &Path) -> Vec<ServiceRecord> {
 /// Convert a managed-service record into a [`DiscoveredService`] for the
 /// collector pipeline, or `None` when the record is not in a scrapeable state.
 ///
-/// The port is taken verbatim from the registry (`record.port`) — the registry
-/// is the authority, never a hardcoded default. `gpu_ids` is left empty because
-/// the record carries no concrete device ids; VRAM and tokens/W attribution
-/// degrade gracefully (device-summed / `None`) for managed services until a
-/// richer device mapping is recorded.
+/// The port and GPU assignment come from the registry record. Numeric GPU
+/// ordinals use the same string form as amd-smi device ids, allowing power and
+/// tokens-per-watt attribution for managed services.
 pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredService> {
-    if !is_scrapeable_status(&record.status) {
+    if record.service_id.trim().is_empty() || !is_scrapeable_status(&record.status) {
         return None;
     }
     // A `#[serde(default)]` u16 missing from the JSON deserializes to 0; an
@@ -167,6 +167,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         container_name: record.service_id.clone(),
         model_name,
         port: Some(record.port),
+        gpu_ids: record.gpu_indices.iter().map(u32::to_string).collect(),
         status: instance_status_for_record(&record.status, record.startup_phase.as_deref()),
         ..Default::default()
     })
@@ -181,34 +182,41 @@ pub fn engine_kind_for(record: &ServiceRecord) -> Option<EngineKind> {
 
 /// The result of turning a batch of registry records into dashboard instances.
 ///
-/// Contains the live instances to upsert, their ids (`seen`), and the subset whose engine
-/// is NOT vLLM (`non_vllm`, excluded from the vLLM Prometheus scrape so they are
-/// not mis-parsed). Pure — the runner applies it (upsert/broadcast/Gone-diff).
+/// Contains the live instances to upsert, their ids (`seen`), the non-vLLM ids
+/// excluded from Prometheus parsing, and the Lemonade subset routed to its
+/// collector. Pure — the runner applies it (upsert/broadcast/Gone-diff).
 #[derive(Debug, Default)]
 pub struct ManagedDiscovery {
     pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
+    pub lemonade: HashSet<String>,
 }
 
-/// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
+/// Convert loaded registry records into scrape targets.
 ///
-/// Non-scrapeable records (bad status / port 0) are dropped; vLLM-engine services flow to the
-/// Prometheus scrape, others are flagged in `non_vllm`.
-///
-/// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet
-/// wired — they appear in the dashboard but are excluded from the vLLM scrape
-/// and not routed to a per-engine collector here. vLLM (the Phase-2 acceptance
-/// target) is fully wired. Non-vLLM managed scraping is a D7 follow-up.
+/// The first record for a service id wins. [`load_service_records`] sorts
+/// newest-first, so a stale duplicate cannot revive a stopped service or
+/// overwrite current endpoint or engine metadata. vLLM services use the
+/// Prometheus collector; Lemonade services are excluded from vLLM parsing and
+/// marked for their collector.
 pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery {
     let mut out = ManagedDiscovery::default();
+    let mut handled = HashSet::new();
     for record in records {
+        if record.service_id.trim().is_empty() || !handled.insert(record.service_id.clone()) {
+            continue;
+        }
         let Some(svc) = discovered_from_record(record) else {
             continue;
         };
         out.seen.insert(svc.container_id.clone());
-        if engine_kind_for(record) != Some(EngineKind::Vllm) {
+        let kind = engine_kind_for(record);
+        if kind != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
+            if kind == Some(EngineKind::Lemonade) {
+                out.lemonade.insert(svc.container_id.clone());
+            }
         }
         out.svcs.push(svc);
     }
@@ -257,6 +265,7 @@ mod tests {
               "canonical_model_id": "llama-3.1-8b",
               "host": "127.0.0.1",
               "port": {port},
+              "gpu_indices": [0],
               "endpoint_url": "http://127.0.0.1:{port}/v1",
               "mode": "managed",
               "status": "{status}",
@@ -553,6 +562,13 @@ mod tests {
     }
 
     #[test]
+    fn discovered_skips_missing_service_id() {
+        let rec: ServiceRecord =
+            serde_json::from_str(r#"{"engine":"vllm","port":8000,"status":"running"}"#).unwrap();
+        assert!(discovered_from_record(&rec).is_none());
+    }
+
+    #[test]
     fn discover_managed_services_classifies_and_filters() {
         let records: Vec<ServiceRecord> = [
             record_json("svc-vllm", "vllm", 8000, "running", 3),
@@ -574,6 +590,8 @@ mod tests {
         // Only the Lemonade service is excluded from the vLLM scrape.
         assert!(disc.non_vllm.contains("svc-lemon"));
         assert!(!disc.non_vllm.contains("svc-vllm"));
+        assert!(disc.lemonade.contains("svc-lemon"));
+        assert!(!disc.lemonade.contains("svc-vllm"));
         // Instances carry the registry port + Running status.
         let vllm = disc
             .svcs
@@ -585,6 +603,25 @@ mod tests {
             vllm.status,
             rocm_dash_core::metrics::InstanceStatus::Running
         );
+        assert_eq!(vllm.gpu_ids, vec!["0"]);
+    }
+
+    #[test]
+    fn discovery_ignores_stale_duplicate_records() {
+        let duplicates: Vec<ServiceRecord> = [
+            record_json("svc-same", "lemonade", 13305, "ready", 4),
+            record_json("svc-same", "vllm", 8000, "running", 3),
+            record_json("svc-stopped", "vllm", 8001, "stopped", 2),
+            record_json("svc-stopped", "vllm", 8001, "running", 1),
+        ]
+        .iter()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect();
+        let disc = discover_managed_services(&duplicates);
+        assert_eq!(disc.svcs.len(), 1);
+        assert_eq!(disc.svcs[0].port, Some(13305));
+        assert!(disc.lemonade.contains("svc-same"));
+        assert!(!disc.seen.contains("svc-stopped"));
     }
 
     /// Deterministic end-to-end of the registry→scrape→dashboard data path (no

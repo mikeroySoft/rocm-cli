@@ -35,6 +35,11 @@ fn shim_dir(world: &E2eWorld) -> PathBuf {
     root.path().join("guard-bin")
 }
 
+fn os_release_path(world: &E2eWorld) -> PathBuf {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    root.path().join("guard-os-release")
+}
+
 /// Write `body` to `path` and mark it executable.
 fn write_shim(path: &PathBuf, body: &str) {
     std::fs::write(path, body)
@@ -81,13 +86,16 @@ async fn plant_runtime(world: &mut E2eWorld) {
 
 #[given("installing OpenMPI would remove the ROCm packages")]
 async fn plant_destructive_apt(world: &mut E2eWorld) {
-    // Stand in for the host package manager so the scenario owns the dependency
-    // solution apt reports. `apt-get -s` (the simulation the CLI runs before
-    // installing) prints the operation records apt itself would print; any other
-    // apt invocation succeeds silently. A companion `ldconfig` shim reports no
-    // libmpi, so OpenMPI reads as missing whatever the host has installed.
+    // Stand in for the host package manager and distro identity so the scenario
+    // owns the dependency solution apt reports on every Linux distribution.
+    // `apt-get -s` (the simulation the CLI runs before installing) prints the
+    // operation records apt itself would print; any other apt invocation
+    // succeeds silently. A companion `ldconfig` shim reports no libmpi, so
+    // OpenMPI reads as missing whatever the host has installed.
     let shim = shim_dir(world);
     std::fs::create_dir_all(&shim).expect("failed to create the package-manager shim dir");
+    std::fs::write(os_release_path(world), "ID=ubuntu\nID_LIKE=debian\n")
+        .expect("failed to write the os-release fixture");
 
     let removals = REMOVED_ROCM
         .iter()
@@ -110,9 +118,13 @@ async fn plant_destructive_apt(world: &mut E2eWorld) {
 async fn install_vllm_approving_changes(world: &mut E2eWorld) {
     // A PATH of only the shim dir keeps the run hermetic: the CLI finds the
     // planted `apt-get` / `ldconfig`, and finds no `mpirun`, so OpenMPI reads as
-    // missing on any host. `--yes` is the approval the guard has to override —
-    // that is the whole point, since the reported break happened unattended.
+    // missing on any host. The os-release fixture makes the CLI select that
+    // planted apt rather than the package manager of the machine running E2E.
+    // `--yes` is the approval the guard has to override — that is the whole
+    // point, since the reported break happened unattended.
     let shim = shim_dir(world);
+    let path = shim.display().to_string();
+    let os_release = os_release_path(world).display().to_string();
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &[
@@ -123,7 +135,10 @@ async fn install_vllm_approving_changes(world: &mut E2eWorld) {
             RUNTIME_KEY,
             "--yes",
         ],
-        &[("PATH", shim.display().to_string().as_str())],
+        &[
+            ("PATH", path.as_str()),
+            ("ROCM_CLI_OS_RELEASE_PATH", os_release.as_str()),
+        ],
     );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);

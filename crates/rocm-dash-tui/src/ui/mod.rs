@@ -8,7 +8,6 @@ pub mod bench;
 pub mod bench_run;
 pub mod command_screen;
 pub mod config_manager;
-pub mod core_bars;
 pub mod dock;
 pub mod engine_manager;
 pub mod examine_manager;

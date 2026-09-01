@@ -4,12 +4,10 @@
 
 //! Observe tab — the AI-serving telemetry surface.
 //!
-//! P5 reorients Observe around AI-serving efficiency/throughput: a top band of
-//! two hero panels — **Node efficiency** (tok/watt + trend) and **Node
-//! throughput** (Σ gen_tps + total power W) — over an AI per-instance table
-//! (model · tok/s · tok/watt · TTFT · TPOT · power · queue · kv%). The deep
-//! hardware (GPU/host) cluster and the bench rollup are kept reachable below so
-//! nothing is lost. The selectable list is the instances table (wired via the
+//! Observe leads with serving efficiency, then gives the hardware instrument
+//! cluster the remaining space: a wide GPUFLO-style GPU surface beside a
+//! compact btop-style CPU surface. The instance table and bench rollup remain
+//! visible below it. The selectable list is the instances table (wired via the
 //! main selection model in `AppState`).
 //!
 //! The amber no-live-data banner is shown iff live daemon telemetry is
@@ -51,18 +49,16 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),      // hero band (two panels)
-            Constraint::Percentage(40), // AI per-instance table
-            Constraint::Percentage(35), // deep hardware/GPU cluster
-            Constraint::Min(6),         // bench rollup
+            Constraint::Length(6), // serving-efficiency heroes
+            Constraint::Min(17),   // aligned identity headers + stacked GPU/VRAM + cores
+            Constraint::Length(6), // AI table: header plus two visible instances
+            Constraint::Length(3), // one-line bench rollup
         ])
         .split(body);
 
     draw_hero_band(f, rows[0], state, theme);
-    // AI per-instance table (tok/watt, TTFT, TPOT, queue, kv%).
-    super::instances::draw_table(f, rows[1], state, theme);
-    // Deep hardware + bench detail kept reachable below the AI surface.
-    super::hardware::draw(f, rows[2], state, theme);
+    super::hardware::draw(f, rows[1], state, theme);
+    super::instances::draw_table(f, rows[2], state, theme);
     super::bench::draw(f, rows[3], state, theme);
 }
 
@@ -253,8 +249,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{
-        GpuMetrics, Instance, InstanceStatus, ObservationFreshness, ObservationMetadata, Snapshot,
-        SystemMetrics,
+        GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
+        ObservationMetadata, Snapshot, SystemMetrics,
     };
 
     fn render(state: &AppState, cols: u16, rows: u16) -> String {
@@ -278,7 +274,11 @@ mod tests {
             version: "1.0".into(),
         };
         s.latest = Some(Snapshot {
-            host: SystemMetrics::default(),
+            host: SystemMetrics {
+                cpu_model: "Intel Core i9-14900KF".into(),
+                cpu_per_core_pct: vec![12.0; 32],
+                ..Default::default()
+            },
             gpus: vec![GpuMetrics {
                 device_id: "GPU0".into(),
                 vram_used_mb: 40_000,
@@ -288,6 +288,12 @@ mod tests {
                 power_w: 300.0,
                 clock_mhz: Some(2000.0),
             }],
+            gpu_system_info: Some(GpuSystemInfo {
+                gpu_model: "Radeon AI PRO R9700".into(),
+                physical_gpu_count: 1,
+                logical_gpu_count: 1,
+                ..Default::default()
+            }),
             ..Default::default()
         });
         s
@@ -336,6 +342,36 @@ mod tests {
     }
 
     #[test]
+    fn observe_prioritizes_gpu_at_real_dashboard_detail_size() {
+        let state = connected_with_snapshot();
+        // The 120×40 black-box terminal leaves 116×32 inside the shared tab frame.
+        let out = render(&state, 116, 32);
+        assert!(
+            out.contains("GPU activity"),
+            "GPU instrument missing: {out:?}"
+        );
+        assert!(
+            out.contains("VRAM occupancy"),
+            "VRAM instrument missing: {out:?}"
+        );
+        assert!(out.contains("CPU cores"), "CPU panel missing: {out:?}");
+        assert!(
+            out.contains("Intel Core i9-14900KF"),
+            "CPU model missing: {out:?}"
+        );
+        assert!(
+            out.contains("Radeon AI PRO R9700"),
+            "GPU model missing: {out:?}"
+        );
+        assert!(out.contains("C0"), "first CPU core missing: {out:?}");
+        assert!(out.contains("C31"), "last CPU core missing: {out:?}");
+        assert!(
+            out.contains("Disk + Net"),
+            "combined I/O panel missing: {out:?}"
+        );
+    }
+
+    #[test]
     fn observe_renders_two_hero_panels() {
         let out = render(
             &connected_with_instances(vec![instance("m", Some(180.0), Some(120.0))]),
@@ -378,6 +414,22 @@ mod tests {
             out.contains("3/0"),
             "queue running/waiting missing: {out:?}"
         );
+    }
+
+    #[test]
+    fn observe_extra_height_reaches_instance_table() {
+        let instances = (0..6)
+            .map(|i| instance(&format!("model-{i}"), Some(200.0), Some(150.0)))
+            .collect();
+        let mut state = connected_with_instances(instances);
+        state.instance_sel = 5;
+
+        let out = render(&state, 116, 40);
+        assert!(
+            out.contains("model-5"),
+            "extra height did not expose the selected sixth instance: {out:?}"
+        );
+        assert!(out.contains("Bench"), "bench minimum was not preserved");
     }
 
     #[test]

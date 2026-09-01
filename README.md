@@ -209,8 +209,10 @@ requirements.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
+| `rocm runtimes adopt-system` | Use an already-installed system ROCm SDK (e.g. `/opt/rocm`) as a read-only runtime |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm agents [<agent>]` | List, inspect, configure, or test local agent harnesses |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
@@ -247,17 +249,35 @@ rocm runtimes uninstall <runtime-key>
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
+rocm runtimes adopt-system [--root <path>] [--runtime-id ID]
+                           [--runtime-key KEY] [--activate] [--replace]
 ```
 
-`adopt` registers an existing TheRock-based Python environment as a managed
-runtime. It does not work with standard ROCm package installs (e.g.
-`/opt/rocm`); use `rocm install sdk` instead.
+`adopt` registers an existing TheRock-based Python environment as a read-only
+runtime.
+
+`adopt-system` registers an already-installed system ROCm SDK (a standard
+package install such as `/opt/rocm`) as a read-only runtime, without
+downloading anything or writing into the SDK tree. The root is detected via
+`ROCM_PATH`, `ROCM_HOME`, or `HIP_PATH`, falling back to `/opt/rocm`; pass
+`--root` to override. `--activate` makes it the default runtime and completes
+first-time setup. Linux and WSL only in this release.
+
+System runtimes are owned by the OS package manager: implicit `rocm update`
+skips them, while `rocm update --runtime <system-key>` directs you to your
+distribution's tooling. After updating ROCm there, re-run `adopt-system`; pass
+the original `--runtime-key` with `--replace` to refresh that existing record.
+`rocm runtimes uninstall` only unregisters the record — the SDK itself is
+left untouched. A system SDK has no managed Python environment, so it is never
+auto-selected for engine installs: Lemonade installs into its own managed
+environment and works normally, while a vLLM install needs a runtime from
+`rocm install sdk` (or an existing external vLLM via `ROCM_CLI_VLLM_PYTHON`).
 
 ### Disk space
 
-Each ROCm install keeps its own multi-gigabyte folder, so installing or
-updating a few times adds up. `rocm storage` shows where the space went and
-frees the parts that are safe to remove:
+Each ROCm CLI-managed SDK install keeps its own multi-gigabyte folder, so
+installing or updating a few times adds up. `rocm storage` shows where the
+space went and frees the parts that are safe to remove:
 
 ```
 rocm storage [report] [--json]
@@ -417,6 +437,88 @@ Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
 omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
 controls forwarded to the request; each is independent, so omit any of them to
 use the provider's default.
+
+### Agent harnesses
+
+Configure supported agent CLIs to use a local ROCm model server:
+
+```
+rocm agents
+rocm agents <agent>
+rocm agents <agent> --setup --dry-run [--model MODEL] [--base-url URL]
+                    [--agent-version VERSION]
+rocm agents <agent> --setup --yes [--model MODEL] [--base-url URL]
+                    [--agent-version VERSION] [--no-check]
+rocm agents <agent> --test [--agent-version VERSION]
+```
+
+Supported harness names are `claude`, `hermes`, `openclaw`, `codex`,
+`opencode`, `qwen-code`, `aider`, `continue`, `pi`, and `omp`; `rocm agents`
+lists all ten with installation and configuration status. Pi is the Earendil
+Works Pi coding agent (`pi` executable), while OMP is Oh My Pi (`omp`
+executable): they are separate canonical harnesses and neither name is an
+alias for the other. Pi setup supports exactly version `0.84.4`; OMP setup
+supports major version `18`.
+
+`rocm agents <agent>` inspects one harness without changing it, including its
+detected executable, version, configuration paths, endpoint, and model. Use
+`--agent-version` to select a supported configuration schema explicitly,
+including when preparing setup before the harness is installed.
+
+Pi setup updates two user-level files under
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}`. `models.json` gets a
+`providers.rocm-local` Chat Completions provider with the loopback base URL,
+the placeholder local API key `rocm-local`, and the selected model;
+`settings.json` gets `defaultProvider` and `defaultModel`. A project
+`.pi/settings.json` or an explicit CLI/session selection has higher precedence,
+so setup warns about project settings and changes only the user files.
+
+OMP setup always adds the unauthenticated `rocm-local` Chat Completions
+provider and model to the active profile's user-level `models.yml`. After a
+successful registration and protocol check, interactive setup asks whether to
+set `modelRoles.default` in `config.yml` to `rocm-local/<model>` for new OMP
+sessions. Declining, running noninteractively with `--yes`, or using
+`--dry-run` leaves the existing default unchanged; rerun setup interactively
+to choose it later. Dry-run reports that default selection follows an applied
+setup. The default agent root is `~/.omp/agent`; `PI_CONFIG_DIR` changes the
+`.omp` root, and `PI_CODING_AGENT_DIR` replaces the default profile's full
+agent directory. A profile selected by `--profile` or `OMP_PROFILE` (preferred
+over legacy `PI_PROFILE`) instead uses `<root>/profiles/<name>/agent`. Setup
+changes only that active profile's user files. Project `.omp/config.yml`,
+`PI_CONFIG_FILES` overlays, repeated `--config` overlays, and runtime `--model`
+can override the effective model; later overlays win, so OMP setup warns when
+they may take precedence.
+
+Pi setup applies its two user files as one transaction. Both targets are
+checked for symlinks and stale plans, replacements are atomic and ordered, a
+partial apply restores earlier files, and full rollback restores files in
+reverse order. OMP registers `models.yml` first and applies the optional
+`config.yml` default separately only after the interactive choice.
+
+Setup automatically uses the unique ready loopback service managed by
+rocm-cli. `--model` selects a matching service when several are ready. If no
+managed service matches, setup falls back to
+`http://127.0.0.1:11435/v1`; supply `--model` for an offline setup plan, or
+start a server with `rocm serve <model>`. An explicit `--base-url` must be a
+loopback HTTP URL; if `--model` is omitted, the endpoint must advertise one
+unambiguous model.
+
+`--dry-run` prints the target and file changes without writing them. A normal
+setup prompts before writing; `--yes` supplies that approval for scripts and
+other non-interactive use, but does not select OMP's optional default. After
+writing, setup probes the harness's native API route with the exact model and
+restores the previous configuration if the check fails. `--no-check`
+deliberately keeps the configuration without making that protocol request.
+
+`--test` runs the installed harness against a nonce probe in an isolated
+temporary workspace using harness-specific safe arguments and the configured
+model. It verifies the probe remains intact and the nonce appears in the
+harness's final output, without exposing the caller's repository. Pi is pinned
+to the selected provider, model, and placeholder API key with offline and
+resource-discovery restrictions. OMP uses noninteractive print mode with an
+`@probe.txt` prompt, disables tools, sessions, titles, LSP, PTY, extensions,
+skills, and rules, and applies a bounded maximum time. Harnesses may create
+ordinary cache or session files inside the temporary workspace.
 
 ### ComfyUI
 
