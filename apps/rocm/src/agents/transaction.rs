@@ -255,6 +255,7 @@ fn publish(temporary: &Path, path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // MoveFileExW is the Windows atomic-replacement primitive
 fn publish(temporary: &Path, path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
