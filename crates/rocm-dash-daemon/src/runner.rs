@@ -18,8 +18,9 @@ use chrono::{DateTime, Utc};
 use rocm_dash_collectors::amd_smi::AmdSmiCollector;
 use rocm_dash_collectors::bench_tail::CsvBenchTailer;
 use rocm_dash_collectors::docker::DockerDiscovery;
+use rocm_dash_collectors::engine_registry::EngineKind;
 use rocm_dash_collectors::host::HostCollector;
-use rocm_dash_collectors::lemonade::LemonadeCollector;
+use rocm_dash_collectors::lemonade::{LemonadeCollector, ManagedLemonadeCollector};
 use rocm_dash_collectors::parallel::parallel_scrape;
 use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
@@ -153,6 +154,10 @@ pub async fn run_loop(
     } else {
         None
     };
+    let managed_lemonade = Arc::new(ManagedLemonadeCollector::new(
+        opts.vllm_metrics_host.clone(),
+        Duration::from_millis(1500),
+    ));
 
     // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
     // configured). Distinct from Docker/vLLM discovery — a local server, not a
@@ -196,6 +201,7 @@ pub async fn run_loop(
     // the vLLM Prometheus scrape so they aren't mis-parsed).
     let mut known_services: HashSet<String> = HashSet::new();
     let mut managed_non_vllm: HashSet<String> = HashSet::new();
+    let mut managed_lemonade_ids: HashSet<String> = HashSet::new();
     // Per-instance generation-throughput tracker. Keyed by container_id.
     // Constructed lazily from opts.instance_tick; survives scrape failures so
     // the last-observed rate is held for the validity window before clearing.
@@ -477,16 +483,24 @@ pub async fn run_loop(
             && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
         {
             let records = crate::registry::load_service_records(services_dir);
-            let disc = crate::registry::discover_managed_services(&records);
-            managed_non_vllm = disc.non_vllm;
-            for svc in disc.svcs {
+            let crate::registry::ManagedDiscovery {
+                svcs,
+                seen,
+                non_vllm: next_non_vllm,
+                lemonade: next_lemonade,
+            } = crate::registry::discover_managed_services(&records);
+            for svc in svcs {
                 let id = svc.container_id.clone();
                 let is_new = !known_services.contains(&id);
                 let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; reset rate baseline and
-                // latency windows so the new port starts fresh.
-                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
-                if !same_endpoint {
+                // A port or collector change means a different telemetry
+                // stream even when the registry reuses the service id.
+                let same_target = existing.as_ref().is_none_or(|ex| {
+                    ex.port == svc.port
+                        && managed_non_vllm.contains(&id) == next_non_vllm.contains(&id)
+                        && managed_lemonade_ids.contains(&id) == next_lemonade.contains(&id)
+                });
+                if !same_target {
                     invalidate_on_endpoint_change(
                         &id,
                         &mut gen_trackers,
@@ -496,11 +510,7 @@ pub async fn run_loop(
                 }
                 let inst = merge_discovery_refresh(
                     &svc,
-                    if same_endpoint {
-                        existing.as_ref()
-                    } else {
-                        None
-                    },
+                    if same_target { existing.as_ref() } else { None },
                 );
                 runner
                     .state
@@ -516,7 +526,7 @@ pub async fn run_loop(
                     );
                 }
             }
-            for gone in known_services.difference(&disc.seen) {
+            for gone in known_services.difference(&seen) {
                 info!(id = %gone, "managed service gone");
                 purge_telemetry_state(gone, &mut gen_trackers, &mut prev_ttft, &mut prev_tpot);
                 runner
@@ -530,56 +540,75 @@ pub async fn run_loop(
                     },
                 );
             }
-            known_services = disc.seen;
+            known_services = seen;
+            managed_non_vllm = next_non_vllm;
+            managed_lemonade_ids = next_lemonade;
         }
         if tick_count.is_multiple_of(instance_ticks) {
             scrape_warns.clear();
         }
 
-        // Per-instance vLLM metric scrape, parallel, on its own cadence. The
-        // Lemonade instance (if any) is scraped via its own collector below, so
-        // exclude it from the vLLM Prometheus targets. Managed non-vLLM services
-        // are excluded too (their engine uses a different parser).
-        if let Some(prom) = vllm.as_ref()
-            && !runner.state.instances.is_empty()
-            && tick_count.is_multiple_of(instance_ticks)
-        {
-            let targets: Vec<(String, u16)> = runner
+        // Per-instance engine metric scrape, parallel, on its own cadence.
+        // Docker instances default to vLLM. Managed Lemonade services use their
+        // collector, which handles both llama.cpp `/metrics` and routed
+        // Lemonade `/api/v1/stats`.
+        if !runner.state.instances.is_empty() && tick_count.is_multiple_of(instance_ticks) {
+            let targets: Vec<(String, u16, EngineKind)> = runner
                 .state
                 .instances
                 .values()
                 .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
-                .filter(|i| !managed_non_vllm.contains(&i.container_id))
-                .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
+                .filter_map(|i| {
+                    let port = i.port?;
+                    if managed_lemonade_ids.contains(&i.container_id) {
+                        return Some((i.container_id.clone(), port, EngineKind::Lemonade));
+                    }
+                    if managed_non_vllm.contains(&i.container_id) || vllm.is_none() {
+                        return None;
+                    }
+                    Some((i.container_id.clone(), port, EngineKind::Vllm))
+                })
                 .collect();
-            let prom = prom.clone();
-            let results = parallel_scrape(targets, move |(id, port)| {
+            let prom = vllm.clone();
+            let lemonade_metrics = managed_lemonade.clone();
+            let results = parallel_scrape(targets, move |(id, port, kind)| {
                 let prom = prom.clone();
+                let lemonade_metrics = lemonade_metrics.clone();
                 async move {
                     let svc = DiscoveredService {
                         container_id: id.clone(),
                         port: Some(port),
                         ..Default::default()
                     };
-                    prom.fetch_async(&svc).await
+                    match kind {
+                        EngineKind::Vllm => {
+                            prom.expect("vLLM target requires an enabled collector")
+                                .fetch_async(&svc)
+                                .await
+                        }
+                        EngineKind::Lemonade => lemonade_metrics.fetch_async(&svc).await,
+                    }
                 }
             })
             .await;
             let mut fail_count: usize = 0;
             let mut last_err: Option<String> = None;
-            for ((id, _port), fetch) in results {
+            for ((id, _port, _kind), fetch) in results {
                 match fetch {
                     Ok(sample) => {
-                        // EAI-7960: drive the per-instance tracker with the
-                        // cumulative counter when present; omitted counter leaves
-                        // the tracker (and its held value) untouched.
-                        if let Some(cur) = sample.gen_tokens_total {
-                            gen_trackers
-                                .entry(id.clone())
-                                .or_insert_with(|| {
-                                    GenerationObservationTracker::new(opts.instance_tick)
-                                })
-                                .observe_counter(cur, cycle_at);
+                        // Prefer a direct engine-reported rate when present,
+                        // while retaining a cumulative baseline for collectors
+                        // that expose both forms.
+                        if sample.gen_tokens_total.is_some() || sample.gen_tps.is_some() {
+                            let tracker = gen_trackers.entry(id.clone()).or_insert_with(|| {
+                                GenerationObservationTracker::new(opts.instance_tick)
+                            });
+                            if let Some(cur) = sample.gen_tokens_total {
+                                tracker.observe_counter(cur, cycle_at);
+                            }
+                            if let Some(rate) = sample.gen_tps {
+                                tracker.observe_direct(rate, cycle_at);
+                            }
                         }
                         // gen_tps is written to the instance in the snapshot
                         // assembly below (tracker.snapshot per cycle_at).
@@ -606,12 +635,8 @@ pub async fn run_loop(
                             inst.waiting_reqs = sample.waiting_reqs;
                             inst.ttft_ms = ttft_ms;
                             inst.tpot_ms = tpot_ms;
-                            // Docker-discovered instances have no
-                            // `ManagedServiceRecord` to promote their status, so
-                            // they start life as `Starting`. A successful vLLM
-                            // Prometheus scrape is the first hard evidence the
-                            // instance is actually serving requests, so promote
-                            // it to `Ready` here.
+                            // A successful engine scrape is hard evidence that a
+                            // `Starting` instance is serving requests.
                             if matches!(inst.status, InstanceStatus::Starting { .. }) {
                                 inst.status = InstanceStatus::Ready;
                             }
@@ -621,7 +646,7 @@ pub async fn run_loop(
                     Err(e) => {
                         fail_count += 1;
                         let msg = format!("{e}");
-                        trace!(id = %id, error = %msg, "vllm scrape failed");
+                        trace!(id = %id, error = %msg, "instance scrape failed");
                         last_err = Some(msg);
                         // EAI-7960: do NOT clear or remove gen_trackers on failure.
                         // The tracker holds the last-observed rate for the validity
@@ -645,8 +670,8 @@ pub async fn run_loop(
             }
             if fail_count > 0 {
                 scrape_warns.push(match last_err {
-                    Some(e) => format!("vllm scrape: {fail_count} failed (last: {e})"),
-                    None => format!("vllm scrape: {fail_count} failed"),
+                    Some(e) => format!("instance scrape: {fail_count} failed (last: {e})"),
+                    None => format!("instance scrape: {fail_count} failed"),
                 });
             }
         }
@@ -671,6 +696,20 @@ pub async fn run_loop(
                             })
                             .observe_direct(rate, cycle_at);
                     }
+                    let ttft_ms = avg_ms_from_histogram(
+                        &mut prev_ttft,
+                        &id,
+                        sample.ttft_sum_s,
+                        sample.ttft_count,
+                        cycle_at,
+                    );
+                    let tpot_ms = avg_ms_from_histogram(
+                        &mut prev_tpot,
+                        &id,
+                        sample.tpot_sum_s,
+                        sample.tpot_count,
+                        cycle_at,
+                    );
                     if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
                         // gen_tps is written in the snapshot assembly below;
                         // set the KV/request fields immediately so they are
@@ -678,6 +717,8 @@ pub async fn run_loop(
                         inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                         inst.running_reqs = sample.running_reqs;
                         inst.waiting_reqs = sample.waiting_reqs;
+                        inst.ttft_ms = ttft_ms;
+                        inst.tpot_ms = tpot_ms;
                         // See the vLLM scrape-success handler: a successful stats
                         // fetch proves the instance is serving; promote out of Starting.
                         if matches!(inst.status, InstanceStatus::Starting { .. }) {

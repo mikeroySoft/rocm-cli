@@ -16,6 +16,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
@@ -34,6 +35,7 @@ pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
+mod system_sdk;
 pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
@@ -59,15 +61,19 @@ pub use runtime::{
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
     normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
-    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
-    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
-    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    resolve_path_through_symlinks, runtime_config_dir, runtime_directory_label,
+    runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix, runtime_home_dir,
+    runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
+    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
+    runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
+};
+pub use system_sdk::{
+    SystemSdkProbe, detect_system_rocm_root, probe_system_rocm_sdk, validate_system_sdk_probe,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
@@ -2094,9 +2100,9 @@ impl ExamineSummary {
             return "none";
         }
         if self.managed_runtime_count == 0 {
-            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format wheel` and keep legacy ROCm unmanaged";
+            return "legacy ROCm detected; register the existing install with `rocm runtimes adopt-system` or install a managed TheRock runtime side-by-side with `rocm install sdk --channel release --format wheel`";
         }
-        "legacy ROCm detected; keep it side-by-side and use rocm-cli managed TheRock runtimes for local engines"
+        "legacy ROCm detected; inspect registered runtimes with `rocm runtimes list`; system runtimes remain owned by the OS package manager"
     }
 }
 
@@ -3492,18 +3498,18 @@ fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ManagedRuntimeEnvironment {
+pub struct RuntimeEnvironment {
     pub rocm_root: Option<PathBuf>,
     pub path_entries: Vec<PathBuf>,
     pub library_entries: Vec<PathBuf>,
 }
 
-pub fn active_managed_therock_environment(
+pub fn active_runtime_environment(
     paths: &AppPaths,
     config: &RocmCliConfig,
-) -> Result<Option<ManagedRuntimeEnvironment>> {
-    Ok(select_active_managed_therock_record(paths, config)
-        .map(|record| managed_therock_environment_from_record(&record)))
+) -> Result<Option<RuntimeEnvironment>> {
+    Ok(select_active_runtime_record(paths, config)
+        .map(|record| runtime_environment_from_record(&record)))
 }
 
 /// Channel (`"release"`/`"nightly"`) of the active managed TheRock runtime.
@@ -3514,17 +3520,34 @@ pub fn active_managed_therock_channel(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<Option<String>> {
-    Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.channel))
+    Ok(select_active_therock_record(paths, config).and_then(|record| record.channel))
 }
 
-/// Pick the active managed TheRock runtime record: the one matching
-/// `config.active_runtime_key`, falling back to the most recently installed.
-fn select_active_managed_therock_record(
+/// Pick the active runtime record (managed TheRock or system SDK): the one
+/// matching `config.active_runtime_key`, falling back to the most recently
+/// installed.
+fn select_active_runtime_record(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Option<TheRockFamilyManifest> {
     let registry_dir = paths.data_dir.join("runtimes").join("registry");
-    let mut records = managed_therock_environment_records(&registry_dir);
+    select_active_record(runtime_environment_records(&registry_dir), config)
+}
+
+/// Pick the active managed TheRock record only; system SDK records are
+/// invisible here.
+fn select_active_therock_record(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Option<TheRockFamilyManifest> {
+    let registry_dir = paths.data_dir.join("runtimes").join("registry");
+    select_active_record(managed_therock_environment_records(&registry_dir), config)
+}
+
+fn select_active_record(
+    mut records: Vec<(PathBuf, TheRockFamilyManifest)>,
+    config: &RocmCliConfig,
+) -> Option<TheRockFamilyManifest> {
     if records.is_empty() {
         return None;
     }
@@ -3572,9 +3595,7 @@ pub fn prepend_runtime_paths(
     }
 }
 
-fn managed_therock_environment_records(
-    registry_dir: &Path,
-) -> Vec<(PathBuf, TheRockFamilyManifest)> {
+fn read_registry_records(registry_dir: &Path) -> Vec<(PathBuf, TheRockFamilyManifest)> {
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
     };
@@ -3588,41 +3609,66 @@ fn managed_therock_environment_records(
             let record = fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<TheRockFamilyManifest>(&bytes).ok())?;
-            (record.looks_like_therock()
-                && record.rocm_sdk.as_ref().is_some_and(|sdk| sdk.import_ok))
-            .then_some((path, record))
+            Some((path, record))
         })
         .collect()
 }
 
-fn managed_therock_environment_from_record(
-    record: &TheRockFamilyManifest,
-) -> ManagedRuntimeEnvironment {
-    let mut env = ManagedRuntimeEnvironment::default();
-    let sdk = record.rocm_sdk.as_ref();
-    env.rocm_root = sdk
-        .and_then(|sdk| sdk.root_path.clone())
-        .or_else(|| record.install_root.clone());
+fn managed_therock_environment_records(
+    registry_dir: &Path,
+) -> Vec<(PathBuf, TheRockFamilyManifest)> {
+    let mut records = read_registry_records(registry_dir);
+    records.retain(|(_, record)| record.is_importable_therock());
+    records
+}
 
-    if let Some(sdk) = sdk {
-        if let Some(bin_path) = sdk.bin_path.as_ref() {
-            push_existing_runtime_path(&mut env.path_entries, bin_path.clone());
-        }
-        for path in &sdk.bin_paths {
+/// Registry records usable as an active runtime: importable managed TheRock
+/// installs plus system SDK records whose probed root still exists.
+fn runtime_environment_records(registry_dir: &Path) -> Vec<(PathBuf, TheRockFamilyManifest)> {
+    let mut records = read_registry_records(registry_dir);
+    records.retain(|(_, record)| record.is_importable_therock() || record.is_usable_system_sdk());
+    records
+}
+
+fn runtime_environment_from_record(record: &TheRockFamilyManifest) -> RuntimeEnvironment {
+    let mut env = RuntimeEnvironment::default();
+    if record.format.as_deref() == Some("system")
+        && let Some(probe) = record.system_sdk.as_ref()
+    {
+        env.rocm_root = Some(probe.root.clone());
+        for path in &probe.bin_paths {
             push_existing_runtime_path(&mut env.path_entries, path.clone());
         }
-        for path in &sdk.library_paths {
+        for path in &probe.library_paths {
             push_existing_runtime_path(&mut env.library_entries, path.clone());
         }
-        if let Some(root_path) = sdk.root_path.as_ref() {
-            collect_runtime_environment_paths(root_path, &mut env);
+        collect_runtime_environment_paths(&probe.root, &mut env);
+    } else {
+        let sdk = record.rocm_sdk.as_ref();
+        env.rocm_root = sdk
+            .and_then(|sdk| sdk.root_path.clone())
+            .or_else(|| record.install_root.clone());
+
+        if let Some(sdk) = sdk {
+            if let Some(bin_path) = sdk.bin_path.as_ref() {
+                push_existing_runtime_path(&mut env.path_entries, bin_path.clone());
+            }
+            for path in &sdk.bin_paths {
+                push_existing_runtime_path(&mut env.path_entries, path.clone());
+            }
+            for path in &sdk.library_paths {
+                push_existing_runtime_path(&mut env.library_entries, path.clone());
+            }
+            if let Some(root_path) = sdk.root_path.as_ref() {
+                collect_runtime_environment_paths(root_path, &mut env);
+            }
+            for root_path in &sdk.runtime_roots {
+                collect_runtime_environment_paths(root_path, &mut env);
+            }
         }
-        for root_path in &sdk.runtime_roots {
-            collect_runtime_environment_paths(root_path, &mut env);
+        if let Some(install_root) = record.install_root.as_ref() {
+            collect_runtime_environment_paths(install_root, &mut env);
         }
-    }
-    if let Some(install_root) = record.install_root.as_ref() {
-        collect_runtime_environment_paths(install_root, &mut env);
     }
     if runtime_is_linux() {
         push_existing_runtime_path(&mut env.library_entries, PathBuf::from("/usr/lib/wsl/lib"));
@@ -3630,7 +3676,7 @@ fn managed_therock_environment_from_record(
     env
 }
 
-fn collect_runtime_environment_paths(root: &Path, env: &mut ManagedRuntimeEnvironment) {
+fn collect_runtime_environment_paths(root: &Path, env: &mut RuntimeEnvironment) {
     for path in [
         root.join("bin"),
         root.join("lib"),
@@ -3784,6 +3830,12 @@ struct TheRockFamilyManifest {
     install_root: Option<PathBuf>,
     #[serde(default)]
     installed_at_unix_ms: Option<u128>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    system_sdk: Option<SystemSdkProbe>,
+    #[serde(default)]
+    read_only: bool,
 }
 
 impl TheRockFamilyManifest {
@@ -3803,6 +3855,23 @@ impl TheRockFamilyManifest {
                 .runtime_id
                 .as_deref()
                 .is_some_and(|runtime_id| runtime_id.to_ascii_lowercase().starts_with("therock-"))
+    }
+
+    fn is_importable_therock(&self) -> bool {
+        self.looks_like_therock() && self.rocm_sdk.as_ref().is_some_and(|sdk| sdk.import_ok)
+    }
+
+    fn is_usable_system_sdk(&self) -> bool {
+        if !runtime_is_linux() || self.format.as_deref() != Some("system") || !self.read_only {
+            return false;
+        }
+        let (Some(install_root), Some(probe)) =
+            (self.install_root.as_deref(), self.system_sdk.as_ref())
+        else {
+            return false;
+        };
+        runtime_paths_equivalent(install_root, &probe.root)
+            && validate_system_sdk_probe(probe).is_ok()
     }
 }
 
@@ -4063,6 +4132,8 @@ fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
     );
 }
 
+static COMMAND_CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn capture_optional_path_command_with_env(
     program: &Path,
     args: &[&str],
@@ -4070,9 +4141,10 @@ fn capture_optional_path_command_with_env(
     timeout: Duration,
 ) -> Option<String> {
     let output_path = std::env::temp_dir().join(format!(
-        "rocm-cli-command-{}-{}.out",
+        "rocm-cli-command-{}-{}-{}.out",
         std::process::id(),
-        unix_time_millis()
+        unix_time_millis(),
+        COMMAND_CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let output_file = fs::File::create(&output_path).ok()?;
     let mut command = Command::new(program);
@@ -9520,6 +9592,180 @@ Class Name:                Display
         Ok(())
     }
 
+    fn write_system_runtime_record(
+        registry: &Path,
+        name: &str,
+        sdk_root: &Path,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_key": format!("system:{name}"),
+                "runtime_id": format!("system:{name}"),
+                "format": "system",
+                "install_root": sdk_root,
+                "read_only": true,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "system_sdk": {
+                    "root": sdk_root,
+                    "version": "7.0.0",
+                    "bin_paths": [sdk_root.join("bin")],
+                    "library_paths": [sdk_root.join("lib")]
+                }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_runtime_environment_resolves_system_record() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-runtime-env-system");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let sdk_root = root.join("system-rocm");
+        fs::create_dir_all(sdk_root.join("bin"))?;
+        fs::create_dir_all(sdk_root.join("lib"))?;
+        fs::write(sdk_root.join("lib").join("libamdhip64.so"), "")?;
+        write_system_runtime_record(&registry, "sys", &sdk_root, 10)?;
+
+        let config = RocmCliConfig::default();
+        let env = active_runtime_environment(&paths, &config)?.expect("system record resolves");
+        assert_eq!(env.rocm_root.as_deref(), Some(sdk_root.as_path()));
+        assert!(env.path_entries.contains(&sdk_root.join("bin")));
+        assert!(env.library_entries.contains(&sdk_root.join("lib")));
+        fs::remove_file(sdk_root.join("lib").join("libamdhip64.so"))?;
+        assert!(active_runtime_environment(&paths, &config)?.is_none());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_runtime_environment_prefers_active_key_system_record() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-runtime-env-system-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let sdk_root = root.join("system-rocm");
+        fs::create_dir_all(sdk_root.join("bin"))?;
+        fs::create_dir_all(sdk_root.join("lib"))?;
+        fs::write(sdk_root.join("lib").join("libamdhip64.so"), "")?;
+        write_system_runtime_record(&registry, "sys", &sdk_root, 10)?;
+        write_therock_channel_record(&registry, "newer", "nightly", 20)?;
+
+        // The active key points at the older system record, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("system:sys".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let env = active_runtime_environment(&paths, &config)?.expect("system record selected");
+        assert_eq!(env.rocm_root.as_deref(), Some(sdk_root.as_path()));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_runtime_environment_newest_wins_across_mixed_records() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-runtime-env-mixed-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let sdk_root = root.join("system-rocm");
+        fs::create_dir_all(sdk_root.join("bin"))?;
+        fs::create_dir_all(sdk_root.join("lib"))?;
+        fs::write(sdk_root.join("lib").join("libamdhip64.so"), "")?;
+        write_therock_channel_record(&registry, "older", "release", 10)?;
+        write_system_runtime_record(&registry, "sys", &sdk_root, 20)?;
+
+        // No active_runtime_key set: the most recently installed record wins.
+        let config = RocmCliConfig::default();
+        let env = active_runtime_environment(&paths, &config)?.expect("newest record selected");
+        assert_eq!(env.rocm_root.as_deref(), Some(sdk_root.as_path()));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_runtime_environment_ignores_system_record_with_missing_root() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-runtime-env-missing-root");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let therock_root = root.join("therock");
+        fs::create_dir_all(therock_root.join("bin"))?;
+        fs::write(
+            registry.join("therock.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true, "root_path": therock_root }
+            }))?,
+        )?;
+        // Newer system record, but its probed root no longer exists on disk.
+        write_system_runtime_record(&registry, "ghost", &root.join("missing-root"), 20)?;
+
+        let config = RocmCliConfig::default();
+        let env = active_runtime_environment(&paths, &config)?.expect("therock record selected");
+        assert_eq!(env.rocm_root.as_deref(), Some(therock_root.as_path()));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_runtime_environment_preserves_therock_env() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-runtime-env-therock");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let sdk_root = root.join("therock");
+        fs::create_dir_all(sdk_root.join("bin"))?;
+        fs::create_dir_all(sdk_root.join("lib"))?;
+        fs::write(
+            registry.join("therock.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_root.join("bin")
+                }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        let env = active_runtime_environment(&paths, &config)?.expect("therock record resolves");
+        assert_eq!(env.rocm_root.as_deref(), Some(sdk_root.as_path()));
+        assert_eq!(env.path_entries, vec![sdk_root.join("bin")]);
+        assert!(env.library_entries.contains(&sdk_root.join("bin")));
+        assert!(env.library_entries.contains(&sdk_root.join("lib")));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_channel_ignores_system_records() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-channel-mixed");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let sdk_root = root.join("system-rocm");
+        fs::create_dir_all(sdk_root.join("bin"))?;
+        fs::create_dir_all(sdk_root.join("lib"))?;
+        write_therock_channel_record(&registry, "older", "release", 10)?;
+        // Newer system record must stay invisible to channel selection.
+        write_system_runtime_record(&registry, "sys", &sdk_root, 20)?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_channel(&paths, &config)?,
+            Some("release".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     #[test]
     fn examine_render_includes_driver_and_state_counts() {
         let summary = ExamineSummary {
@@ -9565,7 +9811,9 @@ Class Name:                Display
         assert!(rendered.contains("legacy_rocm_status: detected_unmanaged"));
         assert!(rendered.contains("legacy_rocm_paths: C:\\Program Files\\AMD\\ROCm"));
         assert!(
-            rendered.contains("legacy_rocm_guidance: legacy ROCm detected; keep it side-by-side")
+            rendered.contains(
+                "legacy_rocm_guidance: legacy ROCm detected; inspect registered runtimes"
+            )
         );
         assert!(rendered.contains("wsl: false"));
         assert!(rendered.contains("managed_runtimes: 2"));
@@ -9666,9 +9914,12 @@ Class Name:                Display
 
         let rendered = summary.render_text();
 
-        assert!(rendered.contains(
-            "legacy_rocm_guidance: legacy ROCm detected; install a managed TheRock runtime"
-        ));
+        assert!(
+            rendered.contains(
+                "legacy_rocm_guidance: legacy ROCm detected; register the existing install"
+            )
+        );
+        assert!(rendered.contains("rocm runtimes adopt-system"));
         assert!(rendered.contains("rocm install sdk --channel release --format wheel"));
     }
 
@@ -10258,7 +10509,7 @@ Class Name:                Display
     fn featured_catalog_is_curated_but_hidden_stay_resolvable() {
         // Current popular models are featured in the curated list — GGUF for
         // Strix Halo (served by their owner/repo:variant id) and BF16 for MI300X.
-        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
+        for alias in ["ornith", "qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
             let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
             assert!(model_recipe_featured(&recipe), "{alias} should be featured");
         }
@@ -10285,6 +10536,13 @@ Class Name:                Display
         assert_eq!(qwen.dtype, "gguf");
         assert_eq!(qwen.device_policy, "gpu_required");
         assert_eq!(qwen.preferred_engines, vec!["lemonade"]);
+
+        let ornith = resolve_builtin_model_recipe("ornith").expect("ornith alias should resolve");
+        assert_eq!(
+            ornith.canonical_model_id,
+            "ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M"
+        );
+        assert_eq!(ornith.preferred_engines, vec!["lemonade"]);
 
         let qwen35 = resolve_builtin_model_recipe("qwen3.5").expect("qwen3.5 alias should resolve");
         assert_eq!(qwen35.canonical_model_id, "Qwen/Qwen3.5-4B");

@@ -17,6 +17,7 @@ use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_
 use tempfile::TempDir;
 
 mod e2e {
+    pub mod agents_steps;
     pub mod artifact_steps;
     pub mod automations_steps;
     pub mod bench_steps;
@@ -41,6 +42,7 @@ mod e2e {
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
+    pub agents: Option<e2e::agents_steps::AgentsState>,
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
@@ -187,6 +189,7 @@ impl Default for E2eWorld {
 
         Self {
             mock: None,
+            agents: None,
             artifact_server: None,
             artifact_marker_path: None,
             endpoint: None,
@@ -220,6 +223,9 @@ impl E2eWorld {
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
             env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+        }
+        if let Some(agents) = &self.agents {
+            env.extend(agents.environment());
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -263,6 +269,9 @@ impl E2eWorld {
     /// must not inherit the host daemon's socket location. Piped scenarios keep
     /// their historical HOME/XDG environment, including GPU/runtime defaults.
     pub fn pty_env(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        if self.agents.is_some() {
+            return Vec::new();
+        }
         let Some(root) = &self.isolated_root else {
             return Vec::new();
         };
@@ -483,6 +492,9 @@ impl Drop for E2eWorld {
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();
+        }
+        if let Some(agents) = self.agents.take() {
+            drop(agents);
         }
         self.artifact_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
@@ -1073,6 +1085,9 @@ async fn main() {
     // unless the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`, keeping the
     // per-PR / on-demand GPU run fast.
     let include_nightly = std::env::var_os("E2E_INCLUDE_NIGHTLY").is_some_and(|v| v == "1");
+    // Real third-party harnesses are an explicit opt-in even on the nightly GPU
+    // lane. This keeps normal CI independent of Claude Code/Codex installation.
+    let include_real_agents = std::env::var_os("E2E_INCLUDE_REAL_AGENTS").is_some_and(|v| v == "1");
     // Expensive, OS-mutating `@lifecycle` scenarios (packaging + real installer +
     // install/uninstall) are skipped unless the caller opts in via
     // `E2E_INCLUDE_LIFECYCLE`, so the default `cargo xtask e2e` stays fast.
@@ -1082,6 +1097,9 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // Focused agent-harness runs stay inside this custom filter so the same
+    // capability, nightly, real-agent, ID, and expectation gates still apply.
+    let only_agents = std::env::var_os("E2E_ONLY_AGENTS").is_some_and(|v| v == "1");
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
     // per-engine canary covers them on the PR fast path); set by ci.yml on the
     // `merge_group` event.
@@ -1152,9 +1170,13 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
-            move |_feature, _rule, scenario| {
+            move |feature, _rule, scenario| {
+                let agents_feature = feature
+                    .tags
+                    .iter()
+                    .any(|tag| tag.trim_start_matches('@') == "agents");
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
-                let expectation = resolve(
+                let mut expectation = resolve(
                     &decl,
                     cap,
                     matrix,
@@ -1162,7 +1184,17 @@ async fn main() {
                     include_lifecycle,
                     include_merge_queue,
                 );
+                let needs_real_agents = scenario
+                    .tags
+                    .iter()
+                    .any(|tag| tag.trim_start_matches('@') == "real-agents");
+                if needs_real_agents && !include_real_agents {
+                    expectation = Expectation::Skip {
+                        reason: "real agent harnesses were not explicitly enabled".to_string(),
+                    };
+                }
                 let run = (!only_lifecycle || decl.lifecycle)
+                    && (!only_agents || agents_feature)
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();

@@ -1054,8 +1054,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
-            found.is_empty(),
-            "an empty directory is not an install, but {found:?} was returned"
+            found.iter().all(|install| install.path != empty),
+            "an empty directory is not an install"
         );
     }
 

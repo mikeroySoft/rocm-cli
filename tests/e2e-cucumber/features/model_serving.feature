@@ -186,3 +186,8 @@ Feature: Model serving
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
+
+  @id:model-list-ornith
+  Scenario: 17 - Ornith is listed as an available model
+    When the user lists recommended models
+    Then Ornith appears in the model list

@@ -476,7 +476,7 @@ fn build_host(t_s: f64, seed: &mut u64) -> SystemMetrics {
     let mut per_core: Vec<f32> = Vec::with_capacity(HOST_CORES);
     for i in 0..HOST_CORES {
         // Each core's load is the aggregate ± a per-core offset so the
-        // CoreBars widget shows visible variation across cores.
+        // per-core history grid shows visible variation across cores.
         let off = osc(t_s, 7.0 + (i as f64 % 11.0), i as f64 * 0.7, 0.0, 18.0);
         let v = (jitter(seed) - 0.5)
             .mul_add(6.0, agg + off)
@@ -488,6 +488,7 @@ fn build_host(t_s: f64, seed: &mut u64) -> SystemMetrics {
         (MEMORY_TOTAL_MB as f64 * 0.42 * 0.02f64.mul_add((t_s / 31.0).sin(), 1.0)) as u64;
 
     SystemMetrics {
+        cpu_model: "AMD EPYC 9654 96-Core Processor".into(),
         cpu_overall_pct: agg,
         cpu_per_core_pct: per_core,
         memory_used_mb: mem_used,

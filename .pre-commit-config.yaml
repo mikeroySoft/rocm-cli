@@ -21,9 +21,9 @@
 
 default_install_hook_types: [pre-commit, pre-push]
 
-# Vendored sources are checked into third_party/ and must not be reformatted or
-# linted by our hooks.
-exclude: '^third_party/'
+# Vendored sources are checked into third_party/ and .agents/skills/ and must
+# not be reformatted or linted by our hooks.
+exclude: '^(third_party/|\.agents/)'
 
 repos:
   # Fast, zero-setup hygiene hooks implemented natively by prek (no clone, no venv).
