@@ -2419,7 +2419,10 @@ fn run_agents_with_file_limit(world: &mut E2eWorld, args: &[&str]) {
         run_agents_command(world, args, &[], &launcher);
     }
     #[cfg(not(unix))]
-    panic!("bounded write fixture requires Unix");
+    {
+        let _ = (world, args);
+        panic!("bounded write fixture requires Unix");
+    }
 }
 
 fn assert_exact_line(contents: &str, expected: &str, label: &str) {
