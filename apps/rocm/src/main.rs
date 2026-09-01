@@ -409,13 +409,14 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         #[command(subcommand)]
         target: InstallTarget,
     },
-    /// Check installed ROCm runtimes for a newer package and optionally install it.
+    /// Check for updates across ROCm runtimes, the CLI, engines, and model recipes;
+    /// optionally install runtime updates.
     ///
-    /// Without --apply or --dry-run, only reports whether an update is available.
-    /// Pass --dry-run to preview what --apply would do, --apply to install it, and
-    /// add --activate to make the new install the default afterward.
+    /// Without --apply or --dry-run, reports each update surface's status. Pass --dry-run
+    /// to preview what --apply would do; --apply installs runtime updates only. Add
+    /// --activate to make the new install the default afterward.
     ///
-    /// This does not update the rocm CLI itself. To upgrade the CLI, re-run the installer
+    /// --apply does not update the rocm CLI itself. To upgrade the CLI, re-run the installer
     /// (install.sh or install.ps1) from the README.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
@@ -12219,8 +12220,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// `rocm update` reads as a self-update but only updates installed ROCm
-    /// runtimes; the help must say so and name the CLI upgrade path.
+    /// `rocm update` reads as a self-update, but `--apply` only installs ROCm
+    /// runtime updates; the help must say so and name the CLI upgrade path.
     #[test]
     fn update_help_names_runtime_only_scope_and_cli_upgrade_path() {
         let help = Cli::command()
@@ -12229,7 +12230,7 @@ pub(crate) mod tests {
             .render_long_help()
             .to_string();
         assert!(
-            help.contains("does not update the rocm CLI"),
+            help.contains("--apply does not update the rocm CLI"),
             "`rocm update --help` must state the CLI is excluded:\n{help}"
         );
         assert!(
