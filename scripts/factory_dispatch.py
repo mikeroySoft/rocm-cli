@@ -27,7 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def origin_repo() -> str:
     url = subprocess.run(
         ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     return url.rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
 
@@ -57,7 +59,9 @@ def log(msg: str) -> None:
     print(f"[dispatch] {msg}", flush=True)
 
 
-def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run(
+    cmd: list[str], cwd: Path | None = None, check: bool = True
+) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
 
 
@@ -93,7 +97,10 @@ def issue_is_open(number: int) -> bool:
 def open_blockers(number: int, body: str) -> list[int]:
     blockers: set[int] = set()
     # GitHub issue-dependency API; 404 means the feature/edges are absent.
-    proc = run(["gh", "api", f"repos/{REPO}/issues/{number}/dependencies/blocked_by"], check=False)
+    proc = run(
+        ["gh", "api", f"repos/{REPO}/issues/{number}/dependencies/blocked_by"],
+        check=False,
+    )
     if proc.returncode == 0:
         for dep in json.loads(proc.stdout):
             if dep.get("state", "").lower() == "open":
@@ -108,11 +115,20 @@ def open_blockers(number: int, body: str) -> list[int]:
 
 
 def frontier() -> list[dict]:
-    issues = gh_json([
-        "issue", "list", "--repo", REPO, "--state", "open",
-        "--label", "ready-for-agent",
-        "--json", "number,title,body,labels,assignees",
-    ])
+    issues = gh_json(
+        [
+            "issue",
+            "list",
+            "--repo",
+            REPO,
+            "--state",
+            "open",
+            "--label",
+            "ready-for-agent",
+            "--json",
+            "number,title,body,labels,assignees",
+        ]
+    )
     ready = []
     for issue in issues:
         n = issue["number"]
@@ -128,8 +144,9 @@ def frontier() -> list[dict]:
 
 
 def build_prompt(n: int, extra: str = "") -> str:
-    issue = gh_json(["issue", "view", str(n), "--repo", REPO,
-                     "--json", "title,body,comments"])
+    issue = gh_json(
+        ["issue", "view", str(n), "--repo", REPO, "--json", "title,body,comments"]
+    )
     parts = [f"# Issue #{n}: {issue['title']}", "", issue.get("body") or "(no body)"]
     for c in issue.get("comments") or []:
         author = (c.get("author") or {}).get("login", "unknown")
@@ -142,14 +159,25 @@ def build_prompt(n: int, extra: str = "") -> str:
 
 def worker_cmd(labels: set[str], promptfile: Path, wt: Path) -> list[str]:
     if "chore" in labels:
-        return ["droid", "exec", "-f", str(promptfile), "--auto", "medium", "--cwd", str(wt)]
+        return [
+            "droid",
+            "exec",
+            "-f",
+            str(promptfile),
+            "--auto",
+            "medium",
+            "--cwd",
+            str(wt),
+        ]
     return ["omp", "-p", "--cwd", str(wt), f"@{promptfile}"]
 
 
 def run_worker(cmd: list[str], wt: Path, logfile: Path) -> int:
     log(f"worker: {' '.join(cmd)} -> {logfile}")
     with logfile.open("a") as out:
-        return subprocess.run(cmd, cwd=wt, stdout=out, stderr=subprocess.STDOUT).returncode
+        return subprocess.run(
+            cmd, cwd=wt, stdout=out, stderr=subprocess.STDOUT
+        ).returncode
 
 
 def ensure_worktree(n: int) -> Path:
@@ -158,7 +186,10 @@ def ensure_worktree(n: int) -> Path:
         return wt
     run(["git", "fetch", "origin"], cwd=ROOT)
     branch = f"agent/{n}"
-    exists = run(["git", "rev-parse", "--verify", branch], cwd=ROOT, check=False).returncode == 0
+    exists = (
+        run(["git", "rev-parse", "--verify", branch], cwd=ROOT, check=False).returncode
+        == 0
+    )
     if exists:
         run(["git", "worktree", "add", str(wt), branch], cwd=ROOT)
     else:
@@ -167,9 +198,20 @@ def ensure_worktree(n: int) -> Path:
 
 
 def commit_leftovers(wt: Path, n: int, title: str) -> None:
-    run(["git", "add", "-A", "--", ".",
-         ":(exclude).factory-prompt.md", ":(exclude).lock",
-         ":(exclude).factory"], cwd=wt, check=False)
+    run(
+        [
+            "git",
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude).factory-prompt.md",
+            ":(exclude).lock",
+            ":(exclude).factory",
+        ],
+        cwd=wt,
+        check=False,
+    )
     staged = run(["git", "diff", "--cached", "--quiet"], cwd=wt, check=False)
     if staged.returncode != 0:
         run(["git", "commit", "-s", "-m", f"agent/{n}: {title}"], cwd=wt)
@@ -181,9 +223,11 @@ def run_gate(wt: Path, n: int) -> tuple[bool, str]:
     # GPU serialization is the gate's job: agent_gate.py flocks the GPU lock
     # itself. Locking here too deadlocks the gate subprocess (seen in run #7).
     proc = subprocess.run(
-        [sys.executable, str(GATE), "--base", "origin/main",
-         "--report", report_rel],
-        cwd=wt, capture_output=True, text=True)
+        [sys.executable, str(GATE), "--base", "origin/main", "--report", report_rel],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+    )
     report = wt / report_rel
     text = report.read_text() if report.exists() else proc.stdout + proc.stderr
     return proc.returncode == 0, text
@@ -191,9 +235,23 @@ def run_gate(wt: Path, n: int) -> tuple[bool, str]:
 
 def escalate(n: int, reason: str, log_path: Path | None) -> None:
     log(f"#{n}: escalating to human ({reason})")
-    run(["gh", "issue", "edit", str(n), "--repo", REPO,
-         "--remove-assignee", "@me", "--remove-label", "ready-for-agent",
-         "--add-label", "ready-for-human"], check=False)
+    run(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(n),
+            "--repo",
+            REPO,
+            "--remove-assignee",
+            "@me",
+            "--remove-label",
+            "ready-for-agent",
+            "--add-label",
+            "ready-for-human",
+        ],
+        check=False,
+    )
     body = f"Factory dispatcher escalating: {reason}."
     if log_path:
         body += f"\n\nWorker logs: `{log_path}`"
@@ -216,7 +274,9 @@ def review(wt: Path, n: int, gate_report: str) -> tuple[str, str]:
         f"Output findings as markdown. End with exactly one line: "
         f"`VERDICT: APPROVE` or `VERDICT: REVISE`."
     )
-    proc = subprocess.run(["codex", "exec", prompt], cwd=wt, capture_output=True, text=True)
+    proc = subprocess.run(
+        ["codex", "exec", prompt], cwd=wt, capture_output=True, text=True
+    )
     findings = proc.stdout.strip() or proc.stderr.strip()
     m = re.search(r"VERDICT:\s*(APPROVE|REVISE)", findings)
     verdict = m.group(1) if m else "REVISE"
@@ -225,26 +285,58 @@ def review(wt: Path, n: int, gate_report: str) -> tuple[str, str]:
 
 def push_and_pr(wt: Path, n: int, title: str, gate_report: str) -> None:
     run(["git", "push", "-u", "origin", f"agent/{n}"], cwd=wt)
-    existing = gh_json(["pr", "list", "--repo", REPO, "--head", f"agent/{n}",
-                        "--json", "number"])
+    existing = gh_json(
+        ["pr", "list", "--repo", REPO, "--head", f"agent/{n}", "--json", "number"]
+    )
     if existing:
         log(f"#{n}: PR already exists (#{existing[0]['number']})")
         return
     body_file = FACTORY / f"pr-body-{n}.md"
     body_file.write_text(f"Closes #{n}\n\n## Gate report\n\n{gate_report}\n")
-    run(["gh", "pr", "create", "--repo", REPO, "--head", f"agent/{n}",
-         "--title", f"agent/{n}: {title}", "--body-file", str(body_file)])
+    run(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            REPO,
+            "--head",
+            f"agent/{n}",
+            "--title",
+            f"agent/{n}: {title}",
+            "--body-file",
+            str(body_file),
+        ]
+    )
 
 
 def pr_comment(n: int, text: str) -> None:
     body_file = FACTORY / f"review-{n}.md"
     body_file.write_text(text + "\n")
-    run(["gh", "pr", "comment", f"agent/{n}", "--repo", REPO,
-         "--body-file", str(body_file)], check=False)
+    run(
+        [
+            "gh",
+            "pr",
+            "comment",
+            f"agent/{n}",
+            "--repo",
+            REPO,
+            "--body-file",
+            str(body_file),
+        ],
+        check=False,
+    )
 
 
-def worker_round(n: int, wt: Path, labels: set[str], title: str, extra: str,
-                 attempt: int, deadline: float) -> tuple[bool, str, Path]:
+def worker_round(
+    n: int,
+    wt: Path,
+    labels: set[str],
+    title: str,
+    extra: str,
+    attempt: int,
+    deadline: float,
+) -> tuple[bool, str, Path]:
     """One worker + gate cycle. Returns (gate_ok, report, logfile)."""
     promptfile = wt / ".factory-prompt.md"
     promptfile.write_text(build_prompt(n, extra))
@@ -259,7 +351,7 @@ def worker_round(n: int, wt: Path, labels: set[str], title: str, extra: str,
 
 def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
     n, title = issue["number"], issue["title"]
-    labels = {l["name"] for l in issue.get("labels", [])}
+    labels = {label["name"] for label in issue.get("labels", [])}
     wt = FACTORY / f"wt-{n}"
     worker = "droid" if "chore" in labels else "omp"
 
@@ -267,8 +359,10 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         log(f"#{n}: skipped (in flight, lock held on {wt / '.lock'})")
         return
     if dry_run:
-        log(f"#{n}: would claim (assign @me), create worktree {wt} on branch agent/{n}, "
-            f"run {worker} worker, gate, push, open PR, codex-review")
+        log(
+            f"#{n}: would claim (assign @me), create worktree {wt} on branch agent/{n}, "
+            f"run {worker} worker, gate, push, open PR, codex-review"
+        )
         return
 
     deadline = time.monotonic() + budget_min * 60
@@ -288,7 +382,9 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         # Attempts 1..MAX_ATTEMPTS: worker + gate, feeding the failed report back.
         extra, logfile, report = "", None, ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            ok, report, logfile = worker_round(n, wt, labels, title, extra, attempt, deadline)
+            ok, report, logfile = worker_round(
+                n, wt, labels, title, extra, attempt, deadline
+            )
             if ok:
                 break
             if time.monotonic() > deadline:
@@ -296,7 +392,9 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
                 return
             extra = f"## Previous gate report (attempt {attempt} failed)\n\n{report}"
         else:
-            escalate(n, f"gate failed {MAX_ATTEMPTS} times; worktree kept at {wt}", logfile)
+            escalate(
+                n, f"gate failed {MAX_ATTEMPTS} times; worktree kept at {wt}", logfile
+            )
             return
 
         push_and_pr(wt, n, title, report)
@@ -308,12 +406,20 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
 
         # One review bounce.
         if time.monotonic() > deadline:
-            escalate(n, f"wall-clock budget ({budget_min} min) exceeded before bounce", logfile)
+            escalate(
+                n,
+                f"wall-clock budget ({budget_min} min) exceeded before bounce",
+                logfile,
+            )
             return
         extra = f"## Reviewer findings (address these)\n\n{findings}"
-        ok, report, logfile = worker_round(n, wt, labels, title, extra, MAX_ATTEMPTS + 1, deadline)
+        ok, report, logfile = worker_round(
+            n, wt, labels, title, extra, MAX_ATTEMPTS + 1, deadline
+        )
         if not ok:
-            escalate(n, f"gate failed after review bounce; worktree kept at {wt}", logfile)
+            escalate(
+                n, f"gate failed after review bounce; worktree kept at {wt}", logfile
+            )
             return
         run(["git", "push", "origin", f"agent/{n}"], cwd=wt)
         verdict, findings = review(wt, n, report)
@@ -328,20 +434,36 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="AI-factory dispatcher (one pass, stateless)")
+    parser = argparse.ArgumentParser(
+        description="AI-factory dispatcher (one pass, stateless)"
+    )
     parser.add_argument("--ticket", type=int, help="process exactly this open issue")
-    parser.add_argument("--budget-min", type=int, default=90,
-                        help="per-ticket wall-clock budget in minutes (default 90)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="print planned actions; no side effects")
+    parser.add_argument(
+        "--budget-min",
+        type=int,
+        default=90,
+        help="per-ticket wall-clock budget in minutes (default 90)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print planned actions; no side effects"
+    )
     args = parser.parse_args()
 
     if args.ticket:
         if not issue_is_open(args.ticket):
             log(f"#{args.ticket}: not open, nothing to do")
             return 1
-        issue = gh_json(["issue", "view", str(args.ticket), "--repo", REPO,
-                         "--json", "number,title,body,labels,assignees"])
+        issue = gh_json(
+            [
+                "issue",
+                "view",
+                str(args.ticket),
+                "--repo",
+                REPO,
+                "--json",
+                "number,title,body,labels,assignees",
+            ]
+        )
         process_ticket(issue, args.budget_min, args.dry_run)
         return 0
 
