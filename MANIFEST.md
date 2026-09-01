@@ -116,6 +116,7 @@ repository.
 | core-foundation | 0.9.4 | MIT OR Apache-2.0 |
 | core-foundation | 0.10.1 | MIT OR Apache-2.0 |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 |
+| countme | 3.0.1 | MIT OR Apache-2.0 |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
 | critical-section | 1.2.0 | MIT OR Apache-2.0 |
@@ -202,6 +203,7 @@ repository.
 | globset | 0.4.18 | Unlicense OR MIT |
 | globwalk | 0.9.1 | MIT |
 | h2 | 0.4.15 | MIT |
+| hashbrown | 0.14.5 | MIT OR Apache-2.0 |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
@@ -251,6 +253,7 @@ repository.
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 |
+| jsonc-parser | 0.33.1 | MIT |
 | junit-report | 0.9.0 | MIT |
 | kasuari | 0.4.12 | MIT OR Apache-2.0 |
 | keyring-core | 1.0.0 | MIT OR Apache-2.0 |
@@ -378,10 +381,12 @@ repository.
 | reqwest | 0.13.4 | MIT OR Apache-2.0 |
 | rig-core | 0.38.1 | MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
+| rowan | 0.16.1 | MIT OR Apache-2.0 |
 | rpassword | 7.5.4 | Apache-2.0 |
 | rsa | 0.9.10 | MIT OR Apache-2.0 |
 | rtoolbox | 0.0.5 | Apache-2.0 |
 | rustc-demangle | 0.1.27 | MIT/Apache-2.0 |
+| rustc-hash | 1.1.0 | Apache-2.0/MIT |
 | rustc-hash | 2.1.2 | Apache-2.0 OR MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
@@ -464,6 +469,7 @@ repository.
 | terminfo | 0.9.0 | WTFPL |
 | termios | 0.3.3 | MIT |
 | termwiz | 0.23.3 | MIT |
+| text-size | 1.1.1 | MIT OR Apache-2.0 |
 | textwrap | 0.16.2 | MIT |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 |
 | thiserror | 2.0.18 | MIT OR Apache-2.0 |
@@ -594,6 +600,7 @@ repository.
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | writeable | 0.6.3 | Unicode-3.0 |
 | xattr | 1.6.1 | MIT OR Apache-2.0 |
+| yaml-edit | 0.2.3 | Apache-2.0 |
 | yoke | 0.8.3 | Unicode-3.0 |
 | yoke-derive | 0.8.2 | Unicode-3.0 |
 | zbus | 5.16.0 | MIT |
