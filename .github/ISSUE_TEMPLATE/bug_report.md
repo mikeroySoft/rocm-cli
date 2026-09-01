@@ -23,6 +23,12 @@ Describe what should happen instead
 **Steps to reproduce**
 Commands, flags, or a minimal example that reproduces the issue
 
+**Acceptance criteria**
+Observable outcome that proves the bug is fixed
+
+**Verification**
+Exact command(s) that demonstrate the fix
+
 **Possible solution**
 Optional: if you have a suggested fix or workaround
 
