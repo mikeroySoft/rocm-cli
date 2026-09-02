@@ -175,6 +175,20 @@ enum Signal {
     Kill,
 }
 
+/// Which PIDs a verified termination actually signalled, alongside its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminationReport {
+    pub outcome: TerminationOutcome,
+    /// Every process that received a termination signal (root and, under
+    /// [`KillScope::Tree`], each snapshotted descendant). Empty when nothing was
+    /// signalled.
+    pub signaled: Vec<u32>,
+    /// The subset of `signaled` still verified alive when the stop escalated
+    /// from `SIGTERM` to `SIGKILL`. Always empty on Windows, which has no
+    /// graceful signal to escalate from.
+    pub forced: Vec<u32>,
+}
+
 /// Terminate the process recorded in `id`, verifying identity first and
 /// reporting the outcome truthfully.
 ///
@@ -194,10 +208,26 @@ pub fn terminate_verified(
     grace: Duration,
     force: bool,
 ) -> TerminationOutcome {
+    terminate_verified_report(id, scope, grace, force).outcome
+}
+
+/// [`terminate_verified`] that also reports which PIDs were signalled.
+#[must_use]
+pub fn terminate_verified_report(
+    id: &ProcessIdentity,
+    scope: KillScope,
+    grace: Duration,
+    force: bool,
+) -> TerminationReport {
+    let unsignaled = |outcome| TerminationReport {
+        outcome,
+        signaled: Vec::new(),
+        forced: Vec::new(),
+    };
     match identity_state(id) {
-        IdentityState::Gone => return TerminationOutcome::AlreadyGone,
-        IdentityState::Recycled => return TerminationOutcome::IdentityMismatch,
-        IdentityState::Indeterminate => return TerminationOutcome::Unverified,
+        IdentityState::Gone => return unsignaled(TerminationOutcome::AlreadyGone),
+        IdentityState::Recycled => return unsignaled(TerminationOutcome::IdentityMismatch),
+        IdentityState::Indeterminate => return unsignaled(TerminationOutcome::Unverified),
         IdentityState::Matches => {}
     }
 
@@ -214,6 +244,12 @@ pub fn terminate_verified(
     } else {
         vec![*id]
     };
+    let signaled: Vec<u32> = members.iter().map(|member| member.pid).collect();
+    let report = |outcome, forced| TerminationReport {
+        outcome,
+        signaled: signaled.clone(),
+        forced,
+    };
 
     // Unix can request a graceful shutdown before escalating. Windows has no
     // equivalent signal: do not burn the grace period on a no-op. A non-forced
@@ -223,16 +259,16 @@ pub fn terminate_verified(
     {
         send_signal(id.pid, Signal::Term, tree);
         if wait_for_all_exit(&members, grace) {
-            return TerminationOutcome::Graceful;
+            return report(TerminationOutcome::Graceful, Vec::new());
         }
 
         if !force {
-            return TerminationOutcome::TimedOut;
+            return report(TerminationOutcome::TimedOut, Vec::new());
         }
     }
     #[cfg(windows)]
     if !force {
-        return TerminationOutcome::TimedOut;
+        return unsignaled(TerminationOutcome::TimedOut);
     }
 
     // Bounded escalation to a forced kill.
@@ -243,6 +279,17 @@ pub fn terminate_verified(
     // member with no recorded start-time cannot be distinguished from a process
     // that recycled its PID during the wait, so its PID is never targeted
     // directly (it is left to time out rather than risk signalling a stranger).
+    //
+    // Only Unix escalates: on Windows this kill *is* the first signal.
+    let forced: Vec<u32> = if cfg!(windows) {
+        Vec::new()
+    } else {
+        members
+            .iter()
+            .filter(|member| matches!(identity_state(member), IdentityState::Matches))
+            .map(|member| member.pid)
+            .collect()
+    };
     if matches!(identity_state(id), IdentityState::Matches) {
         send_signal(id.pid, Signal::Kill, tree);
     }
@@ -255,9 +302,9 @@ pub fn terminate_verified(
         }
     }
     if wait_for_all_exit(&members, grace) {
-        TerminationOutcome::Forced
+        report(TerminationOutcome::Forced, forced)
     } else {
-        TerminationOutcome::TimedOut
+        report(TerminationOutcome::TimedOut, forced)
     }
 }
 

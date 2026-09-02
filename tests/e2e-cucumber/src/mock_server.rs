@@ -702,6 +702,10 @@ pub struct ServiceRecordOptions {
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    /// Kernel start-time identity paired with each PID; `None` leaves the
+    /// record's identity unverifiable (legacy best-effort), as most fixtures want.
+    pub supervisor_start_ticks: Option<u64>,
+    pub engine_start_ticks: Option<u64>,
 }
 
 impl Default for ServiceRecordOptions {
@@ -711,6 +715,8 @@ impl Default for ServiceRecordOptions {
             startup_phase: None,
             supervisor_pid: 0,
             engine_pid: None,
+            supervisor_start_ticks: None,
+            engine_start_ticks: None,
         }
     }
 }
@@ -766,6 +772,8 @@ pub fn write_service_record_named_with(
         "startup_phase": options.startup_phase,
         "supervisor_pid": options.supervisor_pid,
         "engine_pid": options.engine_pid,
+        "supervisor_start_ticks": options.supervisor_start_ticks,
+        "engine_start_ticks": options.engine_start_ticks,
         "runtime_id": null,
         "env_id": null,
         "device_policy": null,

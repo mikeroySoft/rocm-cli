@@ -2700,8 +2700,11 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
     let mut force_signaled_pids = Vec::new();
     let mut skipped_pids = Vec::new();
     // Each PID is paired with its own start-time token so a recycled PID is
-    // never signalled; de-duplicate on PID, preferring a known token.
+    // never signalled. A PID shared by both roles is merged when their tokens
+    // agree (or one is unknown); conflicting tokens mean at least one recorded
+    // identity mismatches, so that PID is refused outright.
     let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+    let mut all_stopped = true;
     for (pid, ticks) in [
         (record.engine_pid, record.engine_start_ticks),
         (Some(record.supervisor_pid), record.supervisor_start_ticks),
@@ -2713,45 +2716,65 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
             if !skipped_pids.contains(&pid) {
                 skipped_pids.push(pid);
             }
-        } else if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
-            if existing.1.is_none() {
-                existing.1 = ticks;
+        } else if let Some(index) = entries.iter().position(|(seen, _)| *seen == pid) {
+            match (entries[index].1, ticks) {
+                (None, ticks) => entries[index].1 = ticks,
+                (Some(seen), Some(ticks)) if seen != ticks => {
+                    entries.remove(index);
+                    skipped_pids.push(pid);
+                    all_stopped = false;
+                }
+                _ => {}
             }
-        } else {
+        } else if !skipped_pids.contains(&pid) {
             entries.push((pid, ticks));
         }
     }
     for (pid, ticks) in entries {
         let identity = rocm_core::ProcessIdentity::new(pid, ticks);
-        let outcome = rocm_core::terminate_verified(
+        let report = rocm_core::terminate_verified_report(
             &identity,
             rocm_core::KillScope::Tree,
             MANAGED_STOP_GRACE,
             true,
         );
-        match outcome {
-            rocm_core::TerminationOutcome::Graceful | rocm_core::TerminationOutcome::TimedOut => {
-                signaled_pids.push(pid);
-            }
-            rocm_core::TerminationOutcome::Forced => {
-                signaled_pids.push(pid);
-                force_signaled_pids.push(pid);
-            }
-            rocm_core::TerminationOutcome::AlreadyGone
-            | rocm_core::TerminationOutcome::IdentityMismatch
-            | rocm_core::TerminationOutcome::Unverified => skipped_pids.push(pid),
+        if !report.outcome.stopped() {
+            all_stopped = false;
         }
+        // The engine tree is normally a subtree of the supervisor's, so a PID
+        // already signalled via one root is neither re-listed nor "skipped".
+        if report.signaled.is_empty() && !signaled_pids.contains(&pid) {
+            skipped_pids.push(pid);
+        }
+        for pid in report.signaled {
+            if !signaled_pids.contains(&pid) {
+                signaled_pids.push(pid);
+            }
+        }
+        force_signaled_pids.extend(report.forced);
     }
-    record.status = "stopped".to_owned();
+    // Only claim "stopped" when every recorded process is confirmed gone;
+    // otherwise record that a stop was asked for and leave the status for the
+    // liveness refresh to reconcile once the process actually dies.
+    if all_stopped {
+        record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = None;
+    } else {
+        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
+    }
     record.write()?;
     // Best-effort and idempotent: a missing key file is not an error, so this
-    // is safe to call unconditionally on every stop (including loopback
-    // services that never had a key, and repeated stops of an already-stopped
-    // service). Leaving the 0600 key file behind after stop would strand a
-    // plaintext secret on disk for a service that no longer exists.
-    let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
-        paths, service_id,
-    ));
+    // is safe to call on every confirmed stop (including loopback services that
+    // never had a key, and repeated stops of an already-stopped service).
+    // Leaving the 0600 key file behind after stop would strand a plaintext
+    // secret on disk for a service that no longer exists. Gated on
+    // `all_stopped`: an unconfirmed stop may have left the engine alive and
+    // still enforcing the key.
+    if all_stopped {
+        let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+            paths, service_id,
+        ));
+    }
     Ok(json!({
         "service": record,
         "signaled_pids": signaled_pids,
@@ -8322,6 +8345,160 @@ mod tests {
         assert_eq!(
             value.get("signaled_pids").and_then(Value::as_array),
             Some(&vec![json!(pid)])
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_managed_service_refuses_conflicting_identities_for_shared_pid() -> Result<()> {
+        // Engine and supervisor record the same PID with different tokens: at
+        // least one identity mismatches, so the PID must not be signalled and
+        // the stop must not be reported as confirmed.
+        let (root, paths) = temp_app_paths("stop-conflicting-identity");
+        paths.ensure()?;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let service_id = "svc-conflict";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        record.engine_start_ticks = Some(real);
+        record.supervisor_start_ticks = Some(real.wrapping_add(1));
+        record.status = "ready".to_owned();
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir()).expect("services dir");
+        fs::write(&key_path, "secret-key").expect("key file");
+        let written = record.write();
+
+        let result = written.and_then(|()| stop_managed_service(&paths, service_id));
+        let alive = rocm_core::process_is_running(pid);
+        let key_retained = key_path.exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert!(
+            alive,
+            "a PID with conflicting identities must not be signalled"
+        );
+        assert_eq!(
+            value.get("signaled_pids").and_then(Value::as_array),
+            Some(&Vec::new())
+        );
+        assert_eq!(
+            value.get("skipped_pids").and_then(Value::as_array),
+            Some(&vec![json!(pid)])
+        );
+        assert_eq!(
+            value.pointer("/service/status").and_then(Value::as_str),
+            Some("ready"),
+            "an unconfirmed stop must not be persisted as stopped"
+        );
+        assert!(
+            value
+                .pointer("/service/stop_requested_unix_ms")
+                .is_some_and(|v| !v.is_null())
+        );
+        assert!(
+            key_retained,
+            "endpoint key must survive an unconfirmed stop"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_managed_service_reports_signaled_descendants() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-descendants");
+        paths.ensure()?;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 60; sleep 60"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        // Wait for the shell to fork its `sleep`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let descendant = loop {
+            let output = ProcessCommand::new("ps")
+                .args(["-o", "pid=", "--ppid", &pid.to_string()])
+                .output()
+                .expect("ps");
+            if let Some(found) = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .find_map(|token| token.parse::<u32>().ok())
+            {
+                break found;
+            }
+            assert!(std::time::Instant::now() < deadline, "child never forked");
+            thread::sleep(Duration::from_millis(20));
+        };
+        let service_id = "svc-descendants";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(descendant);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.engine_start_ticks = rocm_core::process_start_ticks(descendant);
+        record.status = "ready".to_owned();
+        let written = record.write();
+
+        let result = written.and_then(|()| stop_managed_service(&paths, service_id));
+        let _ = child.wait();
+        let alive = rocm_core::process_is_running(pid) || rocm_core::process_is_running(descendant);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert!(!alive, "the whole tree must be terminated");
+        let mut signaled = value
+            .get("signaled_pids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        signaled.sort_by_key(Value::as_u64);
+        let mut expected = vec![json!(pid), json!(descendant)];
+        expected.sort_by_key(Value::as_u64);
+        assert_eq!(signaled, expected, "root and descendant are both reported");
+        assert_eq!(
+            value.get("force_signaled_pids").and_then(Value::as_array),
+            Some(&Vec::new()),
+            "a graceful stop escalates nothing"
+        );
+        assert_eq!(
+            value.get("skipped_pids").and_then(Value::as_array),
+            Some(&Vec::new())
+        );
+        assert_eq!(
+            value.pointer("/service/status").and_then(Value::as_str),
+            Some("stopped")
         );
         Ok(())
     }

@@ -50,8 +50,8 @@ use examine::extract_rocm_version;
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, TerminationReport,
+    identity_state, process_start_ticks, terminate_verified, terminate_verified_report,
 };
 use runtime::env_path_override;
 pub use runtime::{
