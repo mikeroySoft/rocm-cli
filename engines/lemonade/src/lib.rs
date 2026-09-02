@@ -10,12 +10,12 @@ use rocm_core::{
     prepend_runtime_paths, require_nonempty, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::{
-    DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
-    EndpointResponse, EngineCapabilities, EngineDeviceAvailability, EngineMethod, EngineRecipeHint,
-    EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, HealthcheckRequest,
-    HealthcheckResponse, InstallRequest, InstallResponse, LaunchRequest, LaunchResponse,
-    LogsRequest, LogsResponse, ResolveModelRequest, ResolveModelResponse, StopRequest,
-    StopResponse,
+    DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
+    ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest, EndpointResponse, EngineCapabilities,
+    EngineDeviceAvailability, EngineMethod, EngineRecipeHint, EngineRequestEnvelope,
+    EngineResponseEnvelope, GpuSelection, HealthcheckRequest, HealthcheckResponse, InstallRequest,
+    InstallResponse, LaunchRequest, LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest,
+    ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,7 +48,6 @@ const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTAL
 /// `DIRECT_LLAMA_SERVER_BACKENDS`). When only CPU is usable, selection returns
 /// `None` and the caller fails with actionable guidance.
 const LLAMACPP_BACKEND_PRIORITY: [&str; 2] = ["rocm", "vulkan"];
-const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -1014,15 +1013,17 @@ fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
 fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let files = service_files(&request.service_id)?;
-    let limit = request.tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES);
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
-        recent_lines: if files.log_path.is_file() {
-            tail_lines(&files.log_path, limit)?
-        } else {
-            Vec::new()
-        },
+        recent_lines: recent_log_lines(&files.log_path, request.tail_lines)?,
     })
+}
+
+fn recent_log_lines(log_path: &Path, tail_lines: Option<usize>) -> Result<Vec<String>> {
+    if !log_path.is_file() {
+        return Ok(Vec::new());
+    }
+    self::tail_lines(log_path, tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES))
 }
 
 fn stop_service(request: StopRequest) -> Result<StopResponse> {
@@ -4037,6 +4038,19 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_tail_lines_uses_protocol_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("svc.log");
+        let content = "old\n".repeat(199) + "newest\n";
+        std::fs::write(&log, content).unwrap();
+
+        let lines = recent_log_lines(&log, None).unwrap();
+        assert_eq!(lines.len(), rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES);
+        assert_eq!(lines.last().unwrap(), "newest");
+        assert_eq!(recent_log_lines(&log, Some(5)).unwrap().len(), 5);
+    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {
