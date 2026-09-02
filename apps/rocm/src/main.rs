@@ -18427,6 +18427,11 @@ mod tests {
             .expect("update subcommand")
             .render_long_help()
             .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("--apply installs runtime updates only"),
+            "`rocm update --help` must state --apply installs runtime updates only:\n{help}"
+        );
         assert!(
             help.contains("--apply does not update the rocm CLI"),
             "`rocm update --help` must state the CLI is excluded:\n{help}"

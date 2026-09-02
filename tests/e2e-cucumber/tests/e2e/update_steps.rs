@@ -75,12 +75,14 @@ async fn update_help(world: &mut E2eWorld) {
 #[then("the help states --apply does not update the CLI and points to the installer")]
 async fn help_names_cli_upgrade_path(world: &mut E2eWorld) {
     let out = ok_output(world);
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
+        "--apply installs runtime updates only",
         "--apply does not update the rocm CLI",
         "re-run the installer",
     ] {
         assert!(
-            out.contains(needle),
+            flat.contains(needle),
             "expected {needle:?} in `rocm update --help`:\n{out}"
         );
     }
