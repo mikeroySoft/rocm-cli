@@ -558,7 +558,8 @@ package.
 
 #### Updates
 
-`update` checks for a newer ROCm package.
+`update` reports update status across surfaces. `--apply` installs TheRock
+runtime updates only; it never updates the `rocm` binary.
 
 | Flag | Description |
 | --- | --- |
