@@ -5,8 +5,12 @@
 
 """Stateless AI-factory dispatcher.
 
-One pass per invocation: pick claimable issues (or --ticket N), run a worker
-agent in a git worktree, gate, open a PR, review with codex, bounce once.
+One pass per invocation: first the merge stage lands at most one approved,
+green, up-to-date factory PR on main; then pick claimable issues (or
+--ticket N), run a worker agent in a git worktree, gate, open a PR, review
+with codex, bounce once. A codex APPROVE marks the PR `factory-approved`;
+the merge stage requires that label, green GitHub CI, and a head containing
+the current main tip before squash-merging.
 All state lives in GitHub and .factory/ on disk.
 """
 
@@ -335,6 +339,206 @@ def pr_comment(n: int, text: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Merge stage: consume the review verdict + CI and land approved PRs on main.
+# ---------------------------------------------------------------------------
+
+FACTORY_APPROVED = "factory-approved"
+
+
+def approve_pr(n: int) -> None:
+    """Record the codex APPROVE durably on the PR (merge-stage precondition)."""
+    run(
+        [
+            "gh",
+            "pr",
+            "edit",
+            f"agent/{n}",
+            "--repo",
+            REPO,
+            "--add-label",
+            FACTORY_APPROVED,
+        ],
+        check=False,
+    )
+
+
+def signoff() -> str:
+    name = run(["git", "config", "user.name"], cwd=ROOT).stdout.strip()
+    email = run(["git", "config", "user.email"], cwd=ROOT).stdout.strip()
+    return f"Signed-off-by: {name} <{email}>"
+
+
+def pr_checks(pr: int) -> list[dict]:
+    """gh check rows [{name, bucket}]; bucket: pass/fail/pending/skipping/cancel.
+
+    `gh pr checks` exits nonzero for failing or pending checks; that is data
+    here, not an error. Unparseable output returns [] which the caller treats
+    as "no passing CI" and refuses to merge — fail closed.
+    """
+    proc = run(
+        ["gh", "pr", "checks", str(pr), "--repo", REPO, "--json", "name,bucket"],
+        check=False,
+    )
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return []
+
+
+def refresh_pr_branch(n: int, pr: int) -> None:
+    """Rebase agent/n onto current main, re-gate on this host, force-push.
+
+    Re-earns the evidence against what the PR will actually merge into; CI
+    re-runs on the push and the merge happens on a later pass.
+    """
+    wt = ensure_worktree(n)
+    run(["git", "fetch", "origin"], cwd=wt)
+    if run(["git", "rebase", "origin/main"], cwd=wt, check=False).returncode != 0:
+        run(["git", "rebase", "--abort"], cwd=wt, check=False)
+        escalate(n, f"PR #{pr}: rebase onto moved main conflicts; worktree {wt}", None)
+        return
+    ok, report = run_gate(wt, n)
+    if not ok:
+        pr_comment(n, f"Gate failed after rebase onto current main:\n\n{report}")
+        escalate(n, f"PR #{pr}: gate failed after rebase onto moved main", None)
+        return
+    run(["git", "push", "--force-with-lease", "origin", f"agent/{n}"], cwd=wt)
+    log(f"#{n}: PR #{pr} rebased onto current main and re-gated; merge next pass")
+
+
+def cleanup_after_merge(n: int) -> None:
+    wt = FACTORY / f"wt-{n}"
+    if wt.is_dir():
+        run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, check=False)
+    run(["git", "branch", "-D", f"agent/{n}"], cwd=ROOT, check=False)
+    ticket_lock(n).unlink(missing_ok=True)
+
+
+def merge_pass(dry_run: bool) -> None:
+    """Land at most ONE approved, green, up-to-date factory PR per pass.
+
+    A merge requires all four independently produced pieces of evidence:
+    host gate PASS (in the PR body), codex APPROVE (`factory-approved`
+    label), green GitHub CI, and a head that already contains the current
+    main tip — so the evidence was produced against what it merges into.
+    One merge per pass is the merge queue: landing one PR makes the others
+    stale, and the refresh path re-earns their evidence before they land.
+    A human blocks any merge by requesting changes on the PR.
+    """
+    # Serialize against concurrent dispatcher runs (timer + manual): two merge
+    # stages rebasing the same worktree would corrupt it. Skip, don't wait —
+    # the next timer pass retries.
+    (FACTORY / "locks").mkdir(parents=True, exist_ok=True)
+    lock_fd = (FACTORY / "locks" / "merge.lock").open("w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("merge stage: skipped (another dispatcher holds the merge lock)")
+        lock_fd.close()
+        return
+    try:
+        merge_pass_locked(dry_run)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def merge_pass_locked(dry_run: bool) -> None:
+    prs = gh_json(
+        [
+            "pr",
+            "list",
+            "--repo",
+            REPO,
+            "--state",
+            "open",
+            "--json",
+            "number,headRefName,isDraft,labels,reviewDecision",
+        ]
+    )
+    candidates = []
+    for pr in prs:
+        m = re.fullmatch(r"agent/(\d+)", pr["headRefName"])
+        if not m or pr["isDraft"]:
+            continue
+        if FACTORY_APPROVED not in {label["name"] for label in pr["labels"]}:
+            continue
+        if pr["reviewDecision"] == "CHANGES_REQUESTED":
+            log(f"PR #{pr['number']}: human requested changes; not merging")
+            continue
+        candidates.append((pr["number"], int(m.group(1))))
+    for pr_num, n in sorted(candidates):
+        checks = pr_checks(pr_num)
+        buckets: dict[str, int] = {}
+        for c in checks:
+            buckets[c["bucket"]] = buckets.get(c["bucket"], 0) + 1
+        failed = [c["name"] for c in checks if c["bucket"] in ("fail", "cancel")]
+        if failed:
+            # A finished red run is deterministic evidence, not a flake guess.
+            # Pull the PR from candidacy so this escalates once, not every pass;
+            # a human (or a re-run pipeline) re-adds the label after the fix.
+            if dry_run:
+                log(f"PR #{pr_num}: would escalate (CI failed: {', '.join(failed)})")
+                continue
+            run(
+                [
+                    "gh",
+                    "pr",
+                    "edit",
+                    str(pr_num),
+                    "--repo",
+                    REPO,
+                    "--remove-label",
+                    FACTORY_APPROVED,
+                ],
+                check=False,
+            )
+            escalate(
+                n,
+                f"PR #{pr_num}: CI failed ({', '.join(failed)}); "
+                f"`{FACTORY_APPROVED}` label removed",
+                None,
+            )
+            continue
+        if buckets.get("pending"):
+            log(f"PR #{pr_num}: CI pending {buckets}; waiting")
+            continue
+        if not buckets.get("pass"):
+            log(f"PR #{pr_num}: no passing CI checks reported; refusing to merge")
+            continue
+        behind = gh_json(["api", f"repos/{REPO}/compare/main...agent/{n}"])[
+            "behind_by"
+        ]
+        if dry_run:
+            log(f"PR #{pr_num}: would {'refresh (behind main)' if behind else 'merge'}")
+            return
+        if behind:
+            refresh_pr_branch(n, pr_num)
+            return
+        title = gh_json(
+            ["pr", "view", str(pr_num), "--repo", REPO, "--json", "title"]
+        )["title"]
+        run(
+            [
+                "gh",
+                "pr",
+                "merge",
+                str(pr_num),
+                "--repo",
+                REPO,
+                "--squash",
+                "--subject",
+                title,
+                "--body",
+                f"Closes #{n}\n\n{signoff()}",
+            ]
+        )
+        log(f"PR #{pr_num}: merged into main (ticket #{n})")
+        cleanup_after_merge(n)
+        return
+
+
 def worker_round(
     n: int,
     wt: Path,
@@ -356,7 +560,9 @@ def worker_round(
     return ok, report, logfile
 
 
-def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
+def process_ticket(
+    issue: dict, budget_min: int, dry_run: bool, forced: bool = False
+) -> None:
     n, title = issue["number"], issue["title"]
     labels = {label["name"] for label in issue.get("labels", [])}
     wt = FACTORY / f"wt-{n}"
@@ -373,10 +579,6 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         return
 
     deadline = time.monotonic() + budget_min * 60
-    run(["gh", "issue", "edit", str(n), "--repo", REPO, "--add-assignee", "@me"])
-    wt = ensure_worktree(n)
-    LOGS.mkdir(parents=True, exist_ok=True)
-
     lock_fd = ticket_lock(n).open("w")  # held for the life of this pipeline
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -384,6 +586,26 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         log(f"#{n}: skipped (lost lock race)")
         lock_fd.close()
         return
+
+    # Strong re-read before claiming: `issue list` is search-backed and lags
+    # label/assignee edits, which re-claimed #16/#17 seconds after escalation.
+    if not forced:
+        fresh = gh_json(
+            ["issue", "view", str(n), "--repo", REPO, "--json", "state,labels,assignees"]
+        )
+        if (
+            fresh["state"].upper() != "OPEN"
+            or fresh["assignees"]
+            or "ready-for-agent" not in {label["name"] for label in fresh["labels"]}
+        ):
+            log(f"#{n}: skipped (state changed since frontier query)")
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            return
+
+    run(["gh", "issue", "edit", str(n), "--repo", REPO, "--add-assignee", "@me"])
+    wt = ensure_worktree(n)
+    LOGS.mkdir(parents=True, exist_ok=True)
 
     try:
         # Attempts 1..MAX_ATTEMPTS: worker + gate, feeding the failed report back.
@@ -408,6 +630,7 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         verdict, findings = review(wt, n, report)
         pr_comment(n, findings)
         if verdict == "APPROVE":
+            approve_pr(n)
             log(f"#{n}: done (approved)")
             return
 
@@ -434,6 +657,7 @@ def process_ticket(issue: dict, budget_min: int, dry_run: bool) -> None:
         if verdict != "APPROVE":
             escalate(n, "second REVISE verdict from reviewer", logfile)
         else:
+            approve_pr(n)
             log(f"#{n}: done (approved after bounce)")
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -471,9 +695,10 @@ def main() -> int:
                 "number,title,body,labels,assignees",
             ]
         )
-        process_ticket(issue, args.budget_min, args.dry_run)
+        process_ticket(issue, args.budget_min, args.dry_run, forced=True)
         return 0
 
+    merge_pass(args.dry_run)
     active = active_ticket_count()
     capacity = MAX_ACTIVE - active
     log(f"active tickets: {active}, capacity: {max(capacity, 0)}")
