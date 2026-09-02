@@ -6,11 +6,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_PORT, normalize_runtime_path_for_host, runtime_is_linux};
 use rocm_engine_protocol::{
-    DetectRequest, DetectResponse, DevicePolicy, EndpointRequest, EndpointResponse,
-    EngineCapabilities, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,
-    HealthcheckRequest, HealthcheckResponse, InstallRequest, InstallResponse, LaunchRequest,
-    LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest, ResolveModelResponse,
-    StopRequest, StopResponse,
+    DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy, EndpointRequest,
+    EndpointResponse, EngineCapabilities, EngineMethod, EngineRequestEnvelope,
+    EngineResponseEnvelope, HealthcheckRequest, HealthcheckResponse, InstallRequest,
+    InstallResponse, LaunchRequest, LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest,
+    ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ pub(crate) const LLAMACPP_RECIPE: &str = "llamacpp";
 pub(crate) const ROCM_BACKEND_NAME: &str = "rocm";
 #[cfg(feature = "e2e-test-hooks")]
 const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
-const DEFAULT_LOG_TAIL_LINES: usize = 200;
+
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -828,6 +828,14 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_default_matches_protocol_contract() {
+        assert_eq!(
+            DEFAULT_LOG_TAIL_LINES,
+            rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES
+        );
+    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {
