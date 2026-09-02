@@ -1013,15 +1013,17 @@ fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
 fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let files = service_files(&request.service_id)?;
-    let limit = request.tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES);
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
-        recent_lines: if files.log_path.is_file() {
-            tail_lines(&files.log_path, limit)?
-        } else {
-            Vec::new()
-        },
+        recent_lines: recent_log_lines(&files.log_path, request.tail_lines)?,
     })
+}
+
+fn recent_log_lines(log_path: &Path, tail_lines: Option<usize>) -> Result<Vec<String>> {
+    if !log_path.is_file() {
+        return Ok(Vec::new());
+    }
+    self::tail_lines(log_path, tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES))
 }
 
 fn stop_service(request: StopRequest) -> Result<StopResponse> {
@@ -4038,11 +4040,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_tail_default_matches_protocol_contract() {
-        assert_eq!(
-            DEFAULT_LOG_TAIL_LINES,
-            rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES
-        );
+    fn omitted_tail_lines_uses_protocol_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("svc.log");
+        let content = "old\n".repeat(199) + "newest\n";
+        std::fs::write(&log, content).unwrap();
+
+        let lines = recent_log_lines(&log, None).unwrap();
+        assert_eq!(lines.len(), rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES);
+        assert_eq!(lines.last().unwrap(), "newest");
+        assert_eq!(recent_log_lines(&log, Some(5)).unwrap().len(), 5);
     }
 
     #[test]
