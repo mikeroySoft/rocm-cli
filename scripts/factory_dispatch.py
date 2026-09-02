@@ -507,18 +507,16 @@ def merge_pass_locked(dry_run: bool) -> None:
         if not buckets.get("pass"):
             log(f"PR #{pr_num}: no passing CI checks reported; refusing to merge")
             continue
-        behind = gh_json(["api", f"repos/{REPO}/compare/main...agent/{n}"])[
-            "behind_by"
-        ]
+        behind = gh_json(["api", f"repos/{REPO}/compare/main...agent/{n}"])["behind_by"]
         if dry_run:
             log(f"PR #{pr_num}: would {'refresh (behind main)' if behind else 'merge'}")
             return
         if behind:
             refresh_pr_branch(n, pr_num)
             return
-        title = gh_json(
-            ["pr", "view", str(pr_num), "--repo", REPO, "--json", "title"]
-        )["title"]
+        title = gh_json(["pr", "view", str(pr_num), "--repo", REPO, "--json", "title"])[
+            "title"
+        ]
         run(
             [
                 "gh",
@@ -591,7 +589,15 @@ def process_ticket(
     # label/assignee edits, which re-claimed #16/#17 seconds after escalation.
     if not forced:
         fresh = gh_json(
-            ["issue", "view", str(n), "--repo", REPO, "--json", "state,labels,assignees"]
+            [
+                "issue",
+                "view",
+                str(n),
+                "--repo",
+                REPO,
+                "--json",
+                "state,labels,assignees",
+            ]
         )
         if (
             fresh["state"].upper() != "OPEN"
