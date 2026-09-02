@@ -35,7 +35,7 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
@@ -2687,43 +2687,61 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
     }
 }
 
+/// How long a managed stop waits for each recorded process to actually exit
+/// after `SIGTERM` before escalating to `SIGKILL`.
+const MANAGED_STOP_GRACE: Duration = Duration::from_millis(750);
+
 fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
     let mut record = load_managed_services(paths)?
         .into_iter()
         .find(|record| record.service_id == service_id)
         .with_context(|| format!("managed service `{service_id}` not found"))?;
     let mut signaled_pids = Vec::new();
+    let mut force_signaled_pids = Vec::new();
     let mut skipped_pids = Vec::new();
-    let mut root_pids = Vec::new();
-    if let Some(engine_pid) = record.engine_pid
-        && engine_pid != 0
-    {
-        if engine_pid == std::process::id() {
-            skipped_pids.push(engine_pid);
-        } else {
-            root_pids.push(engine_pid);
-        }
-    }
-    if record.supervisor_pid != 0
-        && record.supervisor_pid != std::process::id()
-        && Some(record.supervisor_pid) != record.engine_pid
-    {
-        root_pids.push(record.supervisor_pid);
-    }
-    let mut pids_to_signal = descendant_pids_for_roots(&root_pids)?;
-    pids_to_signal.extend(root_pids);
-    let mut seen_pids = HashSet::new();
-    for pid in pids_to_signal {
-        if !seen_pids.insert(pid) {
+    // Each PID is paired with its own start-time token so a recycled PID is
+    // never signalled; de-duplicate on PID, preferring a known token.
+    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+    for (pid, ticks) in [
+        (record.engine_pid, record.engine_start_ticks),
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0) else {
             continue;
-        }
-        if terminate_process(pid)? {
-            signaled_pids.push(pid);
+        };
+        if pid == std::process::id() {
+            if !skipped_pids.contains(&pid) {
+                skipped_pids.push(pid);
+            }
+        } else if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
+            if existing.1.is_none() {
+                existing.1 = ticks;
+            }
         } else {
-            skipped_pids.push(pid);
+            entries.push((pid, ticks));
         }
     }
-    let force_signaled_pids = force_terminate_remaining_processes(&signaled_pids)?;
+    for (pid, ticks) in entries {
+        let identity = rocm_core::ProcessIdentity::new(pid, ticks);
+        let outcome = rocm_core::terminate_verified(
+            &identity,
+            rocm_core::KillScope::Tree,
+            MANAGED_STOP_GRACE,
+            true,
+        );
+        match outcome {
+            rocm_core::TerminationOutcome::Graceful | rocm_core::TerminationOutcome::TimedOut => {
+                signaled_pids.push(pid);
+            }
+            rocm_core::TerminationOutcome::Forced => {
+                signaled_pids.push(pid);
+                force_signaled_pids.push(pid);
+            }
+            rocm_core::TerminationOutcome::AlreadyGone
+            | rocm_core::TerminationOutcome::IdentityMismatch
+            | rocm_core::TerminationOutcome::Unverified => skipped_pids.push(pid),
+        }
+    }
     record.status = "stopped".to_owned();
     record.write()?;
     // Best-effort and idempotent: a missing key file is not an error, so this
@@ -2740,200 +2758,6 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
         "force_signaled_pids": force_signaled_pids,
         "skipped_pids": skipped_pids,
     }))
-}
-
-#[cfg(unix)]
-fn descendant_pids_for_roots(root_pids: &[u32]) -> Result<Vec<u32>> {
-    if root_pids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let output = ProcessCommand::new("ps")
-        .args(["-eo", "pid=,ppid="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to list process tree with ps")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        bail!(
-            "failed to list process tree: {}",
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-    let output = String::from_utf8_lossy(&output.stdout);
-    Ok(descendant_pids_from_ps_output(&output, root_pids))
-}
-
-#[cfg(not(unix))]
-fn descendant_pids_for_roots(_root_pids: &[u32]) -> Result<Vec<u32>> {
-    Ok(Vec::new())
-}
-
-#[cfg(any(unix, test))]
-fn descendant_pids_from_ps_output(output: &str, root_pids: &[u32]) -> Vec<u32> {
-    fn append_descendants(
-        parent: u32,
-        processes: &[(u32, u32)],
-        seen: &mut HashSet<u32>,
-        output: &mut Vec<u32>,
-    ) {
-        for (pid, ppid) in processes {
-            if *ppid != parent || *pid == parent || !seen.insert(*pid) {
-                continue;
-            }
-            append_descendants(*pid, processes, seen, output);
-            output.push(*pid);
-        }
-    }
-
-    let processes = output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let pid = parts.next()?.parse::<u32>().ok()?;
-            let ppid = parts.next()?.parse::<u32>().ok()?;
-            Some((pid, ppid))
-        })
-        .collect::<Vec<_>>();
-    let mut seen = root_pids.iter().copied().collect::<HashSet<_>>();
-    let mut descendants = Vec::new();
-    for root in root_pids {
-        append_descendants(*root, &processes, &mut seen, &mut descendants);
-    }
-    descendants
-}
-
-fn terminate_process(pid: u32) -> Result<bool> {
-    if pid == std::process::id() {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        let output = ProcessCommand::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch kill for pid {pid}"))?;
-        if output.status.success() {
-            Ok(true)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if stderr.contains("No such process") || stdout.contains("No such process") {
-                return Ok(false);
-            }
-            bail!(
-                "failed to signal pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            )
-        }
-    }
-    #[cfg(windows)]
-    {
-        let output = ProcessCommand::new("taskkill")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch taskkill for pid {pid}"))?;
-        if output.status.success() {
-            Ok(true)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if stderr.contains("not found") || stdout.contains("not found") {
-                return Ok(false);
-            }
-            bail!(
-                "failed to stop pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            )
-        }
-    }
-}
-
-#[cfg(unix)]
-fn force_terminate_remaining_processes(pids: &[u32]) -> Result<Vec<u32>> {
-    if pids.is_empty() {
-        return Ok(Vec::new());
-    }
-    thread::sleep(Duration::from_millis(750));
-    let mut force_signaled = Vec::new();
-    for pid in pids {
-        if *pid == std::process::id() || !process_is_running(*pid)? {
-            continue;
-        }
-        let output = ProcessCommand::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch kill -KILL for pid {pid}"))?;
-        if output.status.success() {
-            force_signaled.push(*pid);
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "failed to force stop pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            );
-        }
-    }
-    Ok(force_signaled)
-}
-
-#[cfg(not(unix))]
-fn force_terminate_remaining_processes(_pids: &[u32]) -> Result<Vec<u32>> {
-    Ok(Vec::new())
-}
-
-#[cfg(unix)]
-fn process_is_running(pid: u32) -> Result<bool> {
-    let output = ProcessCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to launch kill -0 for pid {pid}"))?;
-    Ok(output.status.success())
 }
 
 async fn run_daemon(
@@ -8396,25 +8220,110 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn stop_server_process_tree_discovers_descendants_before_parents() {
-        let output = "\
-10 1
-11 10
-12 11
-13 10
-20 1
-21 20
-";
+    fn stop_managed_service_refuses_recycled_pid() -> Result<()> {
+        // A live process whose recorded identity does not match: this is exactly
+        // what a recycled PID looks like. The stop must NOT signal it.
+        let (root, paths) = temp_app_paths("stop-recycled-pid");
+        paths.ensure()?;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let service_id = "svc-recycled";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        record.supervisor_start_ticks = Some(real.wrapping_add(1));
+        record.engine_start_ticks = Some(real.wrapping_add(1));
+        record.status = "ready".to_owned();
+        let written = record.write();
 
+        let result = written.and_then(|()| stop_managed_service(&paths, service_id));
+        let alive = rocm_core::process_is_running(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert!(alive, "the unrelated live process must survive");
         assert_eq!(
-            descendant_pids_from_ps_output(output, &[10]),
-            vec![12, 11, 13]
+            value.get("signaled_pids").and_then(Value::as_array),
+            Some(&Vec::new()),
+            "must not signal a mismatched identity"
         );
         assert_eq!(
-            descendant_pids_from_ps_output(output, &[10, 20]),
-            vec![12, 11, 13, 21]
+            value.get("force_signaled_pids").and_then(Value::as_array),
+            Some(&Vec::new())
         );
+        assert!(
+            value
+                .get("skipped_pids")
+                .and_then(Value::as_array)
+                .is_some_and(|pids| pids.iter().any(|p| p.as_u64() == Some(u64::from(pid))))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_managed_service_terminates_verified_pid() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-verified-pid");
+        paths.ensure()?;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let service_id = "svc-verified";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.engine_start_ticks = record.supervisor_start_ticks;
+        record.status = "ready".to_owned();
+        let written = record.write();
+
+        let result = written.and_then(|()| stop_managed_service(&paths, service_id));
+        // Reap our own child so the liveness check does not observe a zombie.
+        let _ = child.wait();
+        let alive = rocm_core::process_is_running(pid);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert!(!alive, "the verified process must be terminated");
+        assert_eq!(
+            value.get("signaled_pids").and_then(Value::as_array),
+            Some(&vec![json!(pid)])
+        );
+        Ok(())
     }
 
     #[test]
