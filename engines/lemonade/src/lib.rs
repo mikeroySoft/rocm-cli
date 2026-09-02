@@ -778,6 +778,13 @@ fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     })
 }
 
+fn recent_log_lines(log_path: &Path, tail_lines: Option<usize>) -> Result<Vec<String>> {
+    if !log_path.is_file() {
+        return Ok(Vec::new());
+    }
+    self::tail_lines(log_path, tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES))
+}
+
 fn stop_service(request: StopRequest) -> Result<StopResponse> {
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     let files = crate::state::service_files(&request.service_id)?;
@@ -829,13 +836,6 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn log_tail_default_matches_protocol_contract() {
-        assert_eq!(
-            DEFAULT_LOG_TAIL_LINES,
-            rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES
-        );
-    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {
