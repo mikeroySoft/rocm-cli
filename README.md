@@ -261,8 +261,8 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it.
+native package). `update` reports update status across surfaces; pass `--apply`
+to install TheRock runtime updates only (it never updates the `rocm` binary).
 
 ### Runtime management
 
