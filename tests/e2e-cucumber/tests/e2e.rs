@@ -30,6 +30,7 @@ mod e2e {
     pub mod examine_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod rocmd_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
@@ -96,6 +97,9 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Throwaway process a rocmd stop scenario points its service record at.
+    /// Reaped in `Drop` so a refused (recycled-PID) stop never leaks it.
+    pub stop_target: Option<std::process::Child>,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -208,6 +212,7 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            stop_target: None,
         }
     }
 }
@@ -497,6 +502,9 @@ impl Drop for E2eWorld {
             drop(agents);
         }
         self.artifact_server.take();
+        if let Some(mut target) = self.stop_target.take() {
+            e2e::rocmd_steps::teardown(&mut target);
+        }
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
         // engine process (vLLM / llama-server) that outlives this harness — the
         // TempDir drop below removes the on-disk record but never kills those

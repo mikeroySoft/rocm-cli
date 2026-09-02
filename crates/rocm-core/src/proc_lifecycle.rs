@@ -175,6 +175,21 @@ enum Signal {
     Kill,
 }
 
+/// Which PIDs a verified termination actually signalled, alongside its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminationReport {
+    pub outcome: TerminationOutcome,
+    /// Every process a termination signal was confirmed delivered to (root and,
+    /// under [`KillScope::Tree`], each snapshotted descendant). A member whose
+    /// delivery failed is absent; if it is still alive the outcome reflects
+    /// that via the exit wait.
+    pub signaled: Vec<u32>,
+    /// The subset of `signaled` that was confirmed delivered a `SIGKILL` when
+    /// the stop escalated from `SIGTERM`. Always empty on Windows, which has no
+    /// graceful signal to escalate from.
+    pub forced: Vec<u32>,
+}
+
 /// Terminate the process recorded in `id`, verifying identity first and
 /// reporting the outcome truthfully.
 ///
@@ -194,10 +209,26 @@ pub fn terminate_verified(
     grace: Duration,
     force: bool,
 ) -> TerminationOutcome {
+    terminate_verified_report(id, scope, grace, force).outcome
+}
+
+/// [`terminate_verified`] that also reports which PIDs were signalled.
+#[must_use]
+pub fn terminate_verified_report(
+    id: &ProcessIdentity,
+    scope: KillScope,
+    grace: Duration,
+    force: bool,
+) -> TerminationReport {
+    let unsignaled = |outcome| TerminationReport {
+        outcome,
+        signaled: Vec::new(),
+        forced: Vec::new(),
+    };
     match identity_state(id) {
-        IdentityState::Gone => return TerminationOutcome::AlreadyGone,
-        IdentityState::Recycled => return TerminationOutcome::IdentityMismatch,
-        IdentityState::Indeterminate => return TerminationOutcome::Unverified,
+        IdentityState::Gone => return unsignaled(TerminationOutcome::AlreadyGone),
+        IdentityState::Recycled => return unsignaled(TerminationOutcome::IdentityMismatch),
+        IdentityState::Indeterminate => return unsignaled(TerminationOutcome::Unverified),
         IdentityState::Matches => {}
     }
 
@@ -214,51 +245,62 @@ pub fn terminate_verified(
     } else {
         vec![*id]
     };
+    let report = |outcome, signaled, forced| TerminationReport {
+        outcome,
+        signaled,
+        forced,
+    };
 
     // Unix can request a graceful shutdown before escalating. Windows has no
     // equivalent signal: do not burn the grace period on a no-op. A non-forced
     // Windows stop reports TimedOut immediately; a forced stop proceeds directly
     // to the verified kill path below.
     #[cfg(not(windows))]
-    {
-        send_signal(id.pid, Signal::Term, tree);
+    let signaled = {
+        let signaled = signal_matching(&members, Signal::Term);
         if wait_for_all_exit(&members, grace) {
-            return TerminationOutcome::Graceful;
+            return report(TerminationOutcome::Graceful, signaled, Vec::new());
         }
-
         if !force {
-            return TerminationOutcome::TimedOut;
+            return report(TerminationOutcome::TimedOut, signaled, Vec::new());
         }
-    }
+        signaled
+    };
     #[cfg(windows)]
     if !force {
-        return TerminationOutcome::TimedOut;
+        return unsignaled(TerminationOutcome::TimedOut);
     }
 
-    // Bounded escalation to a forced kill.
+    // Bounded escalation to a forced kill, re-verifying each member first: one
+    // with no recorded start-time cannot be distinguished from a process that
+    // recycled its PID during the wait, so its PID is never targeted directly
+    // (it is left to time out rather than risk signalling a stranger).
     //
-    // While the root is still ours, SIGKILL the live tree from it (re-enumerated,
-    // root verified) — the safest way to reach current children. Then catch any
-    // reparented survivor, but only one we can still *positively* re-verify: a
-    // member with no recorded start-time cannot be distinguished from a process
-    // that recycled its PID during the wait, so its PID is never targeted
-    // directly (it is left to time out rather than risk signalling a stranger).
-    if matches!(identity_state(id), IdentityState::Matches) {
-        send_signal(id.pid, Signal::Kill, tree);
-    }
-    for member in &members {
-        if member.pid == id.pid || member.start_ticks.is_none() {
-            continue;
-        }
-        if matches!(identity_state(member), IdentityState::Matches) {
-            send_signal(member.pid, Signal::Kill, false);
-        }
-    }
+    // Only Unix escalates: on Windows this kill *is* the first signal.
+    let verifiable: Vec<ProcessIdentity> = members
+        .iter()
+        .copied()
+        .filter(|member| member.pid == id.pid || member.start_ticks.is_some())
+        .collect();
+    let killed = signal_matching(&verifiable, Signal::Kill);
+    #[cfg(windows)]
+    let (signaled, killed) = (killed, Vec::new());
     if wait_for_all_exit(&members, grace) {
-        TerminationOutcome::Forced
+        report(TerminationOutcome::Forced, signaled, killed)
     } else {
-        TerminationOutcome::TimedOut
+        report(TerminationOutcome::TimedOut, signaled, killed)
     }
+}
+
+/// Signal every member of `members` that still matches its recorded identity,
+/// returning only the PIDs the signal was confirmed delivered to.
+fn signal_matching(members: &[ProcessIdentity], signal: Signal) -> Vec<u32> {
+    members
+        .iter()
+        .filter(|member| matches!(identity_state(member), IdentityState::Matches))
+        .filter(|member| send_signal(member.pid, signal))
+        .map(|member| member.pid)
+        .collect()
 }
 
 /// Poll until every process in `members` has exited, or `grace` elapses.
@@ -283,17 +325,23 @@ fn wait_for_all_exit(members: &[ProcessIdentity], grace: Duration) -> bool {
     }
 }
 
+/// Deliver `signal` to `pid`, reporting only a confirmed delivery.
+///
+/// A process that exited between identity verification and `kill(2)` (`ESRCH`)
+/// is *not* a delivery: it never received the signal, so it must not appear in
+/// [`TerminationReport::signaled`]. The exit wait still accounts for it.
 #[cfg(not(windows))]
-fn send_signal(pid: u32, signal: Signal, tree: bool) -> bool {
+#[allow(unsafe_code)] // libc FFI
+fn send_signal(pid: u32, signal: Signal) -> bool {
     let raw = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    crate::signal_process_scope(pid, raw, tree)
+    unsafe { libc::kill(pid.cast_signed(), raw) == 0 }
 }
 
 #[cfg(windows)]
-fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
+fn send_signal(pid: u32, signal: Signal) -> bool {
     debug_assert!(matches!(signal, Signal::Kill));
     crate::terminate_process(pid).is_ok()
 }
@@ -466,6 +514,18 @@ mod tests {
         assert_eq!(identity_state(&id), IdentityState::Gone);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn send_signal_reports_esrch_as_not_delivered() {
+        // A process that exits between the identity check and kill(2) never
+        // receives the signal; it must not be reported as signalled.
+        let child = spawn(&["sh", "-c", "exit 0"]);
+        let pid = child.id();
+        reap(child);
+        assert!(!send_signal(pid, Signal::Term));
+        assert!(!send_signal(pid, Signal::Kill));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn refuses_to_signal_on_identity_mismatch() {
@@ -605,5 +665,25 @@ mod tests {
             "forced Tree stop must SIGKILL the SIGTERM-ignoring descendant"
         );
         reap(child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undeliverable_signal_is_not_reported_as_signaled() {
+        // PID 1 is live and identity-verifiable but refuses our signals (EPERM),
+        // so a stop must report it neither signalled nor forced, and time out.
+        // As root the kill would land: nothing to prove, and far too dangerous.
+        #[allow(unsafe_code)] // libc FFI
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let id = ProcessIdentity::capture(1);
+        assert_eq!(identity_state(&id), IdentityState::Matches);
+
+        let report =
+            terminate_verified_report(&id, KillScope::Single, Duration::from_millis(50), true);
+        assert_eq!(report.outcome, TerminationOutcome::TimedOut);
+        assert!(report.signaled.is_empty(), "EPERM delivery must not be reported");
+        assert!(report.forced.is_empty());
     }
 }

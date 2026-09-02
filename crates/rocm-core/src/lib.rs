@@ -50,8 +50,8 @@ use examine::extract_rocm_version;
 pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
-    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    IdentityState, KillScope, ProcessIdentity, TerminationOutcome, TerminationReport,
+    identity_state, process_start_ticks, terminate_verified, terminate_verified_report,
 };
 use runtime::env_path_override;
 pub use runtime::{
@@ -1271,30 +1271,6 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
         return Err(error).with_context(|| format!("failed to terminate process {target}"));
     }
     Ok(())
-}
-
-/// Send `signal` to `pid`, optionally extending to its transitive children.
-///
-/// Delivery to a process that has already exited (`ESRCH`) counts as success:
-/// the goal — that process no longer running — is already met. Returns `false`
-/// only when a signal could not be delivered for another reason (for example
-/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`].
-#[cfg(not(windows))]
-#[allow(unsafe_code)] // libc FFI
-pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) -> bool {
-    let targets = if include_tree {
-        collect_process_tree(pid)
-    } else {
-        vec![pid]
-    };
-    let mut delivered = true;
-    for target in targets {
-        let status = unsafe { libc::kill(target.cast_signed(), signal) };
-        if status != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            delivered = false;
-        }
-    }
-    delivered
 }
 
 /// Snapshot `root` plus its transitive descendants as a flat PID list.
