@@ -24,3 +24,14 @@ Feature: Log inspection
     Given recorded command logs containing several lines about a topic
     When the user asks for one service's logs and a search term together
     Then the CLI refuses and explains only one may be used
+
+  # Engine plugins answer a `logs` request over the engine-plugin protocol. An
+  # omitted `tail_lines` must yield the protocol default from every engine; the
+  # Lemonade engine used to shadow it with its own value (#17). Driven through
+  # the hidden `__engine-stdio` entry point of the built-in engines, so this
+  # exercises the same handler an external caller would, with planted logs only.
+  @id:logs-engine-omitted-tail-uses-protocol-default
+  Scenario: 4 - Every engine returns the same number of log lines when no limit is given
+    Given a service log longer than the default tail for each built-in engine
+    When each engine is asked for that service's logs without a line limit
+    Then every engine returns exactly the protocol default number of lines
