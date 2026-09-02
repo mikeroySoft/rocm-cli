@@ -179,12 +179,13 @@ enum Signal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminationReport {
     pub outcome: TerminationOutcome,
-    /// Every process that received a termination signal (root and, under
-    /// [`KillScope::Tree`], each snapshotted descendant). Empty when nothing was
-    /// signalled.
+    /// Every process a termination signal was confirmed delivered to (root and,
+    /// under [`KillScope::Tree`], each snapshotted descendant). A member whose
+    /// delivery failed is absent; if it is still alive the outcome reflects
+    /// that via the exit wait.
     pub signaled: Vec<u32>,
-    /// The subset of `signaled` still verified alive when the stop escalated
-    /// from `SIGTERM` to `SIGKILL`. Always empty on Windows, which has no
+    /// The subset of `signaled` that was confirmed delivered a `SIGKILL` when
+    /// the stop escalated from `SIGTERM`. Always empty on Windows, which has no
     /// graceful signal to escalate from.
     pub forced: Vec<u32>,
 }
@@ -244,10 +245,9 @@ pub fn terminate_verified_report(
     } else {
         vec![*id]
     };
-    let signaled: Vec<u32> = members.iter().map(|member| member.pid).collect();
-    let report = |outcome, forced| TerminationReport {
+    let report = |outcome, signaled, forced| TerminationReport {
         outcome,
-        signaled: signaled.clone(),
+        signaled,
         forced,
     };
 
@@ -256,56 +256,51 @@ pub fn terminate_verified_report(
     // Windows stop reports TimedOut immediately; a forced stop proceeds directly
     // to the verified kill path below.
     #[cfg(not(windows))]
-    {
-        send_signal(id.pid, Signal::Term, tree);
+    let signaled = {
+        let signaled = signal_matching(&members, Signal::Term);
         if wait_for_all_exit(&members, grace) {
-            return report(TerminationOutcome::Graceful, Vec::new());
+            return report(TerminationOutcome::Graceful, signaled, Vec::new());
         }
-
         if !force {
-            return report(TerminationOutcome::TimedOut, Vec::new());
+            return report(TerminationOutcome::TimedOut, signaled, Vec::new());
         }
-    }
+        signaled
+    };
     #[cfg(windows)]
     if !force {
         return unsignaled(TerminationOutcome::TimedOut);
     }
 
-    // Bounded escalation to a forced kill.
-    //
-    // While the root is still ours, SIGKILL the live tree from it (re-enumerated,
-    // root verified) — the safest way to reach current children. Then catch any
-    // reparented survivor, but only one we can still *positively* re-verify: a
-    // member with no recorded start-time cannot be distinguished from a process
-    // that recycled its PID during the wait, so its PID is never targeted
-    // directly (it is left to time out rather than risk signalling a stranger).
+    // Bounded escalation to a forced kill, re-verifying each member first: one
+    // with no recorded start-time cannot be distinguished from a process that
+    // recycled its PID during the wait, so its PID is never targeted directly
+    // (it is left to time out rather than risk signalling a stranger).
     //
     // Only Unix escalates: on Windows this kill *is* the first signal.
-    let forced: Vec<u32> = if cfg!(windows) {
-        Vec::new()
-    } else {
-        members
-            .iter()
-            .filter(|member| matches!(identity_state(member), IdentityState::Matches))
-            .map(|member| member.pid)
-            .collect()
-    };
-    if matches!(identity_state(id), IdentityState::Matches) {
-        send_signal(id.pid, Signal::Kill, tree);
-    }
-    for member in &members {
-        if member.pid == id.pid || member.start_ticks.is_none() {
-            continue;
-        }
-        if matches!(identity_state(member), IdentityState::Matches) {
-            send_signal(member.pid, Signal::Kill, false);
-        }
-    }
+    let verifiable: Vec<ProcessIdentity> = members
+        .iter()
+        .copied()
+        .filter(|member| member.pid == id.pid || member.start_ticks.is_some())
+        .collect();
+    let killed = signal_matching(&verifiable, Signal::Kill);
+    #[cfg(windows)]
+    let (signaled, killed) = (killed, Vec::new());
     if wait_for_all_exit(&members, grace) {
-        report(TerminationOutcome::Forced, forced)
+        report(TerminationOutcome::Forced, signaled, killed)
     } else {
-        report(TerminationOutcome::TimedOut, forced)
+        report(TerminationOutcome::TimedOut, signaled, killed)
     }
+}
+
+/// Signal every member of `members` that still matches its recorded identity,
+/// returning only the PIDs the signal was confirmed delivered to.
+fn signal_matching(members: &[ProcessIdentity], signal: Signal) -> Vec<u32> {
+    members
+        .iter()
+        .filter(|member| matches!(identity_state(member), IdentityState::Matches))
+        .filter(|member| send_signal(member.pid, signal, false))
+        .map(|member| member.pid)
+        .collect()
 }
 
 /// Poll until every process in `members` has exited, or `grace` elapses.
@@ -652,5 +647,25 @@ mod tests {
             "forced Tree stop must SIGKILL the SIGTERM-ignoring descendant"
         );
         reap(child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undeliverable_signal_is_not_reported_as_signaled() {
+        // PID 1 is live and identity-verifiable but refuses our signals (EPERM),
+        // so a stop must report it neither signalled nor forced, and time out.
+        // As root the kill would land: nothing to prove, and far too dangerous.
+        #[allow(unsafe_code)] // libc FFI
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let id = ProcessIdentity::capture(1);
+        assert_eq!(identity_state(&id), IdentityState::Matches);
+
+        let report =
+            terminate_verified_report(&id, KillScope::Single, Duration::from_millis(50), true);
+        assert_eq!(report.outcome, TerminationOutcome::TimedOut);
+        assert!(report.signaled.is_empty(), "EPERM delivery must not be reported");
+        assert!(report.forced.is_empty());
     }
 }

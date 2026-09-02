@@ -2713,6 +2713,8 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
             continue;
         };
         if pid == std::process::id() {
+            // Never signal ourselves; a live, unsignalled PID is unconfirmed.
+            all_stopped = false;
             if !skipped_pids.contains(&pid) {
                 skipped_pids.push(pid);
             }
@@ -8154,7 +8156,7 @@ mod tests {
     fn stop_managed_service_removes_endpoint_key_file() -> Result<()> {
         let (root, paths) = temp_app_paths("stop-removes-endpoint-key");
         paths.ensure()?;
-        let current_pid = std::process::id();
+        let (current_pid, ticks) = exited_process_identity();
         let service_id = "svc-endpoint-key-stop";
         let mut record = ManagedServiceRecord::new(
             &paths,
@@ -8171,6 +8173,8 @@ mod tests {
             None,
         );
         record.engine_pid = Some(current_pid);
+        record.engine_start_ticks = ticks;
+        record.supervisor_start_ticks = ticks;
         record.status = "ready".to_owned();
         record.write()?;
 
@@ -8202,7 +8206,7 @@ mod tests {
     fn stop_managed_service_without_endpoint_key_file_succeeds() -> Result<()> {
         let (root, paths) = temp_app_paths("stop-no-endpoint-key");
         paths.ensure()?;
-        let current_pid = std::process::id();
+        let (current_pid, ticks) = exited_process_identity();
         let service_id = "svc-no-endpoint-key-stop";
         let mut record = ManagedServiceRecord::new(
             &paths,
@@ -8219,6 +8223,8 @@ mod tests {
             None,
         );
         record.engine_pid = Some(current_pid);
+        record.engine_start_ticks = ticks;
+        record.supervisor_start_ticks = ticks;
         record.status = "ready".to_owned();
         record.write()?;
 
@@ -8421,6 +8427,52 @@ mod tests {
             key_retained,
             "endpoint key must survive an unconfirmed stop"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_managed_service_treats_own_pid_as_unconfirmed() -> Result<()> {
+        // rocmd never signals itself, so a record naming its own PID cannot be
+        // confirmed stopped: status and key must both survive.
+        let (root, paths) = temp_app_paths("stop-own-pid");
+        paths.ensure()?;
+        let pid = std::process::id();
+        let service_id = "svc-self";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11436,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
+        fs::create_dir_all(paths.services_dir()).expect("services dir");
+        fs::write(&key_path, "secret-key").expect("key file");
+        let result = record
+            .write()
+            .and_then(|()| stop_managed_service(&paths, service_id));
+        let key_retained = key_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("skipped_pids").and_then(Value::as_array),
+            Some(&vec![json!(pid)])
+        );
+        assert_eq!(
+            value.pointer("/service/status").and_then(Value::as_str),
+            Some("ready"),
+            "a skipped live PID must not be persisted as stopped"
+        );
+        assert!(key_retained, "endpoint key must survive an unconfirmed stop");
         Ok(())
     }
 
@@ -9242,6 +9294,22 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (root, paths)
+    }
+
+    /// A PID plus start-time token for a process that has already exited, so a
+    /// stop can be confirmed without signalling anything live.
+    fn exited_process_identity() -> (u32, Option<u64>) {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit"]).spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .expect("spawn child");
+        let pid = child.id();
+        let ticks = rocm_core::process_start_ticks(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        (pid, ticks)
     }
 
     fn unique_test_root(label: &str) -> PathBuf {
