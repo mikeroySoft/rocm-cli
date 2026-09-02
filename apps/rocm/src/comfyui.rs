@@ -2108,6 +2108,7 @@ mod tests {
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             system_sdk: None,
@@ -2174,6 +2175,7 @@ mod tests {
                 library_paths: vec![sdk_lib.clone()],
                 ..Default::default()
             }),
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             system_sdk: None,
@@ -2271,6 +2273,7 @@ mod tests {
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             system_sdk: None,
