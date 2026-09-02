@@ -12,3 +12,10 @@ Feature: Update report
     When the user checks for updates
     Then the report shows there are no managed runtimes to update
     And it reports each update feed's status, marking unpublished feeds as not configured
+
+  # The command name reads as a self-update. `--apply` only installs runtime
+  # updates; the help must say so and name the installer as the CLI upgrade path.
+  @id:update-help-names-runtime-only-apply-and-cli-upgrade-path
+  Scenario: 2 - The update help explains --apply is runtime-only and how to upgrade the CLI
+    When the user asks for update help
+    Then the help states --apply does not update the CLI and points to the installer
