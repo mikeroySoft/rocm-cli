@@ -293,7 +293,7 @@ first-time setup. Linux and WSL only in this release.
 `rocm update` reports update status for installed TheRock ROCm runtimes plus the
 CLI, engine, and model-recipe feeds. `rocm update --apply` installs runtime
 updates only; it does not update the `rocm` binary itself. To upgrade the CLI,
-re-run the installer from [Installation](#installation).
+re-run the installer from the Installation section.
 
 System runtimes are owned by the OS package manager: implicit `rocm update`
 skips them, while `rocm update --runtime <system-key>` directs you to your
