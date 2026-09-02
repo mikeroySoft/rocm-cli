@@ -8139,7 +8139,9 @@ mod tests {
 
         assert_eq!(value.get("status").and_then(Value::as_str), Some("stopped"));
         assert_eq!(value.get("mutating").and_then(Value::as_bool), Some(true));
-        assert_eq!(reloaded.status, "stopped");
+        // Our own PID is skipped, not confirmed gone: the stop stays pending.
+        assert_eq!(reloaded.status, "ready");
+        assert!(reloaded.stop_requested_unix_ms.is_some());
         assert!(
             value
                 .get("result")
