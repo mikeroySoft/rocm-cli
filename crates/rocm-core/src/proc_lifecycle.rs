@@ -298,7 +298,7 @@ fn signal_matching(members: &[ProcessIdentity], signal: Signal) -> Vec<u32> {
     members
         .iter()
         .filter(|member| matches!(identity_state(member), IdentityState::Matches))
-        .filter(|member| send_signal(member.pid, signal, false))
+        .filter(|member| send_signal(member.pid, signal))
         .map(|member| member.pid)
         .collect()
 }
@@ -325,17 +325,23 @@ fn wait_for_all_exit(members: &[ProcessIdentity], grace: Duration) -> bool {
     }
 }
 
+/// Deliver `signal` to `pid`, reporting only a confirmed delivery.
+///
+/// A process that exited between identity verification and `kill(2)` (`ESRCH`)
+/// is *not* a delivery: it never received the signal, so it must not appear in
+/// [`TerminationReport::signaled`]. The exit wait still accounts for it.
 #[cfg(not(windows))]
-fn send_signal(pid: u32, signal: Signal, tree: bool) -> bool {
+#[allow(unsafe_code)] // libc FFI
+fn send_signal(pid: u32, signal: Signal) -> bool {
     let raw = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    crate::signal_process_scope(pid, raw, tree)
+    unsafe { libc::kill(pid.cast_signed(), raw) == 0 }
 }
 
 #[cfg(windows)]
-fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
+fn send_signal(pid: u32, signal: Signal) -> bool {
     debug_assert!(matches!(signal, Signal::Kill));
     crate::terminate_process(pid).is_ok()
 }
@@ -506,6 +512,18 @@ mod tests {
         let id = ProcessIdentity::capture(child.id());
         reap(child);
         assert_eq!(identity_state(&id), IdentityState::Gone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_signal_reports_esrch_as_not_delivered() {
+        // A process that exits between the identity check and kill(2) never
+        // receives the signal; it must not be reported as signalled.
+        let child = spawn(&["sh", "-c", "exit 0"]);
+        let pid = child.id();
+        reap(child);
+        assert!(!send_signal(pid, Signal::Term));
+        assert!(!send_signal(pid, Signal::Kill));
     }
 
     #[cfg(target_os = "linux")]
