@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 /// Adding a `.feature` file means adding its key here — deliberately explicit,
 /// so a new file can't quietly opt out of the convention.
 const FEATURE_KEYS: &[(&str, &str)] = &[
+    ("agents.feature", "agents"),
     ("artifact_prefetch.feature", "artifact-prefetch"),
     ("automations.feature", "automations"),
     ("bench.feature", "bench"),
