@@ -6,7 +6,7 @@ Feature: Agent harness setup
   # the agents fixture; no developer harness installation or setting is read.
 
   @id:agents-list-supported-harnesses
-  Scenario: 1 - Help explains target selection and listing shows every supported harness
+  Scenario: agents-01 - Help explains target selection and listing shows every supported harness
     Given an isolated agents environment
     And a supported fake Claude harness is installed
     When the user reads agents help and lists supported agent harnesses
@@ -14,7 +14,7 @@ Feature: Agent harness setup
     And every canonical harness and both installation states are listed
 
   @id:agents-inspect-visible-status
-  Scenario: 2 - Inspecting one harness reports its executable and visible configuration
+  Scenario: agents-02 - Inspecting one harness reports its executable and visible configuration
     Given an isolated agents environment
     And a configured fake Aider harness
     And supported fake Pi and OMP harnesses are installed
@@ -24,7 +24,7 @@ Feature: Agent harness setup
     And canonical Pi and OMP status reports their distinct executables and versions
 
   @id:agents-aliases-canonicalized
-  Scenario: 3 - Familiar aliases resolve to canonical harness names
+  Scenario: agents-03 - Familiar aliases resolve to canonical harness names
     Given an isolated agents environment
     And all supported fake agent harnesses are installed
     When the user inspects every documented agent alias
@@ -33,7 +33,7 @@ Feature: Agent harness setup
     And Pi and OMP report no aliases
 
   @id:agents-invalid-name-and-missing-agent
-  Scenario: 4 - Unknown names and actions without an agent are rejected with guidance
+  Scenario: agents-04 - Unknown names and actions without an agent are rejected with guidance
     Given an isolated agents environment
     When the user names an unknown harness and requests setup without a harness
     And the user names plausible Pi and OMP aliases
@@ -41,73 +41,73 @@ Feature: Agent harness setup
     And the alias-free Pi and OMP names are rejected with canonical guidance
 
   @id:agents-target-unique-managed-service
-  Scenario: 5 - A unique ready managed service supplies endpoint and exact model
+  Scenario: agents-05 - A unique ready managed service supplies endpoint and exact model
     Given an isolated agents environment
     And one ready managed agent service
     When the user previews Aider setup without an explicit target
     Then the plan uses the unique managed endpoint and model
 
   @id:agents-target-ambiguous-and-model-filtered
-  Scenario: 6 - Several managed services require a unique model selection
+  Scenario: agents-06 - Several managed services require a unique model selection
     Given an isolated agents environment
     And two ready managed agent services
     When the user previews setup without and then with a model filter
     Then ambiguity is refused and the exact matching service is selected
 
   @id:agents-target-explicit-single-model
-  Scenario: 7 - An explicit unmanaged loopback endpoint supplies its single advertised model
+  Scenario: agents-07 - An explicit unmanaged loopback endpoint supplies its single advertised model
     Given an isolated agents environment
     And an unmanaged agent endpoint advertising one model
     When the user previews setup with only that base URL
     Then the advertised model and normalized endpoint appear in the plan
 
   @id:agents-target-explicit-multiple-models
-  Scenario: 8 - An endpoint advertising several models requires an exact model
+  Scenario: agents-08 - An endpoint advertising several models requires an exact model
     Given an isolated agents environment
     And an unmanaged agent endpoint advertising several models
     When the user previews setup without and then with an advertised model
     Then multiple models are refused until the exact model is supplied
 
   @id:agents-target-default-fallback
-  Scenario: 9 - The ROCm serving default is the fallback when the model is explicit
+  Scenario: agents-09 - The ROCm serving default is the fallback when the model is explicit
     Given an isolated agents environment
     When the user applies offline Aider setup with only an explicit model
     Then the configuration uses the ROCm default loopback endpoint
 
   @id:agents-target-no-running-server
-  Scenario: 10 - No managed server gives deterministic serve guidance instead of starting one
+  Scenario: agents-10 - No managed server gives deterministic serve guidance instead of starting one
     Given an isolated agents environment
     When the user previews setup with no target and no managed server
     Then setup fails with deterministic rocm serve guidance
 
   @id:agents-target-explicit-unreachable
-  Scenario: 11 - An explicit local endpoint with no running server is rejected
+  Scenario: agents-11 - An explicit local endpoint with no running server is rejected
     Given an isolated agents environment
     When the user previews setup against a local endpoint with no server
     Then setup fails and identifies the unreachable local endpoint
 
   @id:agents-target-invalid-urls
-  Scenario: 12 - Unsafe or malformed endpoint URLs are all rejected
+  Scenario: agents-12 - Unsafe or malformed endpoint URLs are all rejected
     Given an isolated agents environment
     When the user previews setup with invalid endpoint forms
     Then every invalid endpoint is rejected before configuration is written
 
   @id:agents-plan-dry-run-and-approval
-  Scenario: 13 - Dry run writes nothing and noninteractive setup requires approval
+  Scenario: agents-13 - Dry run writes nothing and noninteractive setup requires approval
     Given an isolated agents environment
     And a representative Claude configuration
     When the user previews and then attempts unapproved Claude setup
     Then both commands leave the configuration unchanged and explain why
 
   @id:agents-plan-redaction-and-idempotence
-  Scenario: 14 - Plans redact credentials and repeated setup performs no rewrite
+  Scenario: agents-14 - Plans redact credentials and repeated setup performs no rewrite
     Given an isolated agents environment
     And a Claude configuration containing a credential
     When the user previews and applies the same Claude setup twice
     Then the credential is redacted and the second setup is a filesystem no-op
 
   @id:agents-persistence-all-adapters
-  Scenario: 15 - Every adapter safely preserves unrelated global settings
+  Scenario: agents-15 - Every adapter safely preserves unrelated global settings
     Given an isolated agents environment
     And representative global configurations for every harness
     And all supported fake agent harnesses are installed
@@ -116,7 +116,7 @@ Feature: Agent harness setup
 
   @id:agents-write-refuses-symlink
   @requires-os:linux
-  Scenario: 16 - Setup refuses a symlinked configuration
+  Scenario: agents-16 - Setup refuses a symlinked configuration
     Given an isolated agents environment
     And a symlinked Claude configuration
     And a symlinked Pi second configuration
@@ -126,7 +126,7 @@ Feature: Agent harness setup
 
   @id:agents-write-refuses-stale-plan
   @requires-os:linux
-  Scenario: 17 - An edit made during approval invalidates the setup plan
+  Scenario: agents-17 - An edit made during approval invalidates the setup plan
     Given an isolated agents environment
     And a representative Claude configuration
     And representative Pi and OMP configurations
@@ -136,14 +136,14 @@ Feature: Agent harness setup
 
   @id:agents-write-permissions-and-atomicity
   @requires-os:linux
-  Scenario: 18 - Successful setup preserves permissions and leaves no replacement debris
+  Scenario: agents-18 - Successful setup preserves permissions and leaves no replacement debris
     Given an isolated agents environment
     And a restricted Claude configuration
     When the user applies offline Claude setup
     Then its permissions are preserved and the atomic replacement is complete
 
   @id:agents-write-rollback-after-check
-  Scenario: 19 - A failed protocol check restores the original configuration
+  Scenario: agents-19 - A failed protocol check restores the original configuration
     Given an isolated agents environment
     And an endpoint that only lists agent models
     And a representative Claude configuration
@@ -153,7 +153,7 @@ Feature: Agent harness setup
     Then every checked setup fails and restores all original configuration files
 
   @id:agents-write-no-check-retained
-  Scenario: 20 - No-check keeps offline configuration without a protocol request
+  Scenario: agents-20 - No-check keeps offline configuration without a protocol request
     Given an isolated agents environment
     And an endpoint that only lists agent models
     And a representative Claude configuration
@@ -161,7 +161,7 @@ Feature: Agent harness setup
     Then setup is retained without sending a protocol request
 
   @id:agents-version-detected
-  Scenario: 21 - A supported installed version is detected and reported
+  Scenario: agents-21 - A supported installed version is detected and reported
     Given an isolated agents environment
     And a supported fake Claude harness is installed
     And supported fake Pi and OMP harnesses are installed
@@ -170,13 +170,13 @@ Feature: Agent harness setup
     Then all three setup plans report their exact detected version source
 
   @id:agents-version-override-without-install
-  Scenario: 22 - Explicit versions permit deterministic setup before installation while preserving managed policy
+  Scenario: agents-22 - Explicit versions permit deterministic setup before installation while preserving managed policy
     Given an isolated agents environment
     When the user configures uninstalled harnesses by explicit version and retries in managed modes
     Then every override is visible direct setup succeeds and known managed modes are refused
 
   @id:agents-version-unsupported
-  Scenario: 23 - Unsupported versions remain inspectable but cannot mutate settings
+  Scenario: agents-23 - Unsupported versions remain inspectable but cannot mutate settings
     Given an isolated agents environment
     And an unsupported fake Claude harness is installed
     And unsupported fake Pi and OMP harnesses are installed
@@ -185,7 +185,7 @@ Feature: Agent harness setup
     Then all unsupported versions remain inspectable and refuse mutation
 
   @id:agents-protocol-chat-completions
-  Scenario: 24 - Chat adapters check the Chat Completions route with the exact model
+  Scenario: agents-24 - Chat adapters check the Chat Completions route with the exact model
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     And all supported fake agent harnesses are installed
@@ -193,34 +193,34 @@ Feature: Agent harness setup
     Then every check reaches v1 chat completions with the exact model
 
   @id:agents-protocol-responses
-  Scenario: 25 - Codex checks the Responses route with the exact model
+  Scenario: agents-25 - Codex checks the Responses route with the exact model
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     When checked Codex setup is applied
     Then the check reaches v1 responses with the exact model
 
   @id:agents-protocol-anthropic-messages
-  Scenario: 26 - Claude checks the Anthropic Messages route with the exact model
+  Scenario: agents-26 - Claude checks the Anthropic Messages route with the exact model
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     When checked Claude setup is applied
     Then the check reaches v1 messages with the exact model
 
   @id:agents-test-all-fake-harnesses
-  Scenario: 27 - Every isolated fake harness reads the nonce without exposing the caller workspace
+  Scenario: agents-27 - Every isolated fake harness reads the nonce without exposing the caller workspace
     Given an isolated agents environment
     And all supported fake agent harnesses are installed
     When the user configures and tests every fake harness
     Then every fake process proves safe arguments caller isolation nonce integrity and disposable workspace state
 
   @id:agents-test-failure-categories
-  Scenario: 28 - Harness timeout exit failure and missing nonce are distinguished
+  Scenario: agents-28 - Harness timeout exit failure and missing nonce are distinguished
     Given an isolated agents environment
     When fake Claude tests time out exit nonzero and omit the nonce
     Then each harness failure has its concise category
 
   @id:agents-test-setup-combinations
-  Scenario: 29 - Setup-test and no-check-test keep their literal behavior
+  Scenario: agents-29 - Setup-test and no-check-test keep their literal behavior
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     And a supported fake Claude harness is installed
@@ -228,7 +228,7 @@ Feature: Agent harness setup
     Then the first checks the protocol and both invoke the isolated harness
 
   @id:agents-project-override-warning
-  Scenario: 30 - A project override is warned about but never modified
+  Scenario: agents-30 - A project override is warned about but never modified
     Given an isolated agents environment
     And an Aider project override
     And Pi and OMP project and overlay overrides
@@ -237,13 +237,13 @@ Feature: Agent harness setup
     Then all global setups warn about higher-precedence project and overlay files without changing them
 
   @id:agents-invalid-flag-combinations
-  Scenario: 31 - Invalid setup flag combinations are rejected before mutation
+  Scenario: agents-31 - Invalid setup flag combinations are rejected before mutation
     Given an isolated agents environment
     When the user requests invalid agents flag combinations
     Then every invalid flag combination fails without creating a harness config
 
   @id:agents-multifile-plan-idempotence
-  Scenario: 32 - Pi updates both user files while OMP registers models without changing defaults
+  Scenario: agents-32 - Pi updates both user files while OMP registers models without changing defaults
     Given an isolated agents environment
     And representative Pi and OMP configurations
     When the user previews and applies the same Pi and OMP setup twice
@@ -251,27 +251,27 @@ Feature: Agent harness setup
 
   @id:agents-multifile-partial-rollback
   @requires-os:linux
-  Scenario: 33 - A second-file write failure restores the first Pi file without replacement debris
+  Scenario: agents-33 - A second-file write failure restores the first Pi file without replacement debris
     Given an isolated agents environment
     And a Pi second configuration larger than the bounded writer
     When Pi setup hits a bounded second-file write failure
     Then the first Pi file is rolled back and the oversized second file is unchanged
 
   @id:agents-omp-config-root-and-profiles
-  Scenario: 34 - OMP resolves relative config roots and normalized profile precedence under home
+  Scenario: agents-34 - OMP resolves relative config roots and normalized profile precedence under home
     Given an isolated agents environment
     When the user inspects OMP with a relative config directory and normalized profiles
     Then the relative OMP root and normalized profile precedence select exact files
 
   @id:agents-omp-legacy-models-refused
-  Scenario: 35 - OMP refuses setup over an unmigrated legacy registry without changing it
+  Scenario: agents-35 - OMP refuses setup over an unmigrated legacy registry without changing it
     Given an isolated agents environment
     And a legacy OMP models.json without a YAML registry
     When the user attempts offline OMP setup with the legacy registry
     Then OMP setup refuses migration and preserves the legacy registry
 
   @id:agents-omp-default-declined
-  Scenario: Interactive OMP setup can retain the existing default after registration
+  Scenario: agents-36 - Interactive OMP setup can retain the existing default after registration
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     And representative Pi and OMP configurations
@@ -280,7 +280,7 @@ Feature: Agent harness setup
     Then OMP setup and test use the registered model without changing the existing default
 
   @id:agents-omp-default-accepted
-  Scenario: Interactive OMP setup can select the registered model as the default
+  Scenario: agents-37 - Interactive OMP setup can select the registered model as the default
     Given an isolated agents environment
     And a protocol-complete agent endpoint
     And representative Pi and OMP configurations
@@ -292,7 +292,7 @@ Feature: Agent harness setup
   # E2E_INCLUDE_NIGHTLY=1 E2E_INCLUDE_REAL_AGENTS=1. Default CI never requires
   # Claude Code or Codex to be installed.
   @id:agents-real-vllm-claude-codex @requires-gpu @requires-engine:vllm @requires-os:linux @nightly @real-agents
-  Scenario: 36 - Real Claude Code and Codex pass setup protocol and nonce tests through vLLM
+  Scenario: agents-38 - Real Claude Code and Codex pass setup protocol and nonce tests through vLLM
     Given a managed runtime is active
     And a model is being served on GPU
     And an isolated environment with real Claude Code and Codex
