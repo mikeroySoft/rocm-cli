@@ -124,3 +124,13 @@ Feature: Interactive dashboard
     Then the launcher shows the model serving
     When the user quits the launcher
     Then the launcher exits successfully
+
+  @id:dash-warning-details @requires-os:linux
+  Scenario: dash-11 - A user opens warning details from the header
+    When the user opens a dashboard replay containing a warning
+    Then the warning indicator is displayed
+    When the user clicks the warning indicator
+    Then the warning details are displayed
+    When the user closes the warning details
+    And the user quits the dashboard
+    Then the dashboard exits successfully

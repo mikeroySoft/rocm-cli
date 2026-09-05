@@ -79,6 +79,21 @@ pub fn draw_scrollable_lines(
     f.render_widget(p, inner);
 }
 
+/// Render warning messages captured when the header badge was clicked.
+pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
+    let popup = centered_rect(70, 60, 100, 24, area);
+    let lines = warnings
+        .iter()
+        .map(|warning| {
+            Line::from(Span::styled(
+                warning.as_str(),
+                Style::default().fg(theme.warn),
+            ))
+        })
+        .collect();
+    draw_scrollable_lines(f, popup, "Warnings · Esc/Enter close", lines, 0, theme);
+}
+
 /// Render the Help modal for the active tab.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let popup = centered_rect(70, 70, 80, 22, area);
@@ -733,7 +748,7 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod ported_chrome_tests {
-    use super::{draw_logo, grey_overlay, opt_row};
+    use super::{draw_logo, draw_warnings, grey_overlay, opt_row};
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -746,6 +761,24 @@ mod ported_chrome_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn warning_modal_renders_all_messages() {
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_warnings(
+                f,
+                f.area(),
+                &["first warning".into(), "second warning".into()],
+                &theme,
+            );
+        })
+        .unwrap();
+        let screen = flat(&term);
+        assert!(screen.contains("first warning"));
+        assert!(screen.contains("second warning"));
     }
 
     #[test]

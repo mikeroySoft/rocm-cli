@@ -458,6 +458,8 @@ pub enum Modal {
     Options,
     /// Global 2-column keyboard reference (distinct from the contextual `?`).
     GlobalHelp,
+    /// Warning messages captured when the header badge was clicked.
+    Warnings(Vec<String>),
 }
 
 pub struct AppState {
@@ -587,6 +589,8 @@ pub struct AppState {
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
     pub last_footer_chips: Vec<FooterChip>,
+    /// Exact screen cells occupied by the warning badge in the latest frame.
+    pub last_warning_badge_area: Option<ratatui::layout::Rect>,
     /// Background-job model for operational screens (Phase 3 Wave 1). The
     /// job-bridge runtime streams `StateEvent`s into this from the event loop.
     pub jobs: rocm_dash_core::state::State,
@@ -679,6 +683,7 @@ impl AppState {
             instances: HashMap::new(),
             active_tab: ActiveTab::default(),
             modal: Modal::None,
+            last_warning_badge_area: None,
             menu_sel: 0,
             palette_sel: 0,
             options_tab: 0,
@@ -2533,6 +2538,13 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             };
         }
         KeyAction::CloseModal => state.modal = Modal::None,
+        KeyAction::OpenWarnings => {
+            if let Some(snapshot) = &state.latest
+                && !snapshot.warnings.is_empty()
+            {
+                state.modal = Modal::Warnings(snapshot.warnings.clone());
+            }
+        }
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
         // or effect — can ever leave two `Some` at once.
@@ -2770,6 +2782,13 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // bar), so a click on the bar grabs it instead of falling through.
         if let Some(a) = scrollbar_hit(state, me.column, me.row) {
             return a;
+        }
+        if state.modal == Modal::None
+            && state
+                .last_warning_badge_area
+                .is_some_and(|area| point_in(area, me.column, me.row))
+        {
+            return KeyAction::OpenWarnings;
         }
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
@@ -3098,6 +3117,7 @@ pub enum KeyAction {
     OpenDetail,
     ToggleHelp,
     CloseModal,
+    OpenWarnings,
     OpenThemePicker,
     ApplyThemePick,
     /// Vertical scroll inside the active modal body (positive = down).
@@ -3268,6 +3288,13 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
             }
         }
     }
+    if matches!(modal, Modal::Warnings(_)) {
+        return match k.code {
+            KeyCode::Esc | KeyCode::Enter => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
+
     // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
     if *modal == Modal::ThemePicker {
         return match k.code {
@@ -3688,6 +3715,62 @@ mod tests {
         // Once the console is dismissed (back at root), Esc backs out.
         s.install_manager.as_mut().unwrap().active_job = None;
         assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+    }
+
+    #[test]
+    fn warning_badge_click_opens_clicked_snapshot() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        let snapshot = Snapshot {
+            warnings: vec!["first warning".into(), "second warning".into()],
+            ..Snapshot::default()
+        };
+        s.latest = Some(snapshot);
+        s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 22,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let action = resolve_mouse(click, &s);
+        apply_action(&mut s, action);
+        assert_eq!(
+            s.modal,
+            Modal::Warnings(vec!["first warning".into(), "second warning".into()])
+        );
+
+        s.latest.as_mut().unwrap().warnings = vec!["later warning".into()];
+        assert_eq!(
+            s.modal,
+            Modal::Warnings(vec!["first warning".into(), "second warning".into()])
+        );
+    }
+
+    #[test]
+    fn warning_badge_hit_area_excludes_adjacent_cells() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
+
+        for (column, expected) in [
+            (19, KeyAction::Nothing),
+            (20, KeyAction::OpenWarnings),
+            (24, KeyAction::OpenWarnings),
+            (25, KeyAction::Nothing),
+        ] {
+            assert_eq!(
+                resolve_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &s,
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -4357,6 +4440,17 @@ mod tests {
             ),
             KeyAction::CloseModal
         );
+    }
+
+    #[test]
+    fn warning_modal_closes_with_escape_or_enter() {
+        let modal = Modal::Warnings(vec!["warning".into()]);
+        for code in [KeyCode::Esc, KeyCode::Enter] {
+            assert_eq!(
+                handle_key(press(code), ActiveTab::Home, &modal, ChatKeyCtx::default()),
+                KeyAction::CloseModal
+            );
+        }
     }
 
     #[test]
