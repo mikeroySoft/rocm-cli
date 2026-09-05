@@ -3720,8 +3720,10 @@ mod tests {
     #[test]
     fn warning_badge_click_opens_clicked_snapshot() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        let mut snapshot = Snapshot::default();
-        snapshot.warnings = vec!["first warning".into(), "second warning".into()];
+        let snapshot = Snapshot {
+            warnings: vec!["first warning".into(), "second warning".into()],
+            ..Snapshot::default()
+        };
         s.latest = Some(snapshot);
         s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
         let click = MouseEvent {
