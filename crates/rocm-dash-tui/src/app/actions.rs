@@ -197,6 +197,13 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             };
         }
         KeyAction::CloseModal => state.modal = Modal::None,
+        KeyAction::OpenWarnings => {
+            if let Some(snapshot) = &state.latest
+                && !snapshot.warnings.is_empty()
+            {
+                state.modal = Modal::Warnings(snapshot.warnings.clone());
+            }
+        }
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
         // or effect — can ever leave two `Some` at once.
@@ -394,6 +401,7 @@ pub enum KeyAction {
     OpenDetail,
     ToggleHelp,
     CloseModal,
+    OpenWarnings,
     OpenThemePicker,
     ApplyThemePick,
     /// Vertical scroll inside the active modal body (positive = down).
@@ -569,6 +577,13 @@ pub(crate) fn handle_key(
             }
         }
     }
+    if matches!(modal, Modal::Warnings(_)) {
+        return match k.code {
+            KeyCode::Esc | KeyCode::Enter => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
+
     // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
     if *modal == Modal::ThemePicker {
         return match k.code {
@@ -1414,6 +1429,17 @@ mod tests {
             ),
             KeyAction::CloseModal
         );
+    }
+
+    #[test]
+    fn warning_modal_closes_with_escape_or_enter() {
+        let modal = Modal::Warnings(vec!["warning".into()]);
+        for code in [KeyCode::Esc, KeyCode::Enter] {
+            assert_eq!(
+                handle_key(press(code), ActiveTab::Home, &modal, ChatKeyCtx::default()),
+                KeyAction::CloseModal
+            );
+        }
     }
 
     #[test]
