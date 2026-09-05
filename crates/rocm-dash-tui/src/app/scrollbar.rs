@@ -119,6 +119,13 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if let Some(a) = scrollbar_hit(state, me.column, me.row) {
             return a;
         }
+        if state.modal == Modal::None
+            && state
+                .last_warning_badge_area
+                .is_some_and(|area| point_in(area, me.column, me.row))
+        {
+            return KeyAction::OpenWarnings;
+        }
         if let Some(area) = state.last_tab_bar_area
             && let Some(tab) = tab_bar_hit(area, me.column, me.row)
         {
@@ -415,6 +422,63 @@ mod tests {
 
     use super::super::test_support::st;
 
+
+    #[test]
+    fn warning_badge_click_opens_clicked_snapshot() {
+        use rocm_dash_core::metrics::Snapshot;
+
+        let mut s = st();
+        s.latest = Some(Snapshot {
+            warnings: vec!["first warning".into(), "second warning".into()],
+            ..Snapshot::default()
+        });
+        s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 22,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let action = resolve_mouse(click, &s);
+        apply_action(&mut s, action);
+        assert_eq!(
+            s.modal,
+            Modal::Warnings(vec!["first warning".into(), "second warning".into()])
+        );
+
+        s.latest.as_mut().unwrap().warnings = vec!["later warning".into()];
+        assert_eq!(
+            s.modal,
+            Modal::Warnings(vec!["first warning".into(), "second warning".into()])
+        );
+    }
+
+    #[test]
+    fn warning_badge_hit_area_excludes_adjacent_cells() {
+        let mut s = st();
+        s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
+
+        for (column, expected) in [
+            (19, KeyAction::Nothing),
+            (20, KeyAction::OpenWarnings),
+            (24, KeyAction::OpenWarnings),
+            (25, KeyAction::Nothing),
+        ] {
+            assert_eq!(
+                resolve_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &s,
+                ),
+                expected
+            );
+        }
+    }
     #[test]
     fn body_clicks_are_swallowed_while_a_manager_is_open() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
