@@ -640,3 +640,13 @@ Feature: Interactive dashboard
     When the user closes the Diagnose screen
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-warning-details @requires-os:linux
+  Scenario: dash-38 - A user opens warning details from the header
+    When the user opens a dashboard replay containing a warning
+    Then the warning indicator is displayed
+    When the user clicks the warning indicator
+    Then the warning details are displayed
+    When the user closes the warning details
+    And the user quits the dashboard
+    Then the dashboard exits successfully
