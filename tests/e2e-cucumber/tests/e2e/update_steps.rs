@@ -8,6 +8,9 @@
 //! host-invariant and is what pins the "distinguishes configured from
 //! not-configured feeds" behaviour. Contracts verified against the running Linux
 //! binary (EAI-8072). Mock lane.
+//!
+//! Timeout scenarios instead register a read-only runtime and redirect metadata
+//! connections to an isolated loopback blackhole.
 
 use cucumber::{given, then, when};
 
@@ -62,6 +65,99 @@ async fn reports_feed_status(world: &mut E2eWorld) {
             None => panic!("no update feed line for {feed:?} in:\n{out}"),
         }
     }
+}
+
+// Linux's full accept queue drops SYNs; Windows has different backlog behavior.
+// Compile the interposer only for these scenarios, never into the shipped CLI.
+#[cfg(target_os = "linux")]
+#[when(expr = "the user runs {word} with blackholed metadata connections")]
+async fn check_with_blackholed_metadata(world: &mut E2eWorld, command: String) {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    // Allow scheduler slack around the 2s startup budget and the 10s
+    // THEROCK_HEAD_PROBE_TIMEOUT_SECS cap, but reject immediate refusals.
+    let (lower_bound, upper_bound) = match command.as_str() {
+        "version" => (1, 8),
+        "update" => (9, 18),
+        _ => panic!("unsupported timeout scenario command: {command}"),
+    };
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let library = root.path().join("blackhole-dns.so");
+    let compiled = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/e2e/blackhole_dns.c"
+        ))
+        .args(["-ldl", "-o"])
+        .arg(&library)
+        .output()
+        .expect("failed to run the Linux C compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile blackhole fixture: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let started = Instant::now();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &[&command],
+        &[(
+            "LD_PRELOAD",
+            library.to_str().expect("non-UTF-8 fixture path"),
+        )],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(upper_bound),
+        "{command} exceeded its connect budget: {elapsed:?}; rc={rc}\n{stdout}\n{stderr}"
+    );
+    // Reject immediate DNS errors/refusals: the fixture must really time out.
+    assert!(
+        elapsed >= Duration::from_secs(lower_bound),
+        "blackhole fixture did not exercise a connect wait: {elapsed:?}\n{stdout}\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the startup check records a metadata timeout")]
+async fn startup_metadata_timeout(world: &mut E2eWorld) {
+    ok_output(world);
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("cache/therock/startup-update-check.json"))
+            .expect("startup check did not record an outcome"),
+    )
+    .expect("invalid startup check record");
+    assert_eq!(record["runtime_key"], "release-tarball-gfx942");
+    assert_eq!(record["status"], "error");
+    assert!(
+        record["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("timed out"),
+        "expected a metadata transport timeout: {record}"
+    );
+}
+
+#[then("the update report records a metadata timeout")]
+async fn report_metadata_timeout(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let line = out
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("runtime release-tarball-gfx942 ")
+        })
+        .expect("update report omitted the registered runtime");
+    assert!(
+        line.contains("status=error") && line.contains("timed out"),
+        "expected a metadata transport timeout for this runtime: {line}"
+    );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
