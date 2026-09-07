@@ -2,7 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm update` (report only), including offline metadata failure.
+//! Steps for `rocm update` (report only). Run with NO managed runtimes so the
+//! report needs no network (with a runtime present, `update` reaches the TheRock
+//! index to resolve the latest version). The report's update-feed status block is
+//! host-invariant and is what pins the "distinguishes configured from
+//! not-configured feeds" behaviour. Contracts verified against the running Linux
+//! binary (EAI-8072). Mock lane.
+//!
+//! Timeout scenarios instead register a read-only runtime and redirect metadata
+//! connections to an isolated loopback blackhole.
 
 use cucumber::{given, then, when};
 
@@ -67,9 +75,11 @@ async fn check_with_blackholed_metadata(world: &mut E2eWorld, command: String) {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    let upper_bound = match command.as_str() {
-        "version" => 8,
-        "update" => 18,
+    // Allow scheduler slack around the 2s startup budget and the 10s
+    // THEROCK_HEAD_PROBE_TIMEOUT_SECS cap, but reject immediate refusals.
+    let (lower_bound, upper_bound) = match command.as_str() {
+        "version" => (1, 8),
+        "update" => (9, 18),
         _ => panic!("unsupported timeout scenario command: {command}"),
     };
     let root = world.isolated_root.as_ref().expect("no isolated root");
@@ -105,7 +115,6 @@ async fn check_with_blackholed_metadata(world: &mut E2eWorld, command: String) {
         "{command} exceeded its connect budget: {elapsed:?}; rc={rc}\n{stdout}\n{stderr}"
     );
     // Reject immediate DNS errors/refusals: the fixture must really time out.
-    let lower_bound = if command == "version" { 1 } else { 9 };
     assert!(
         elapsed >= Duration::from_secs(lower_bound),
         "blackhole fixture did not exercise a connect wait: {elapsed:?}\n{stdout}\n{stderr}"
