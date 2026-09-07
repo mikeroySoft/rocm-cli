@@ -148,6 +148,29 @@ cargo test -p rocm --bin rocm http_header_value
 rocm install sdk --channel release --format wheel --dry-run
 ```
 
+Metadata connect-timeout regressions are covered end-to-end by
+`@id:update-startup-connect-timeout` and `@id:update-report-connect-timeout` in
+`tests/e2e-cucumber/features/update.feature`. They exercise the real CLI's short
+startup budget and its independent connect cap when the overall request budget
+is ten minutes. Both run in the default Linux mock lane, without a GPU or a
+runtime install.
+
+The Linux-only fixture requires `cc` and a dynamically linked CLI. It redirects
+only the child process's DNS and connections to a full loopback accept queue;
+it does not change host networking or contact the package index. A watchdog
+bounds a regressed CLI at 20 seconds. The assertions reject immediate connection
+refusals as well as over-budget waits. Windows skips these scenarios because
+the fixture uses Linux's accept-queue behavior and `LD_PRELOAD`.
+
+For a focused reproduction **on Linux only**:
+
+```bash
+cargo xtask e2e -- -n '^update-0[23]'
+```
+
+The name filter bypasses capability resolution; normal CI runs the unfiltered
+suite and honors the scenarios' `@requires-os:linux` tags.
+
 ## Agent Harness Setup E2E
 
 The `rocm agents` behavior spec is
