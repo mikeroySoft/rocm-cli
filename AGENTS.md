@@ -190,7 +190,7 @@ When relevant to touched behavior, also run targeted checks from `docs/testing.m
 
 - focused Rust test groups for touched modules
 - engine-specific GPU self-tests (`--self-test`) or live GPU tests when hardware is available
-- release gate checks for release-path changes (`python scripts/single_exe_release_gate.py`)
+- release gate checks for release-path changes (`python scripts/release_readiness.py`)
 
 **Execution environment expectations:**
 
