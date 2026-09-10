@@ -949,6 +949,7 @@ mod tests {
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
+            last_warning_badge_area: None,
             jobs: rocm_dash_core::state::State::default(),
             services: None,
             serve_wizard: None,

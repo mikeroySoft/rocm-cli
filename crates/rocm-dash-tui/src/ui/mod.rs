@@ -120,7 +120,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     state.last_footer_chips = footer_chips;
 
     // Modal overlay (rendered last so it sits on top of the body).
-    match state.modal {
+    match &state.modal {
         Modal::None => {}
         Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
         // Observe folds the telemetry tabs; its detail modal is the instance
@@ -137,6 +137,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
         Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::Warnings(warnings) => modal::draw_warnings(f, body, warnings, &theme),
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -298,7 +299,7 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
     Some((left, center_outer, right))
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn draw_header(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     // In demo/replay the data is not live, so never present the session as
     // "connected" to a real daemon — the Connected case shows a simulated label
     // instead, and the SIMULATED DATA chip below makes the state unmistakable.
@@ -343,10 +344,15 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(status_text, Style::default().fg(status_color)));
     let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
+    let mut warning_geometry = None;
     if warning_count > 0 {
         spans.push(Span::raw("   "));
+        let label = format!(" ⚠ {warning_count} ");
+        let x = spans.iter().map(Span::width).sum::<usize>();
+        let width = Span::raw(label.clone()).width();
+        warning_geometry = Some((x, width));
         spans.push(Span::styled(
-            format!(" ⚠ {warning_count} "),
+            label,
             Style::default()
                 .bg(theme.warn)
                 .fg(theme.surface_2)
@@ -392,6 +398,14 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ));
     let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
     f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
+    state.last_warning_badge_area = warning_geometry.map(|(x, width)| {
+        Rect::new(
+            inner.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
+            inner.y,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            1,
+        )
+    });
 }
 
 /// One footer-legend segment: a key chip (optionally clickable) or plain text.
