@@ -20,6 +20,15 @@ use crate::E2eWorld;
 const TOPIC: &str = "E2ENEEDLE";
 /// Number of matching lines planted — asserted exactly in the search result.
 const MATCH_COUNT: usize = 9;
+/// Built-in engines that answer the engine-plugin `logs` method.
+const ENGINES: [&str; 2] = ["lemonade", "vllm"];
+/// Service whose log is planted for every engine.
+const SERVICE_ID: &str = "e2e-tail-probe";
+/// Lines planted per service log; more than the default tail so the limit bites.
+const PLANTED_LINES: usize = 200;
+/// `rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`, pinned here as the black-box
+/// contract value every engine must honour when `tail_lines` is omitted (#17).
+const PROTOCOL_DEFAULT_TAIL: usize = 80;
 
 #[given("recorded command logs containing several lines about a topic")]
 async fn plant_command_logs(world: &mut E2eWorld) {
@@ -39,6 +48,26 @@ async fn plant_command_logs(world: &mut E2eWorld) {
         );
     }
     std::fs::write(cli_logs.join("e2e-probe.log"), body).expect("failed to write log file");
+}
+
+#[given("a service log longer than the default tail for each built-in engine")]
+async fn plant_engine_service_logs(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let body: String = (1..=PLANTED_LINES).fold(String::new(), |mut acc, i| {
+        let _ = writeln!(acc, "line {i}");
+        acc
+    });
+    for engine in ENGINES {
+        let logs = root
+            .path()
+            .join("data")
+            .join("engines")
+            .join(engine)
+            .join("logs");
+        std::fs::create_dir_all(&logs).expect("failed to create engine logs dir");
+        std::fs::write(logs.join(format!("{SERVICE_ID}.log")), &body)
+            .expect("failed to write engine service log");
+    }
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -62,6 +91,35 @@ async fn service_and_search(world: &mut E2eWorld) {
         &["logs", "--service", "some-service", "--search", TOPIC],
     );
     record(world, stdout, stderr, rc);
+}
+
+#[when("each engine is asked for that service's logs without a line limit")]
+async fn ask_each_engine_for_logs(world: &mut E2eWorld) {
+    let envelope = serde_json::json!({
+        "method": "logs",
+        "payload": { "service_id": SERVICE_ID },
+    })
+    .to_string();
+    // Record one "<engine> <count> <last line>" row per engine in the shared
+    // output slot so the Then step can compare engines against each other.
+    let mut rows = String::new();
+    for engine in ENGINES {
+        let (stdout, stderr, rc) =
+            crate::run_rocm_with_stdin(world, &["__engine-stdio", engine], &envelope, &[]);
+        assert_eq!(rc, 0, "{engine} logs request failed:\n{stdout}\n{stderr}");
+        let response: serde_json::Value =
+            serde_json::from_str(&stdout).expect("engine response is not JSON");
+        assert_eq!(
+            response["ok"], true,
+            "{engine} logs request was rejected:\n{stdout}"
+        );
+        let lines = response["data"]["recent_lines"]
+            .as_array()
+            .expect("recent_lines missing");
+        let last = lines.last().and_then(|v| v.as_str()).unwrap_or("");
+        let _ = writeln!(rows, "{engine} {} {last}", lines.len());
+    }
+    record(world, rows, String::new(), 0);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -100,6 +158,20 @@ async fn refuses_conflict(world: &mut E2eWorld) {
         "expected the service/search conflict message, got:\n{}",
         combined(world)
     );
+}
+
+#[then("every engine returns exactly the protocol default number of lines")]
+async fn every_engine_returns_default_tail(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let expected_last = format!("line {PLANTED_LINES}");
+    for engine in ENGINES {
+        assert!(
+            out.contains(&format!(
+                "{engine} {PROTOCOL_DEFAULT_TAIL} {expected_last}\n"
+            )),
+            "expected {engine} to return the newest {PROTOCOL_DEFAULT_TAIL} lines, got:\n{out}"
+        );
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
