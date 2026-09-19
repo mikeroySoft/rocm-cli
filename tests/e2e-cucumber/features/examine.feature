@@ -129,3 +129,48 @@ Feature: GPU detection and system inspection
   Scenario: examine-12 - The driver install dry-run shows the effective repo version
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder
+
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing
+
+  # `rocm examine`'s own engine_inventory block prefixes the effective default
+  # engine with the same `*` marker, via a renderer separate from `engines
+  # list`'s (see `append_examine_engine_inventory` vs
+  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # two used to be able to drift apart. examine-13 only ever drove `engines
+  # list`, leaving this second renderer's legend unexercised end-to-end.
+  @id:examine-shows-default-engine-legend
+  Scenario: examine-14 - Inspecting the system explains the default-engine marker
+    When the user inspects the system
+    Then the inspection explains the default-engine marker
+    And the host's default engine is marked in the inspection's engine inventory
+
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # `Given a managed runtime is active` is what lets this scenario fail. Without
+  # it the world's `<data>/runtimes` stays isolated and empty by design (see
+  # `E2eWorld::default`), no interpreter resolves, and any assertion would land
+  # on the `PATH` fallback — holding whether the fix is present or reverted.
+  # That precondition is also why this is `@requires-gpu`: the step installs the
+  # SDK, so only a GPU lane exercises it.
+  #
+  # `framework_source` is what check_8 reads to decide whether comparing this
+  # torch against the *system* ROCm means anything, so it is the field worth
+  # pinning rather than the versions themselves.
+  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    Given a managed runtime is active
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the runtime's interpreter
