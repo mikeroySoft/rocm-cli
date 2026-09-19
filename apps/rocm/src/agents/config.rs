@@ -221,6 +221,13 @@ pub(super) fn plan(
             );
             json_set(
                 &env,
+                "CLAUDE_CODE_DISABLE_ARTIFACT",
+                "1",
+                "env.CLAUDE_CODE_DISABLE_ARTIFACT",
+                changes,
+            );
+            json_set(
+                &env,
                 "ANTHROPIC_DEFAULT_OPUS_MODEL",
                 &target.model,
                 "env.ANTHROPIC_DEFAULT_OPUS_MODEL",
