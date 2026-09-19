@@ -40,11 +40,13 @@ rpassword.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tar = "0.4"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml_edit = "0.22.27"
+unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 yaml-edit = "0.2.3"
 

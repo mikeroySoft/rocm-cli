@@ -13,18 +13,61 @@ Feature: Update report
     Then the report shows there are no managed runtimes to update
     And it reports each update feed's status, marking unpublished feeds as not configured
 
+  @id:update-json-reports-empty-runtimes
+  Scenario: update-02 - The machine-readable update check reports an empty runtimes array
+    Given a machine with no managed runtimes
+    When the user checks for updates as machine-readable JSON
+    Then the machine-readable check reports no runtimes to update
+
+  @id:update-json-accepts-timeout-flag
+  Scenario: update-03 - The machine-readable update check accepts a --timeout-secs flag
+    Given a machine with no managed runtimes
+    When the user checks for updates as machine-readable JSON with a 5 second timeout
+    Then the machine-readable check reports no runtimes to update
+
+  # `--dry-run` used to `requires = "apply"` in clap, so `rocm update --dry-run`
+  # alone failed with a bare usage error instead of previewing. It no longer
+  # requires `--apply`, so this asserts the command reaches real business logic
+  # (the "no managed runtimes" bail, which reads nothing like a clap usage error)
+  # rather than being rejected before `rocm` even looks at the registry.
+  @id:update-dry-run-reaches-preview-path-without-apply
+  Scenario: update-04 - Previewing an update with --dry-run does not require --apply
+    Given a machine with no managed runtimes
+    When the user previews an update
+    Then the CLI refuses because no managed runtimes are registered
+
+  # `--runtime`/`--activate` are apply-only flags: without `--apply` or
+  # `--dry-run` alongside them, the old code rejected them with a bare clap
+  # usage error (both were declared `requires = "apply"`) instead of a message
+  # naming the actual constraint. This pins the intentional refusal message.
+  @id:update-runtime-or-activate-without-apply-or-dry-run-is-refused
+  Scenario: update-05 - --runtime or --activate without --apply or --dry-run is refused
+    Given a machine with no managed runtimes
+    When the user requests updating a specific runtime without --apply or --dry-run
+    Then the CLI refuses because --apply or --dry-run is required with --runtime or --activate
+
+  # --dry-run and --json are mutually exclusive: --json emits a single line of
+  # machine-readable JSON, and --dry-run would print human-readable preview text
+  # on top of it, corrupting the JSON contract. Pins the clap conflict instead of
+  # one flag silently winning.
+  @id:update-dry-run-conflicts-with-json
+  Scenario: update-06 - --dry-run and --json cannot be combined
+    Given a machine with no managed runtimes
+    When the user checks for updates as JSON with --dry-run
+    Then the CLI refuses because --dry-run and --json cannot be combined
+
   # The Linux fixture fills a loopback accept queue and redirects only the CLI
   # child's DNS there. These are real connect timeouts, not refused connections.
   # The short startup budget and the independent cap on a long update request
   # must both survive an upstream sync. Neither scenario installs a runtime.
   @id:update-startup-connect-timeout @requires-os:linux
-  Scenario: update-02 - Startup remains bounded when metadata connections drop packets
+  Scenario: update-07 - Startup remains bounded when metadata connections drop packets
     Given a registered read-only runtime
     When the user runs version with blackholed metadata connections
     Then the startup check records a metadata timeout
 
   @id:update-report-connect-timeout @requires-os:linux
-  Scenario: update-03 - Checking updates fails fast even with a long request budget
+  Scenario: update-08 - Checking updates fails fast even with a long request budget
     Given a registered read-only runtime
     When the user runs update with blackholed metadata connections
     Then the update report records a metadata timeout
