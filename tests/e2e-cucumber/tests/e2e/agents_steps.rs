@@ -1521,6 +1521,9 @@ async fn all_adapters_persist_safely(world: &mut E2eWorld) {
         assert_contains(&config, MODEL);
         assert_contains(&config, "127.0.0.1:11435");
         assert_contains(&config, &format!("keep-{}", harness.name));
+        if harness.name == "claude" {
+            assert_contains(&config, "\"CLAUDE_CODE_DISABLE_ARTIFACT\": \"1\"");
+        }
     }
     for (agent, comment) in [
         ("hermes", "# retained hermes comment"),
