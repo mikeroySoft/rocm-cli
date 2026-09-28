@@ -1,0 +1,17 @@
+# Not installed automatically. ROCm CLI AI-factory dashboard (http://0.0.0.0:8765/). To use:
+#   systemctl --user link /home/mike/dev/mikeroysoft/rocm-cli/scripts/systemd/rocm-dashboard.service
+#   systemctl --user enable --now rocm-dashboard.service
+#   loginctl enable-linger   # user services start at boot, not at login
+
+[Unit]
+Description=ROCm CLI AI-factory dashboard
+After=network.target
+
+[Service]
+WorkingDirectory=/home/mike/dev/mikeroysoft/rocm-cli
+ExecStart=/usr/bin/python scripts/factory_dashboard.py --host 0.0.0.0 --port 8765 --no-open
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

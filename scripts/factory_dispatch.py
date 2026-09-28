@@ -5,12 +5,13 @@
 
 """Stateless AI-factory dispatcher.
 
-One pass per invocation: first the merge stage lands at most one approved,
-green, up-to-date factory PR on main; then pick claimable issues (or
---ticket N), run a worker agent in a git worktree, gate, open a PR, review
-with codex, bounce once. A codex APPROVE marks the PR `factory-approved`;
-the merge stage requires that label, green GitHub CI, and a head containing
-the current main tip before squash-merging.
+One pass per invocation: first the upstream sync merges any new upstream main
+commits into the fork's main (host gate, no CI), then the merge stage lands
+at most one approved, green, up-to-date factory PR on main; then pick
+claimable issues (or --ticket N), run a worker agent in a git worktree, gate,
+open a PR, review with codex, bounce once. A codex APPROVE marks the PR
+`factory-approved`; the merge stage requires that label, green GitHub CI, and
+a head containing the current main tip before squash-merging.
 All state lives in GitHub and .factory/ on disk.
 """
 
@@ -28,9 +29,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def origin_repo() -> str:
+def remote_repo(remote: str) -> str:
     url = subprocess.run(
-        ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+        ["git", "-C", str(ROOT), "remote", "get-url", remote],
         capture_output=True,
         text=True,
         check=True,
@@ -38,7 +39,8 @@ def origin_repo() -> str:
     return url.rsplit("github.com", 1)[-1].strip(":/").removesuffix(".git")
 
 
-REPO = origin_repo()
+REPO = remote_repo("origin")
+UPSTREAM = remote_repo("upstream")
 FACTORY = ROOT / ".factory"
 LOGS = FACTORY / "logs"
 GATE = Path(__file__).resolve().parent / "agent_gate.py"
@@ -54,6 +56,9 @@ STANDING_INSTRUCTIONS = """
   edited for the ticket; never `git add -A`, and never commit
   `.factory-prompt.md` or gate reports.
 - NEVER use `git stash` — the stash is shared with the user's other worktrees.
+- Only push `agent/{n}`. NEVER push, merge into, or fast-forward `main`, and
+  never close the ticket yourself: the dispatcher opens the PR and the merge
+  stage lands it after review and CI.
 - Finish by running `python {gate} --report .factory/gate-report-{n}.md`
   and fixing any failures it reports.
 """
@@ -228,17 +233,15 @@ def commit_leftovers(wt: Path, n: int, title: str) -> None:
         run(["git", "commit", "-s", "-m", f"agent/{n}: {title}"], cwd=wt)
 
 
-def run_gate(wt: Path, n: int) -> tuple[bool, str]:
+def run_gate(wt: Path, n: int | str, skip: str = "") -> tuple[bool, str]:
     report_rel = f".factory/gate-report-{n}.md"
     (wt / ".factory").mkdir(exist_ok=True)
     # GPU serialization is the gate's job: agent_gate.py flocks the GPU lock
     # itself. Locking here too deadlocks the gate subprocess (seen in run #7).
-    proc = subprocess.run(
-        [sys.executable, str(GATE), "--base", "origin/main", "--report", report_rel],
-        cwd=wt,
-        capture_output=True,
-        text=True,
-    )
+    cmd = [sys.executable, str(GATE), "--base", "origin/main", "--report", report_rel]
+    if skip:
+        cmd += ["--skip", skip]
+    proc = subprocess.run(cmd, cwd=wt, capture_output=True, text=True)
     report = wt / report_rel
     text = report.read_text() if report.exists() else proc.stdout + proc.stderr
     return proc.returncode == 0, text
@@ -294,14 +297,20 @@ def review(wt: Path, n: int, gate_report: str) -> tuple[str, str]:
     return verdict, findings
 
 
-def push_and_pr(wt: Path, n: int, title: str, gate_report: str) -> None:
+def push_and_pr(wt: Path, n: int, title: str, gate_report: str) -> bool:
+    """Push agent/n and open its PR. False if the branch adds nothing over
+    main (nothing to review; a worker that landed its work elsewhere)."""
+    run(["git", "fetch", "origin", "main"], cwd=wt)
+    ahead = run(["git", "rev-list", "--count", "origin/main..HEAD"], cwd=wt).stdout
+    if int(ahead) == 0:
+        return False
     run(["git", "push", "-u", "origin", f"agent/{n}"], cwd=wt)
     existing = gh_json(
         ["pr", "list", "--repo", REPO, "--head", f"agent/{n}", "--json", "number"]
     )
     if existing:
         log(f"#{n}: PR already exists (#{existing[0]['number']})")
-        return
+        return True
     body_file = FACTORY / f"pr-body-{n}.md"
     body_file.write_text(f"Closes #{n}\n\n## Gate report\n\n{gate_report}\n")
     run(
@@ -319,6 +328,7 @@ def push_and_pr(wt: Path, n: int, title: str, gate_report: str) -> None:
             str(body_file),
         ]
     )
+    return True
 
 
 def pr_comment(n: int, text: str) -> None:
@@ -337,6 +347,153 @@ def pr_comment(n: int, text: str) -> None:
         ],
         check=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Upstream sync: merge new upstream main commits into the fork's main.
+# ---------------------------------------------------------------------------
+
+SYNC_LOG = FACTORY / "upstream-sync.jsonl"
+SYNC_TITLE = "upstream sync: "
+
+
+def sync_record(**rec: object) -> None:
+    FACTORY.mkdir(exist_ok=True)
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **rec}
+    with SYNC_LOG.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def open_sync_issue() -> int | None:
+    issues = gh_json(
+        [
+            "issue",
+            "list",
+            "--repo",
+            REPO,
+            "--state",
+            "open",
+            "--search",
+            '"upstream sync" in:title',
+            "--json",
+            "number,title",
+        ]
+    )
+    for issue in issues:
+        if issue["title"].startswith(SYNC_TITLE):
+            return issue["number"]
+    return None
+
+
+def sync_escalate(tip: str, reason: str, detail: str) -> str:
+    """Open one ready-for-human issue for a failed sync; returns its URL."""
+    body = (
+        f"Automatic sync of `{UPSTREAM}` main ({tip}) into `main` failed: "
+        f"{reason}.\n\n```\n{detail.strip()[-6000:]}\n```\n\n"
+        "Resolve through the normal flow: a PR onto `main` that contains the "
+        "upstream tip (merge, do not squash or rebase it away), gated and reviewed "
+        "like any factory PR. Never push `main` directly. Close this issue once "
+        "`main` contains the tip; the dispatcher skips upstream sync while it is "
+        "open."
+    )
+    body_file = FACTORY / "sync-issue.md"
+    body_file.write_text(body)
+    out = run(
+        [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            REPO,
+            "--title",
+            f"{SYNC_TITLE}{reason} at {tip[:12]}",
+            "--label",
+            "ready-for-human",
+            "--body-file",
+            str(body_file),
+        ]
+    ).stdout
+    return out.strip().splitlines()[-1]
+
+
+def sync_pass(dry_run: bool) -> None:
+    """Merge upstream main into fork main when upstream moved; one merge per pass.
+
+    Evidence is the host gate (minus the leak scan: upstream is already
+    public). Conflicts or a failed gate open one ready-for-human issue and the
+    stage stays parked until that issue closes. Runs under the merge lock:
+    it moves main, so it must not race the merge stage.
+    """
+    run(["git", "fetch", "origin", "main"], cwd=ROOT)
+    run(["git", "fetch", "upstream", "main"], cwd=ROOT)
+    tip = run(["git", "rev-parse", "upstream/main"], cwd=ROOT).stdout.strip()
+    contained = run(
+        ["git", "merge-base", "--is-ancestor", tip, "origin/main"],
+        cwd=ROOT,
+        check=False,
+    )
+    if contained.returncode == 0:
+        log(f"upstream sync: main contains upstream tip {tip[:12]}")
+        return
+    count = run(
+        ["git", "rev-list", "--count", "origin/main..upstream/main"], cwd=ROOT
+    ).stdout.strip()
+    issue = open_sync_issue()
+    if issue:
+        log(f"upstream sync: {count} commit(s) behind; waiting on human (#{issue})")
+        return
+    if dry_run:
+        log(f"upstream sync: would merge {count} upstream commit(s) at {tip[:12]}")
+        return
+    wt = FACTORY / "wt-upstream"
+    if wt.is_dir():
+        run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, check=False)
+    run(["git", "worktree", "add", "--detach", str(wt), "origin/main"], cwd=ROOT)
+    try:
+        merge = run(
+            [
+                "git",
+                "merge",
+                "--no-ff",
+                "--signoff",
+                "-m",
+                f"Merge upstream main at {tip[:12]} ({count} commits)",
+                "upstream/main",
+            ],
+            cwd=wt,
+            check=False,
+        )
+        if merge.returncode != 0:
+            conflicts = run(
+                ["git", "diff", "--name-only", "--diff-filter=U"], cwd=wt, check=False
+            ).stdout
+            run(["git", "merge", "--abort"], cwd=wt, check=False)
+            url = sync_escalate(tip, "merge conflict", conflicts or merge.stderr)
+            sync_record(upstream=tip, commits=count, result="conflict", issue=url)
+            log(f"upstream sync: merge conflict at {tip[:12]}; escalated {url}")
+            return
+        ok, report = run_gate(wt, "upstream", skip="leak-scan")
+        if not ok:
+            url = sync_escalate(tip, "gate failed", report)
+            sync_record(upstream=tip, commits=count, result="gate-failed", issue=url)
+            log(f"upstream sync: gate failed at {tip[:12]}; escalated {url}")
+            return
+        merged = run(["git", "rev-parse", "HEAD"], cwd=wt).stdout.strip()
+        push = run(["git", "push", "origin", "HEAD:main"], cwd=wt, check=False)
+        if push.returncode != 0:
+            # main moved under us; the next pass retries from the new tip.
+            sync_record(
+                upstream=tip,
+                commits=count,
+                result="push-rejected",
+                detail=push.stderr[-500:],
+            )
+            log(f"upstream sync: push rejected; retry next pass\n{push.stderr}")
+            return
+        sync_record(upstream=tip, commits=count, result="synced", merge=merged)
+        log(f"upstream sync: merged {count} commit(s) at {tip[:12]} -> {merged[:12]}")
+    finally:
+        run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +572,9 @@ def cleanup_after_merge(n: int) -> None:
     ticket_lock(n).unlink(missing_ok=True)
 
 
-def merge_pass(dry_run: bool) -> None:
-    """Land at most ONE approved, green, up-to-date factory PR per pass.
+def land_pass(dry_run: bool) -> None:
+    """Everything that moves main, under one lock: upstream sync, then the
+    merge stage (at most ONE approved, green, up-to-date factory PR per pass).
 
     A merge requires all four independently produced pieces of evidence:
     host gate PASS (in the PR body), codex APPROVE (`factory-approved`
@@ -434,10 +592,11 @@ def merge_pass(dry_run: bool) -> None:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        log("merge stage: skipped (another dispatcher holds the merge lock)")
+        log("sync + merge stage: skipped (another dispatcher holds the merge lock)")
         lock_fd.close()
         return
     try:
+        sync_pass(dry_run)
         merge_pass_locked(dry_run)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -517,6 +676,21 @@ def merge_pass_locked(dry_run: bool) -> None:
         title = gh_json(["pr", "view", str(pr_num), "--repo", REPO, "--json", "title"])[
             "title"
         ]
+        # A PR that carries new upstream commits (a human/agent-resolved sync)
+        # must keep them as ancestors of main, or the sync stage never sees
+        # main contain the upstream tip. Squash everything else.
+        run(["git", "fetch", "origin", "main", f"agent/{n}"], cwd=ROOT)
+        run(["git", "fetch", "upstream", "main"], cwd=ROOT)
+        contains = lambda ref: (  # noqa: E731
+            run(
+                ["git", "merge-base", "--is-ancestor", "upstream/main", ref],
+                cwd=ROOT,
+                check=False,
+            ).returncode
+            == 0
+        )
+        carries_upstream = contains(f"origin/agent/{n}") and not contains("origin/main")
+        method = "--merge" if carries_upstream else "--squash"
         run(
             [
                 "gh",
@@ -525,14 +699,14 @@ def merge_pass_locked(dry_run: bool) -> None:
                 str(pr_num),
                 "--repo",
                 REPO,
-                "--squash",
+                method,
                 "--subject",
                 title,
                 "--body",
                 f"Closes #{n}\n\n{signoff()}",
             ]
         )
-        log(f"PR #{pr_num}: merged into main (ticket #{n})")
+        log(f"PR #{pr_num}: merged into main ({method[2:]}, ticket #{n})")
         cleanup_after_merge(n)
         return
 
@@ -632,7 +806,9 @@ def process_ticket(
             )
             return
 
-        push_and_pr(wt, n, title, report)
+        if not push_and_pr(wt, n, title, report):
+            escalate(n, f"agent/{n} has no commits over main; nothing to PR", logfile)
+            return
         verdict, findings = review(wt, n, report)
         pr_comment(n, findings)
         if verdict == "APPROVE":
@@ -704,7 +880,7 @@ def main() -> int:
         process_ticket(issue, args.budget_min, args.dry_run, forced=True)
         return 0
 
-    merge_pass(args.dry_run)
+    land_pass(args.dry_run)
     active = active_ticket_count()
     capacity = MAX_ACTIVE - active
     log(f"active tickets: {active}, capacity: {max(capacity, 0)}")
