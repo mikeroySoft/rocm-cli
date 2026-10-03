@@ -679,8 +679,7 @@ fn best_llamacpp_backend_for_host(manifest: &LemonadeInstallManifest) -> Result<
             log_path,
             &process_env,
         )?;
-        let listing =
-            run_lemonade_backends_list(manifest, DEFAULT_HOST, port, &process_env)?;
+        let listing = run_lemonade_backends_list(manifest, DEFAULT_HOST, port, &process_env)?;
         let backends = parse_llamacpp_backend_statuses(&listing);
         Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
     })();

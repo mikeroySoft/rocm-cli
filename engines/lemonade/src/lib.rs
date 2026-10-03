@@ -831,5 +831,4 @@ mod tests {
     fn stop_scope_targets_only_the_recorded_lemonade_server() {
         assert_eq!(STOP_SCOPE, rocm_core::KillScope::Single);
     }
-
 }
