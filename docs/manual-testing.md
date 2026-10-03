@@ -68,12 +68,14 @@ Expected result:
 - The launcher opens; choosing "Set up this system" there opens the setup
   screen. It does not open automatically before the main TUI, and the user
   does not need to type `/setup`.
-- The setup shows a recommended ROCm folder.
-- The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
-  can see that pip downloads stay inside the chosen ROCm folder.
-- The install-folder row opens an interactive folder picker. Arrow keys and the
-  mouse can choose folders; Enter opens or selects; Esc returns without losing
-  the current setup screen.
+- On the "Install ROCm SDK (pip)" step's Configure screen, the Folder row reads
+  `(default managed folder · Tab to browse)` until a folder is chosen. `Tab`
+  opens the folder picker; arrow keys choose, Enter opens or selects, Esc
+  returns without losing the Configure screen or an already-chosen folder.
+  Leaving the row unset installs to the default managed folder.
+- On that same screen `←`/`→` toggle Release/Nightly, and `Tab` opens the
+  folder picker rather than toggling the channel — the same Tab-to-browse
+  binding the Install and Serve forms use.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
 - Install logs show only in the foreground progress card, with PageUp/PageDown
@@ -157,16 +159,18 @@ Expected result:
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
-  `libraries,devel`), alongside pinned `torchaudio` from the TheRock index. On a host
-  with no detectable AMD GPU the preview reports `device_target: undetermined`
-  and a real install refuses rather than pulling every published device payload.
+  `libraries`, and `devel` only when `--devel` is passed), alongside pinned
+  `torchaudio` from the TheRock index. On a host with no detectable AMD GPU the
+  preview reports `device_target: undetermined` and a real install refuses
+  rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
   all four packages in one pip transaction.
 - The install does not ask for an external Python venv.
-- Runtime validation uses TheRock's runtime/devel package roots and
+- Runtime validation uses TheRock's runtime package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
-  pinned `rocm[libraries,devel,device-…]` install succeeds.
+  pinned `rocm[libraries,device-…]` install succeeds. The compiler toolchain is
+  not required for validation to pass; `--devel` adds `devel` to those extras.
 - `rocm examine` reports the active runtime as ready.
 
 Developer-only deterministic override:
@@ -176,7 +180,8 @@ python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for
-normal user setup.
+normal user setup. The script checks the default install; add `--devel` to check
+the opt-in compiler toolchain path instead.
 
 ## 3. Lemonade GPU Verification
 
@@ -215,10 +220,23 @@ rocm services logs <service-id>
 
 Expected result:
 
-- `rocm services` shows only living local servers.
-- `rocm services list --all` shows saved history, including failed or stopped
-  attempts.
+- `rocm services` lists only living local servers, but its `Status:` line
+  counts the whole registry, so a failed or stopped record is counted as
+  `N not running` even though no row for it is shown.
+- When such records exist, `rocm services` ends with a `Past attempts:` block
+  giving their count and three runnable commands: `See them: rocm services list
+  --all`, `Read the newest: rocm services logs <service-id>` (with the id of the
+  newest record that is no longer running) and `Reclaim the space: rocm services
+  prune`. Paste the `Read the newest:` line as-is and confirm it opens the logs
+  for that attempt.
+- On a machine that has never served, `rocm services` prints no `Past attempts:`
+  block at all.
+- `rocm services list --all` shows saved history, including the failed or
+  stopped attempts the default view hides.
 - The logs command shows the exact service failure or startup output.
+- `rocm storage report` lists these records under `local server records` with
+  the folder that holds them; no `rocm storage` command deletes them, and the
+  row's note points at `rocm services prune` to reclaim the space.
 - Stop and restart require explicit approval:
 
 ```powershell
@@ -264,6 +282,22 @@ Expected result:
 - A record whose server died long ago but has not been listed since is still
   removed by a plain `rocm services prune --yes`: age is read from the record
   file as it was before the command refreshed it, not after.
+- A prune running during a launch does not delete the starting server's endpoint
+  key. `rocm serve` writes `<data>/services/<id>.endpoint-key` before it writes
+  `<id>.json`, and `prune` waits on the shared `<data>/services/launch.lock` that
+  `serve` holds across both writes. Start `rocm serve --managed ...` and, while
+  it is still coming up, run `rocm services prune --any-age --yes` from a second
+  shell: the prune shows `Waiting for a launch already under way…` on a terminal
+  and blocks until the launch has published its record — as long as that takes,
+  with no timeout — then leaves that service's key and record alone (reporting it
+  under "still running, left alone") while still removing every other non-running
+  record. `--dry-run` waits in exactly the same way. Run in the other order, a
+  `serve` started while a prune is scanning waits for the prune instead — the
+  same lock, the same cost, in the other direction.
+- `rocm services prune --dry-run` on a machine that has never served creates
+  `<data>/services/` and an empty `launch.lock` (the lock the wait above needs),
+  and reports that nothing would be removed. That is the only thing a preview
+  writes.
 
 ## 5. ComfyUI Verification
 

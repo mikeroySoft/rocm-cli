@@ -99,7 +99,9 @@ mod tests {
 
     /// Split a flattened YAML sequence into its items. Handles the flow form
     /// (`[a, b]`) and the block form, which [`flattened_values`] joins into
-    /// `- a - b`, so the two spellings compare equal.
+    /// `- a - b`, so the two spellings compare equal. Surrounding quotes are
+    /// stripped from each item too, so `release/**` and `"release/**"` — both
+    /// valid, semantically identical YAML — also compare equal.
     fn flattened_list_items(value: &str) -> Vec<String> {
         let value = value.trim();
         let items: Vec<String> =
@@ -116,7 +118,22 @@ mod tests {
             } else {
                 vec![value.to_owned()]
             };
-        items.into_iter().filter(|item| !item.is_empty()).collect()
+        items
+            .into_iter()
+            .map(|item| strip_quotes(&item))
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// Strip one layer of matching `"..."` or `'...'` quoting, if present.
+    fn strip_quotes(item: &str) -> String {
+        let mut chars = item.chars();
+        match (chars.next(), chars.next_back()) {
+            (Some('"'), Some('"')) | (Some('\''), Some('\'')) if item.len() >= 2 => {
+                chars.as_str().to_owned()
+            }
+            _ => item.to_owned(),
+        }
     }
 
     /// Extract the top-level `concurrency.group` value, joining folded (`>-`)
@@ -689,6 +706,31 @@ mod tests {
 trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
+
+    #[test]
+    fn every_ci_job_declares_a_timeout() {
+        let ci = read_workflow("ci.yml");
+        let jobs = top_level_block(&ci, "jobs");
+        let job_ids: Vec<&str> = jobs
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .collect();
+        assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
+        for job in job_ids {
+            let block = job_block(&ci, job);
+            assert!(
+                block
+                    .lines()
+                    .any(|line| indent_of(line) == 4 && line.trim().starts_with("timeout-minutes:")),
+                "job `{job}` in ci.yml has no timeout-minutes -- GitHub's 360min default applies, \
+                 so a hung step (an unbounded network call, an unresponsive registry) holds a \
+                 runner for six hours instead of failing fast (see the convention comment at the \
+                 top of the jobs: block)"
+            );
+        }
+    }
+
     #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
@@ -728,6 +770,50 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "e2e-selfhosted.yml must define the self-hosted job `{job}` (EAI-7548)"
             );
         }
+    }
+
+    /// The full `on.push.branches` list from a workflow's top-level `push:`
+    /// trigger, as a flattened item vector (e.g. `["main", "release/**"]`).
+    fn push_branches(text: &str) -> Vec<String> {
+        let push_block = nested_block(text, "  push:");
+        let branches = flattened_values(&push_block, "branches");
+        assert_eq!(
+            branches.len(),
+            1,
+            "expected exactly one branches: list under this workflow's push trigger"
+        );
+        flattened_list_items(&branches[0])
+    }
+
+    /// Reverting or mistyping the `release/**` push branch (EAI-8761) would
+    /// leave every other assertion in this suite green, since none of them
+    /// read `on.push.branches`. Only `e2e-selfhosted.yml` carries it — a
+    /// release-branch push should get the self-hosted regression matrix ahead
+    /// of cutting the `v*` tag `release.yml` builds from. `ci.yml`'s own push
+    /// trigger stays `main`-only, so it does not run on the release-branch
+    /// commit itself; a direct push or cherry-pick to a release branch is not
+    /// covered by it, and coverage instead comes from whatever pull request
+    /// produced that commit.
+    #[test]
+    fn self_hosted_workflow_fires_on_release_branch_push() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string(), "release/**".to_string()],
+            "e2e-selfhosted.yml must run its push-triggered jobs on `main` and any \
+             `release/**` branch, ahead of cutting the `v*` tag release.yml builds from (EAI-8761)"
+        );
+    }
+
+    #[test]
+    fn ci_workflow_push_trigger_stays_main_only() {
+        let workflow = read_workflow("ci.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string()],
+            "ci.yml's push trigger must stay main-only; it does not run on the \
+             release-branch commit itself, so it must not re-run on push too"
+        );
     }
 
     #[test]
@@ -780,6 +866,34 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
+    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
+    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
+    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
+    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
+    /// runs-on; `native` never applied to this job, only to the two
+    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
+    /// this file green while the doc and the comment both quietly went false
+    /// again.
+    #[test]
+    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let nightly = read_workflow("nightly.yml");
+        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
+        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
+        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
+        assert!(
+            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
+             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
+        );
+        assert_eq!(
+            per_pr, nightly_wsl,
+            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
+             the same DevLab Dispatch pool"
+        );
+    }
+
     #[test]
     fn every_nightly_strix_job_uses_the_shared_machine_tui_budget() {
         let nightly = read_workflow("nightly.yml");
@@ -827,6 +941,652 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 );
             }
         }
+    }
+
+    /// Every `GPU preflight` step block in `text`, in file order.
+    fn gpu_preflight_steps(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut steps = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("- name: GPU preflight") {
+                continue;
+            }
+            let step_indent = indent_of(line);
+            let mut step = format!("{line}\n");
+            for body in &lines[i + 1..] {
+                if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                    break;
+                }
+                step.push_str(body);
+                step.push('\n');
+            }
+            steps.push(step);
+        }
+        steps
+    }
+
+    /// The lines of a step's `run: |` block, still indented.
+    fn run_block(step: &str) -> Option<Vec<&str>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
+        let run_indent = indent_of(lines[run_at]);
+        Some(
+            lines[run_at + 1..]
+                .iter()
+                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+                .copied()
+                .collect(),
+        )
+    }
+
+    fn dedent(body: &[&str]) -> Option<String> {
+        let pad = body
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| indent_of(l))
+            .min()?;
+        let dedented: Vec<&str> = body
+            .iter()
+            .map(|l| if l.len() > pad { &l[pad..] } else { l.trim() })
+            .collect();
+        Some(dedented.join("\n") + "\n")
+    }
+
+    /// The POSIX-shell body a preflight step actually runs, dedented.
+    ///
+    /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
+    /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
+    /// to end yields `None`; `preflight_powershell_script` carries those.
+    fn preflight_shell_script(step: &str) -> Option<String> {
+        let body = run_block(step)?;
+        let body = match body
+            .iter()
+            .position(|l| l.trim_end().ends_with("-Script @'"))
+        {
+            Some(open) => {
+                let close = body.iter().position(|l| l.trim() == "'@")?;
+                body[open + 1..close].to_vec()
+            }
+            None if step.contains("shell: powershell") => return None,
+            None => body,
+        };
+        dedent(&body)
+    }
+
+    /// The PowerShell body a preflight step runs, for the steps that are
+    /// PowerShell end to end.
+    ///
+    /// The WSL lanes are excluded deliberately: their PowerShell is a wrapper
+    /// around a bash here-string that `preflight_shell_script` already carries.
+    /// Without this the Windows-native blocks are invisible to the drift check
+    /// below — reproducing, on the test side, the very gap that let one of the
+    /// six production blocks sit un-converted.
+    fn preflight_powershell_script(step: &str) -> Option<String> {
+        if !step.contains("shell: powershell") || step.contains("-Script @'") {
+            return None;
+        }
+        dedent(&run_block(step)?)
+    }
+
+    /// The shell options a lane's body actually runs under in CI.
+    ///
+    /// Driving a lane under the wrong ones tests a shell production never uses,
+    /// which is how a script can pass here and abort on a runner.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum PreflightShell {
+        /// A plain `run:` step, which GitHub runs as `bash -e {0}` — `-e` but,
+        /// unlike an explicit `shell: bash`, no pipefail.
+        DefaultRunStep,
+        /// The WSL lanes pass their body to `Invoke-WslBash.ps1` *without*
+        /// `-PipeFail`, which execs a bare `bash <file>`: no `-e` either.
+        WslBareBash,
+    }
+
+    /// Whether this preflight guards an APU lane (the 8 GiB floor) rather than a
+    /// discrete card (16 GiB).
+    fn is_apu_preflight(step: &str) -> bool {
+        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || step.contains("else { 8 }")
+    }
+
+    #[test]
+    fn every_apu_preflight_block_measures_the_gtt_pool() {
+        // A gfx1151 APU reports its BIOS carveout as VRAM total — 512 MiB on the
+        // hosts these lanes run on — while the engine allocates from GTT-backed
+        // system RAM. A floor applied to VRAM there can never be cleared, so the
+        // lane fails on every healthy host. Six blocks guard that hardware class
+        // and one was missed when the other five were converted; this is what
+        // makes the next copy-paste fail loudly rather than months later.
+        let mut checked = 0;
+        for (workflow, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text)
+                .iter()
+                .filter(|s| is_apu_preflight(s))
+            {
+                assert!(
+                    step.contains("showmeminfo vram gtt"),
+                    "{workflow}: an APU-class GPU preflight still queries VRAM only; on a \
+                     small-carveout gfx1151 host it can never clear its own floor"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected at least six APU-class preflight blocks, found {checked} — if a lane \
+             was removed update this floor, otherwise the extractor has stopped matching"
+        );
+    }
+
+    /// Both WSL2 lanes must settle the clock before anything times a scenario.
+    ///
+    /// cucumber measures scenario durations by subtracting `SystemTime` stamps, so
+    /// a guest whose clock steps backwards mid-run kills the suite (#455 makes that
+    /// survivable; this keeps the durations real). The hazard is invisible: the
+    /// step's absence breaks nothing that any other test here observes, and on the
+    /// nightly lane job-level `continue-on-error: true` means a regression would
+    /// not even turn the run red.
+    ///
+    /// Matching the step NAME rather than a substring of the job is deliberate —
+    /// the surrounding comments discuss the clock at length, so a bare substring
+    /// would stay satisfied by prose after the step itself was deleted, which is
+    /// exactly the failure this pins.
+    #[test]
+    fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
+        const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        for (workflow, job, suite_step) in [
+            (
+                "e2e-selfhosted.yml",
+                "  e2e-wsl:",
+                "      - name: Run E2E tests on Strix Halo WSL2",
+            ),
+            (
+                "nightly.yml",
+                "  e2e-wsl-nightly:",
+                "      - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)",
+            ),
+        ] {
+            let job_block = nested_block(&read_workflow(workflow), job);
+            let settle = job_block.find(STEP).unwrap_or_else(|| {
+                panic!(
+                    "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
+                     steps its clock backwards mid-run and cucumber subtracts SystemTime \
+                     stamps, so the durations that lane reports become fiction"
+                )
+            });
+            let suite = job_block
+                .find(suite_step)
+                .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
+            assert!(
+                settle < suite,
+                "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
+                 correction has to land while nothing is being timed"
+            );
+        }
+    }
+
+    #[test]
+    fn apu_preflight_twins_do_not_drift() {
+        // The nightly lanes are copies of their per-PR twins. One was left on the
+        // pre-GTT script while the other five were converted and nothing failed,
+        // because every contract test here asserts step names, env keys and
+        // labels — never the script body.
+        type Extract = fn(&str) -> Option<String>;
+        let scripts = |name: &str, extract: Extract| -> Vec<String> {
+            gpu_preflight_steps(&read_workflow(name))
+                .iter()
+                .filter(|s| is_apu_preflight(s))
+                .filter_map(|s| extract(s))
+                .collect()
+        };
+        // Both languages, or the check reproduces the bug it exists to catch:
+        // the Windows blocks are PowerShell end to end, and an edit landing in
+        // only one of the two files would otherwise go unnoticed.
+        for (language, extract, want) in [
+            ("shell", preflight_shell_script as Extract, 2),
+            ("PowerShell", preflight_powershell_script as Extract, 1),
+        ] {
+            let per_pr = scripts("e2e-selfhosted.yml", extract);
+            let nightly = scripts("nightly.yml", extract);
+            assert_eq!(
+                per_pr.len(),
+                want,
+                "expected {want} {language} APU preflight block(s) in e2e-selfhosted.yml"
+            );
+            assert_eq!(
+                per_pr.len(),
+                nightly.len(),
+                "{language} APU preflight count differs"
+            );
+            for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "{language} APU preflight script #{i} has drifted between \
+                     e2e-selfhosted.yml and nightly.yml"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn smi_fixture(vram_total: u64, vram_used: u64, gtt: Option<(u64, u64)>) -> String {
+        use std::fmt::Write as _;
+
+        let mut s = String::from("===== ROCm System Management Interface =====\n");
+        let _ = writeln!(s, "GPU[0]\t\t: VRAM Total Memory (B): {vram_total}");
+        let _ = writeln!(s, "GPU[0]\t\t: VRAM Total Used Memory (B): {vram_used}");
+        if let Some((total, used)) = gtt {
+            let _ = writeln!(s, "GPU[0]\t\t: GTT Total Memory (B): {total}");
+            let _ = writeln!(s, "GPU[0]\t\t: GTT Total Used Memory (B): {used}");
+        }
+        s
+    }
+
+    /// A `rocm-smi` stub that answers each `--showmeminfo` shape the preflight
+    /// uses: both pools at once, GTT alone, VRAM alone.
+    ///
+    /// `REJECT_COMBINED` fails the two-pool form the way an older build does —
+    /// the case that must still reach GTT through the single-pool query.
+    /// `FAIL_GTT` fails the GTT-alone query, which has to stay distinguishable
+    /// from a host that answers and simply has no GTT pool (hence the `|| true`
+    /// on the `grep`: an absent pool is an empty answer, not a failed call).
+    /// `GOOD_CALLS` degrades the tool after N calls, for the polls that have to
+    /// survive a reading going away mid-wait.
+    #[cfg(unix)]
+    const SMI_STUB: &str = r#"#!/bin/sh
+n=$(cat "$COUNTER" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$COUNTER"
+if [ -n "${GOOD_CALLS:-}" ] && [ "$n" -gt "$GOOD_CALLS" ]; then exit 1; fi
+case "$*" in
+  *vram*gtt*)
+    [ "${REJECT_COMBINED:-0}" = 1 ] && exit 1
+    cat "$FIXTURE" ;;
+  *gtt*)
+    [ "${FAIL_GTT:-0}" = 1 ] && exit 1
+    grep GTT "$FIXTURE" || true ;;
+  *)
+    grep -v GTT "$FIXTURE" || true ;;
+esac
+"#;
+
+    /// Run a preflight script against fixture `rocm-smi` output, returning its
+    /// exit code and everything it logged. `rocm-smi` is stubbed on `PATH`;
+    /// nothing touches a real GPU.
+    ///
+    /// `shell` decides how the body is invoked, so each lane is driven the way
+    /// CI drives it rather than under whichever options happen to be stricter.
+    #[cfg(unix)]
+    fn run_preflight(
+        script: &str,
+        shell: PreflightShell,
+        fixture: &str,
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture_path = dir.path().join("smi.txt");
+        let script_path = dir.path().join("preflight.sh");
+        let stub = dir.path().join("rocm-smi");
+        std::fs::write(&fixture_path, fixture).expect("write fixture");
+        std::fs::write(&script_path, script).expect("write script");
+        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = std::process::Command::new("bash");
+        if matches!(shell, PreflightShell::DefaultRunStep) {
+            cmd.arg("-e");
+        }
+        let out = cmd
+            .arg(&script_path)
+            .env("PATH", path)
+            .env("FIXTURE", &fixture_path)
+            .env("COUNTER", dir.path().join("calls"))
+            // One poll, then the script's own 5s backoff ends the loop. Cases
+            // that need a second poll raise this.
+            .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            .envs(env.iter().copied())
+            .output()
+            .expect("running the preflight script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("preflight exited with a status code"),
+            log,
+        )
+    }
+
+    /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
+    #[cfg(unix)]
+    fn apu_lanes() -> (String, String) {
+        let steps = gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"));
+        let native = steps
+            .iter()
+            .filter(|s| is_apu_preflight(s) && !s.contains("advisory"))
+            .find_map(|s| preflight_shell_script(s))
+            .expect("native APU preflight shell script");
+        let advisory = steps
+            .iter()
+            .filter(|s| s.contains("advisory"))
+            .find_map(|s| preflight_shell_script(s))
+            .expect("advisory APU preflight shell script");
+        (native, advisory)
+    }
+
+    /// The Windows-native APU preflight body, which is PowerShell end to end.
+    #[cfg(unix)]
+    fn windows_apu_lane() -> String {
+        gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"))
+            .iter()
+            .filter(|s| is_apu_preflight(s))
+            .find_map(|s| preflight_powershell_script(s))
+            .expect("Windows APU preflight PowerShell script")
+    }
+
+    /// Whether GNU `timeout` — which every shell lane wraps `rocm-smi` in — is
+    /// available to drive these scripts at all.
+    #[cfg(unix)]
+    fn has_timeout() -> bool {
+        std::process::Command::new("timeout")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[cfg(unix)]
+    fn has_pwsh() -> bool {
+        std::process::Command::new("pwsh")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// Run the Windows preflight body under `pwsh`, stubbing `rocm-smi` on
+    /// `PATH` exactly as the shell lanes do.
+    ///
+    /// Unix-only because the stub is a `/bin/sh` script; on Windows CI this
+    /// block is still covered by the drift and shape checks. `pwsh` ships on
+    /// GitHub's Ubuntu images, so this normally runs rather than skips.
+    #[cfg(unix)]
+    fn run_preflight_pwsh(script: &str, fixture: &str, env: &[(&str, &str)]) -> (i32, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture_path = dir.path().join("smi.txt");
+        let script_path = dir.path().join("preflight.ps1");
+        let stub = dir.path().join("rocm-smi");
+        std::fs::write(&fixture_path, fixture).expect("write fixture");
+        std::fs::write(&script_path, script).expect("write script");
+        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-File"])
+            .arg(&script_path)
+            .env("PATH", path)
+            .env("FIXTURE", &fixture_path)
+            .env("COUNTER", dir.path().join("calls"))
+            .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            .envs(env.iter().copied())
+            .output()
+            .expect("running the preflight script under pwsh");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("preflight exited with a status code"),
+            log,
+        )
+    }
+
+    /// One host reading, and what each lane must make of it.
+    #[cfg(unix)]
+    struct GateCase {
+        label: &'static str,
+        fixture: String,
+        env: Vec<(&'static str, &'static str)>,
+        /// Exit code, plus phrases the log must carry, for the native lane…
+        native: (i32, &'static [&'static str]),
+        /// …and for the advisory one.
+        advisory: (i32, &'static [&'static str]),
+    }
+
+    #[cfg(unix)]
+    fn assert_gate(lane: &str, case: &str, got: (i32, String), want: (i32, &[&str])) {
+        let (code, log) = got;
+        assert_eq!(code, want.0, "{lane} preflight, {case} — logged:\n{log}");
+        for phrase in want.1 {
+            assert!(
+                log.contains(phrase),
+                "{lane} preflight, {case}: expected {phrase:?} in the log, got:\n{log}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apu_preflight_gates_on_the_pool_the_engine_uses() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        // The shape tests above cannot tell a working gate from a broken one:
+        // they all pass with the production logic reverted. This drives the real
+        // script against fixture tool output instead, which is what distinguishes
+        // "measures the right pool" from "passes whenever any pool looks free".
+        //
+        // Each case pins the reason as well as the exit code. Several branches
+        // here exist ONLY to produce an honest reason: deleting the "no GTT
+        // pool" bail leaves every exit code untouched and swaps the message back
+        // to the false "a serve is likely still holding the GPU" this change
+        // exists to stop — invisible to an exit-code-only assertion.
+        //
+        // All three hard-failing lanes are driven, the Windows one included: it
+        // is a third copy of the same logic in another language, and the bug
+        // that prompted this work was one copy left behind.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let windows = has_pwsh().then(windows_apu_lane);
+        if windows.is_none() {
+            eprintln!("skipping the Windows lane: no `pwsh` on PATH");
+        }
+
+        let cases = vec![
+            GateCase {
+                label: "carveout with a free aperture",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![],
+                native: (0, &["GPU ready: 61 GiB GTT free"]),
+                advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+            },
+            // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
+            // single-pool fallback carries no GTT rows, so without a dedicated
+            // GTT query this healthy APU would fail as "no GTT pool" — the very
+            // false low-memory report this gate exists to stop producing. The
+            // separate-query line must appear too: the pool line printed earlier
+            // necessarily said `GTT n/a/n/a`, and a log that stops there
+            // contradicts the verdict.
+            GateCase {
+                label: "carveout where rocm-smi rejects the two-pool query",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("REJECT_COMBINED", "1")],
+                native: (
+                    0,
+                    &[
+                        "rocm-smi GTT pool (separate query):",
+                        "GPU ready: 61 GiB GTT free",
+                    ],
+                ),
+                advisory: (
+                    0,
+                    &[
+                        "rocm-smi GTT pool (separate query):",
+                        "GPU ready: 61 GiB GTT free",
+                    ],
+                ),
+            },
+            GateCase {
+                label: "carveout with the aperture pinned by a leftover serve",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB))),
+                env: vec![],
+                native: (1, &["GTT never dropped below the floor"]),
+                advisory: (1, &["GTT never dropped below the floor"]),
+            },
+            GateCase {
+                label: "discrete card with VRAM free",
+                fixture: smi_fixture(192 * GIB, 10 * GIB, None),
+                env: vec![],
+                native: (0, &["GPU ready: 182 GiB VRAM free"]),
+                advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+            },
+            GateCase {
+                label: "discrete card with VRAM held",
+                fixture: smi_fixture(192 * GIB, 191 * GIB, None),
+                env: vec![],
+                native: (1, &["VRAM never dropped below the floor"]),
+                advisory: (1, &["VRAM never dropped below the floor"]),
+            },
+            // A wedged driver must not be read as "this is an APU" and waved
+            // through on whatever the other pool reports.
+            GateCase {
+                label: "zero VRAM total against a healthy aperture",
+                fixture: smi_fixture(0, 0, Some((62 * GIB, GIB))),
+                env: vec![],
+                native: (1, &["reported a VRAM total of 0"]),
+                advisory: (0, &["no VRAM figures under WSL"]),
+            },
+            // The same defect one pool over: a GTT total that parses as zero is
+            // a failed reading, not an exhausted aperture. Unguarded it produced
+            // `0 GiB free … a serve is likely still holding the GPU` — verbatim
+            // the report this change exists to eliminate — and hard-failed the
+            // one lane specified never to fail on a host it cannot read.
+            GateCase {
+                label: "carveout with a GTT total of zero",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((0, 0))),
+                env: vec![],
+                native: (1, &["reported a GTT total of 0"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+            // Nothing measurable: the native lane fails, the advisory lane warns.
+            GateCase {
+                label: "carveout with no GTT pool reported",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, None),
+                env: vec![],
+                native: (1, &["reported no GTT pool"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+            // A query that failed is not a host without the pool. The aperture
+            // is right there in the fixture; only the call for it broke, and
+            // saying "no GTT pool" here would report a flake as a hardware fact.
+            GateCase {
+                label: "carveout where the GTT query itself fails",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("REJECT_COMBINED", "1"), ("FAIL_GTT", "1")],
+                native: (1, &["the GTT query itself failed"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+        ];
+
+        let (native, advisory) = apu_lanes();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = cases
+                .iter()
+                .map(|case| {
+                    let (native, advisory, windows) = (&native, &advisory, &windows);
+                    scope.spawn(move || {
+                        (
+                            case,
+                            run_preflight(
+                                native,
+                                PreflightShell::DefaultRunStep,
+                                &case.fixture,
+                                &case.env,
+                            ),
+                            run_preflight(
+                                advisory,
+                                PreflightShell::WslBareBash,
+                                &case.fixture,
+                                &case.env,
+                            ),
+                            windows
+                                .as_ref()
+                                .map(|w| run_preflight_pwsh(w, &case.fixture, &case.env)),
+                        )
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (case, native, advisory, windows) =
+                    handle.join().expect("preflight case thread");
+                assert_gate("native", case.label, native, case.native);
+                assert_gate("advisory", case.label, advisory, case.advisory);
+                // The Windows block guards the same hardware class with the
+                // same floor, so it owes the same verdicts as the native lane.
+                if let Some(windows) = windows {
+                    assert_gate("Windows", case.label, windows, case.native);
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apu_preflight_verdict_reflects_the_last_completed_reading() {
+        const MIB: u64 = 1024 * 1024;
+
+        // A poll that ends in an early `continue` — rocm-smi timing out, empty
+        // fields — learned nothing, so it must not overwrite what the last
+        // completed poll established. Here poll 1 reads a carveout with no GTT
+        // pool and the tool then stops answering entirely.
+        //
+        // The advisory lane must still WARN: it is specified never to hard-fail
+        // on a host it cannot measure. Re-deriving that state per poll instead
+        // would let the silent second poll flip this to `exit 1` with "a serve
+        // is likely still holding the GPU" — a serve this run never observed,
+        // which is the report the whole change exists to stop.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+
+        // Two polls: one at t=0, one after the script's own 5s backoff. The
+        // first spends two calls (combined, then GTT alone); everything after
+        // that fails, so the second poll reads nothing.
+        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "6")];
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, None);
+        let (native, advisory) = apu_lanes();
+
+        assert_gate(
+            "advisory",
+            "reading lost after the first poll",
+            run_preflight(&advisory, PreflightShell::WslBareBash, &fixture, &env),
+            (0, &["no usable GTT pool"]),
+        );
+        // The native lane hard-fails either way, but for the reason the last
+        // completed poll actually found rather than a default about a serve.
+        assert_gate(
+            "native",
+            "reading lost after the first poll",
+            run_preflight(&native, PreflightShell::DefaultRunStep, &fixture, &env),
+            (1, &["reported no GTT pool"]),
+        );
     }
 
     #[test]
@@ -882,8 +1642,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let dispatch_timeout = job_scalar(job_block(&self_hosted, "e2e-wsl"), "timeout-minutes");
         let nightly_timeout = job_scalar(job_block(&nightly, "e2e-wsl-nightly"), "timeout-minutes");
         assert_eq!(
-            dispatch_timeout, "90",
-            "the 2400s large-model readiness budget needs the established 90-minute job cap for setup and the remaining suite"
+            dispatch_timeout, "120",
+            "the 2400s large-model readiness budget plus the ephemeral pool's per-job WSL install/build/prewarm \
+             overhead needs the established 120-minute job cap for setup and the remaining suite"
         );
         assert_eq!(
             dispatch_timeout, nightly_timeout,
@@ -955,19 +1716,33 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 )
             })
             .filter(|name| !name.starts_with("e2e-consolidated-report"))
+            .map(|name| crate::e2e_report::without_channel_matrix_segment(&name))
             .collect();
         declared_artifacts.sort();
         declared_artifacts.dedup();
         let mut documented_artifacts = backticked_list_between(
             &docs,
             "The lane artifacts are named canonically (",
-            ") in every workflow",
+            ") in `ci.yml` and",
         );
         // Sorted, not deduplicated: a name listed twice must still fail.
         documented_artifacts.sort();
         assert_eq!(
             documented_artifacts, declared_artifacts,
             "the canonical artifact list must enumerate every uploaded report artifact exactly once"
+        );
+
+        // ponytail: brittle literal-text match, not a YAML matrix parse — it exists only
+        // to keep this hardcoded literal in sync with `consolidated::parse_descriptor`'s
+        // hardcoded "release"/"nightly" suffixes. If nightly.yml's channel matrix ever
+        // changes, update both it and `parse_descriptor` together.
+        let nightly = std::fs::read_to_string(repo_root().join(".github/workflows/nightly.yml"))
+            .expect("read nightly.yml");
+        assert!(
+            nightly.contains("channel: [release, nightly]"),
+            "nightly.yml's channel matrix must declare exactly the channel values \
+             `consolidated::parse_descriptor` strips as artifact-name suffixes; if this \
+             literal ever changes, `parse_descriptor` must change with it"
         );
 
         let platform_input = nested_block(
@@ -1418,5 +2193,393 @@ permissions:
     fn job_mapping_extractor_rejects_malformed_non_comment_rows() {
         let block = "    env:\n      VALID: one\n      MALFORMED\n    steps:\n";
         let _ = job_mapping(block, "env");
+    }
+
+    /// The E2E-owned roots declared in `scripts/reclaim-gpu.sh`.
+    ///
+    /// Parsed rather than duplicated: a copy here would drift the same way the
+    /// PowerShell mirrors can, which is the defect this test exists to prevent.
+    fn reclaim_script_roots() -> Vec<String> {
+        let p = repo_root().join("scripts/reclaim-gpu.sh");
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n");
+        parse_e2e_roots(&text, &p.display().to_string())
+    }
+
+    /// The parsing half of [`reclaim_script_roots`], split out so every spelling
+    /// it must cope with is a standing test rather than a mutation somebody has
+    /// to remember to run by hand against the tracked script.
+    ///
+    /// That split is the point. The previous version of this parser could only
+    /// be exercised by editing `scripts/reclaim-gpu.sh` itself, so three legal
+    /// spellings of the same array reached review unnoticed — and the failure
+    /// they produced blamed the PowerShell mirrors, advising a maintainer to
+    /// delete a real root from Windows.
+    fn parse_e2e_roots(text: &str, origin: &str) -> Vec<String> {
+        // Comments come off BEFORE anything is located — before the array's
+        // START as well as its closing `)`. Two distinct mis-parses, one fix:
+        //
+        //   - an inline comment containing a `)` — `'/tmp/rocm-e2e'  # see docs
+        //     (section 3)` — closes the array at that paren, so every root below
+        //     it vanishes from the parse. The test then fails in the
+        //     mirror->script direction naming a root that is plainly still in
+        //     the script, and a maintainer who follows that message deletes a
+        //     real root from both PowerShell mirrors. Measured: that spelling
+        //     made this test demand the deletion of `e2e-prewarm`, the root this
+        //     whole change exists to add.
+        //   - a comment ABOVE the array that merely quotes the literal text
+        //     `E2E_ROOTS=(` would otherwise anchor the search inside that
+        //     sentence rather than at the declaration. This file already quotes
+        //     bash array syntax in prose (`E2E_ROOTS+=(` appears in a comment),
+        //     so that is a spelling a future header edit can reach.
+        let decommented = text
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with('#') {
+                    ""
+                } else {
+                    strip_comment(l)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = decommented
+            .split_once("E2E_ROOTS=(")
+            .unwrap_or_else(|| panic!("{origin} must declare E2E_ROOTS=("))
+            .1
+            .split_once(')')
+            .unwrap_or_else(|| panic!("{origin} has an unterminated E2E_ROOTS array"))
+            .0;
+
+        // Every non-empty line inside the array must parse into exactly one
+        // root. This is the load-bearing half: without it an unrecognised
+        // spelling is silently DROPPED, and a dropped root is indistinguishable
+        // from mirror drift downstream — so the failure arrives as a confident
+        // wrong remedy rather than as "this parser did not understand the
+        // array". A checker that converts a formatting change into advice that
+        // removes Windows coverage is worse than no checker on that axis.
+        //
+        // Deliberately NOT tokenised on whitespace: that would silently split a
+        // future root containing a space into two bogus roots, which is this
+        // same defect class in a new place.
+        let mut roots: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Both bash quotings are accepted. A quoted root can never contain
+            // its OWN delimiter, so requiring that is what rejects the whole
+            // array folded onto one line — `E2E_ROOTS=('a' 'b')` parses as the
+            // single bogus root `a' 'b` under a prefix/suffix strip alone, and
+            // then fails script->mirror naming a root nobody wrote.
+            let parsed = ['\'', '"'].into_iter().find_map(|q| {
+                line.strip_prefix(q)
+                    .and_then(|l| l.strip_suffix(q))
+                    .filter(|inner| !inner.contains(q))
+            });
+            let Some(root) = parsed else {
+                // `strip_comment` splits on a literal " #" with no quote
+                // awareness, so a root whose VALUE contains that sequence —
+                // `'/tmp/e2e root #2'`, which bash itself accepts, since `#` is
+                // inert inside single quotes — arrives here already truncated
+                // and unterminated. Named in the message rather than fixed:
+                // this lands as a loud false failure, never a silent miss, and
+                // making the shared helper quote-aware for a spelling no root
+                // uses would be untested code on a path every other caller
+                // depends on.
+                panic!(
+                    "{origin}: E2E_ROOTS line `{line}` is not a single quoted root. This \
+                     test's parser did not understand it — that is NOT drift against the \
+                     PowerShell mirrors, so do not remove anything from them. Restore one \
+                     quoted root per line, or teach this parser the new spelling. Note the \
+                     line is shown after comment-stripping, so a root whose value contains \
+                     \" #\" appears truncated here (EAI-8751)"
+                );
+            };
+            roots.push(root.to_owned());
+        }
+        assert!(
+            !roots.is_empty(),
+            "{origin} declared no E2E_ROOTS entries — the parser or the array shape changed"
+        );
+        roots
+    }
+
+    /// An `E2E_ROOTS` array spelled the way the script spells it today, with
+    /// enough surrounding file to exercise the comment handling.
+    #[cfg(test)]
+    fn roots_fixture(body: &str) -> String {
+        format!(
+            "#!/usr/bin/env bash\n# a header comment\nset -euo pipefail\nE2E_ROOTS=(\n{body})\nENGINE_MARKERS=(\n  'llama-server'\n)\n"
+        )
+    }
+
+    /// Every spelling this parser must cope with, as a test rather than as a
+    /// mutation of the tracked script. Each of these was found by editing
+    /// `scripts/reclaim-gpu.sh` by hand during review; none of them could fail
+    /// CI afterwards, which is the gap this closes.
+    #[test]
+    fn e2e_roots_parser_accepts_legal_respellings_of_the_same_array() {
+        let canonical = vec!["/tmp/rocm-e2e".to_owned(), "e2e-shared".to_owned()];
+
+        // As written today.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // An inline comment containing a `)`. This closed the array early and
+        // made the test demand the deletion of a real root from Windows.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'  # see docs (section 3)\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // Double quotes, and a mix of both. Silently dropped the entry before.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  \"/tmp/rocm-e2e\"\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A full-line comment inside the array, indented or at column 0, and a
+        // blank line. All three are skipped rather than failing completeness.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n# flush left\n  # indented\n\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A comment ABOVE the array quoting the declaration's own text. The
+        // anchor must find the declaration, not the sentence about it.
+        let text = "#!/usr/bin/env bash\n# see how E2E_ROOTS=( is declared below\nE2E_ROOTS=(\n  '/tmp/rocm-e2e'\n  'e2e-shared'\n)\n";
+        assert_eq!(parse_e2e_roots(text, "fixture"), canonical);
+
+        // A root containing a space is preserved whole, which is what rules out
+        // tokenising the body on whitespace.
+        assert_eq!(
+            parse_e2e_roots(&roots_fixture("  '/tmp/rocm e2e'\n"), "fixture"),
+            vec!["/tmp/rocm e2e".to_owned()]
+        );
+    }
+
+    /// The other half: spellings the parser must REJECT, and reject as its own
+    /// misunderstanding rather than as drift against the PowerShell mirrors —
+    /// because the mirror-drift message tells a maintainer to delete a root
+    /// from Windows, and following it on a false positive is what makes this
+    /// worse than having no checker.
+    #[test]
+    fn e2e_roots_parser_rejects_unparsable_lines_without_blaming_the_mirrors() {
+        for (label, body) in [
+            (
+                "array folded onto one line",
+                "  '/tmp/rocm-e2e' 'e2e-shared'\n",
+            ),
+            ("unquoted entry", "  e2e-shared\n"),
+            ("unterminated quote", "  '/tmp/rocm-e2e\n"),
+            // `strip_comment` is not quote-aware, so this arrives truncated.
+            // Rejected loudly, never silently dropped.
+            ("value containing \" #\"", "  '/tmp/rocm e2e #2'\n"),
+        ] {
+            let text = roots_fixture(body);
+            let err = std::panic::catch_unwind(|| parse_e2e_roots(&text, "fixture"))
+                .expect_err(&format!("{label} must not parse"));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("did not understand"),
+                "{label} failed with the wrong message — it must not read as mirror drift: {msg}"
+            );
+            assert!(
+                msg.contains("do not remove anything from them"),
+                "{label} must tell the reader NOT to edit the mirrors: {msg}"
+            );
+        }
+    }
+
+    /// An empty array is a parser/shape change, not zero roots — and must not
+    /// sail through as "no roots declared, nothing to compare".
+    #[test]
+    fn e2e_roots_parser_rejects_an_empty_array() {
+        let err = std::panic::catch_unwind(|| parse_e2e_roots(&roots_fixture(""), "fixture"))
+            .expect_err("an empty E2E_ROOTS must not parse as success");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("declared no E2E_ROOTS entries"), "got: {msg}");
+    }
+
+    /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
+    /// alternation on the `Where-Object` line.
+    ///
+    /// This cannot tell the reclaim's own matcher from any other
+    /// `Where-Object … -match` line. Each of these workflows has exactly one
+    /// today, so every alternation returned IS a reclaim matcher; add a second,
+    /// unrelated one and the caller's assertions would be applied to it too.
+    ///
+    /// Extracted rather than substring-matched against the whole file for the
+    /// reason this module's header gives: every root ALSO appears in these
+    /// workflows as an env var and in prose, so a `text.contains(root)` check
+    /// passes even when the alternation itself has lost that root. Confirmed by
+    /// mutation — deleting `e2e-prewarm` from the alternation left the
+    /// whole-file form of this test green.
+    fn powershell_reclaim_root_alternations(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("Where-Object") && l.contains("-match"))
+            .map(|l| {
+                let after = l.split_once("-match").expect("filtered on -match").1;
+                let body = after
+                    .split_once('\'')
+                    .unwrap_or_else(|| panic!("no opening quote in matcher line: {l}"))
+                    .1;
+                body.split_once('\'')
+                    .unwrap_or_else(|| panic!("unterminated matcher literal: {l}"))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// EAI-8751: native Windows has no bash, so the two PowerShell reclaim steps
+    /// restate the bash rule instead of sharing it. Nothing else in CI compares
+    /// the two, so a root added to the script — as `e2e-prewarm` was, to fix a
+    /// leak that held the card for 16 consecutive jobs — can silently miss the
+    /// Windows lanes.
+    ///
+    /// Only the ROOT half is pinned. The engine half is knowingly divergent on
+    /// Windows (EAI-8815), so asserting parity there would fail on a difference
+    /// that is recorded rather than accidental.
+    #[test]
+    fn reclaim_roots_are_mirrored_in_the_powershell_reclaims() {
+        let roots = reclaim_script_roots();
+        for workflow in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let text = read_workflow(workflow);
+            assert!(
+                text.contains("Get-CimInstance Win32_Process"),
+                "{workflow} must keep a PowerShell reclaim step (EAI-8751)"
+            );
+            let alternations = powershell_reclaim_root_alternations(&text);
+            assert!(
+                !alternations.is_empty(),
+                "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
+                 — the step's shape changed and this guard went blind (EAI-8751)"
+            );
+            // The scenario root is compared on its portable segment, and that
+            // asymmetry is deliberate rather than cosmetic.
+            //
+            // bash anchors it to an absolute path (`/tmp/rocm-e2e`, plus a
+            // TMPDIR-derived form appended at run time) because its roots are
+            // matched as unanchored substrings of a whole command line: the
+            // bare segment would also match an ARGUMENT naming it, and kill a
+            // hand-run serve the script promises to spare. The PowerShell
+            // mirrors carry the bare segment and so do have that exposure —
+            // pre-existing, and not something this test can fix by failing.
+            //
+            // That anchoring gap is NOT what EAI-8815 tracks. That ticket is
+            // scoped to the engine-marker divergence (`rocm.exe daemon`
+            // unmatched; `__engine-serve-http` sitting in the root alternation
+            // rather than the engine one), and closing it would leave the
+            // substring exposure untouched. The anchoring gap is untracked on
+            // the Windows side — said plainly here, so that closing EAI-8815
+            // cannot be misread as closing this as well.
+            //
+            // What it still pins is the part that matters here: that every root
+            // the script knows about is named in both mirrors, so a root added
+            // to one side cannot silently miss the Windows lanes.
+            //
+            // CAVEAT: the `/tmp/` prefix below is the only absolute prefix this
+            // mapping knows. A future root anchored under any other one — say
+            // `/var/tmp/rocm-e2e` — would be compared to the mirrors verbatim,
+            // fail against their bare segment, and need this line edited by
+            // hand: the manual sync this test exists to remove, reappearing one
+            // level up. Named rather than generalised, because there is exactly
+            // one anchored root today and a speculative prefix list would be
+            // untested code.
+            let expected: Vec<&str> = roots
+                .iter()
+                .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
+                .collect();
+
+            // Pinned at one, which is what lets the exemption below be tracked
+            // per WORKFLOW rather than per alternation. Requiring EVERY
+            // alternation to name the exempted marker would fail spuriously the
+            // moment an unrelated `Where-Object … -match` line appeared — the
+            // case `powershell_reclaim_root_alternations` warns it cannot
+            // distinguish — but relaxing it to "some alternation" would stop
+            // catching a second matcher that copies every root and drops the
+            // marker. While there is exactly one, the two readings coincide;
+            // this assertion is what keeps that true, and fails loudly with
+            // something to decide if a second one is ever added.
+            assert_eq!(
+                alternations.len(),
+                1,
+                "{workflow} now has {} PowerShell reclaim matcher alternations; the \
+                 divergence-exemption check below assumes exactly one, and must be \
+                 re-read per alternation before this count changes (EAI-8751)",
+                alternations.len()
+            );
+            let mut divergence_seen = false;
+            for alternation in &alternations {
+                let present: Vec<&str> = alternation.split('|').collect();
+
+                // Script -> mirror: a root added to the script must reach Windows.
+                for needle in &expected {
+                    assert!(
+                        present.contains(needle),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` does not name \
+                         the E2E root `{needle}` declared in scripts/reclaim-gpu.sh (EAI-8751)"
+                    );
+                }
+
+                // Mirror -> script: and a root REMOVED from the script must not be
+                // left behind here. Without this direction the guard is one-way,
+                // which is how the lists drifted in the first place.
+                for token in &present {
+                    // Known divergence, not drift: `__engine-serve-http` is an
+                    // ENGINE marker that sits in this root alternation, so on
+                    // Windows it over-matches. Tracked in EAI-8815 — when that is
+                    // fixed, delete this arm and the assertion below will hold.
+                    if *token == "__engine-serve-http" {
+                        divergence_seen = true;
+                        continue;
+                    }
+                    assert!(
+                        expected.contains(token),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` names `{token}`, \
+                         which is not an E2E root in scripts/reclaim-gpu.sh — remove it here too, \
+                         or add it there (EAI-8751)"
+                    );
+                }
+            }
+
+            // An exemption nothing asserts is an exemption that rots: once
+            // EAI-8815 moves `__engine-serve-http` out of the root alternation,
+            // the arm above stops firing and would sit here forever as dead
+            // code exempting nothing. Fail instead, so the fix is told to
+            // finish the job.
+            assert!(
+                divergence_seen,
+                "no PowerShell reclaim matcher in {workflow} names `__engine-serve-http`, so the \
+                 EAI-8815 divergence looks fixed — delete the exemption arm in this test, which \
+                 is now dead code (EAI-8751)"
+            );
+        }
     }
 }

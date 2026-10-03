@@ -216,7 +216,7 @@ rocm serve qwen
 ```
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
-box. You can also serve any compatible Hugging Face model directly — see
+box. You can also serve any compatible Hugging Face model directly. See
 [Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
@@ -233,10 +233,11 @@ form works depends on the engine your GPU selects.
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm agents [<agent>]` | List, inspect, configure, or test local agent harnesses |
+| `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the rocm-cli version |
+| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -302,7 +303,7 @@ sometimes because it also needs sudo or a reboot).
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -312,43 +313,84 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. An install with no active default runtime never prompts, but once a
-managed runtime is the active default every `install sdk` asks first, because
-the new install takes over as the active default. That gate is not scoped to the
-family or channel you are installing: a `--family` or `--channel` you have never
-installed before takes over the active default just as a same-family upgrade
-does, so it asks too. To approve that non-interactively — in scripts or CI, where
-the prompt would otherwise refuse — pass `--approve-replacing-active-default`,
-which is also what the refusal itself recommends and what ROCm CLI's own
-non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
-approval *and* approves installing required system packages (such as OpenMPI for
-vLLM), which means `sudo`; reach for it only where something can answer a sudo
-password prompt — which an unattended job cannot, unless it has passwordless sudo
-configured. In the default managed install root, the root and its manifest are
-keyed by version, so an upgrade or downgrade keeps the previous install on disk
-and only a same-version reinstall reuses the same root. `--prefix` opts out of
-that: the folder you name is used verbatim for every version, so successive
-installs into one prefix replace each other in place — and if the venv already
-there no longer runs its own Python, it is removed outright and rebuilt. The
-consent gate does not cover that: it asks about changing the active default
-runtime, not about what a named prefix loses. `install driver` installs the AMD
-kernel driver on Linux (DKMS or native package). `update` checks for a newer
-ROCm package; pass `--apply` to install it, or `--dry-run` to preview what
-`--apply` would do without changing anything (`--dry-run` does not require
-`--apply`). `--runtime` and `--activate` require `--apply` or `--dry-run` — pass
-one of those instead of naming a runtime or requesting activation on its own.
-`--json` prints the check result as a single line of JSON instead of text;
-`--timeout-secs` bounds its network calls (`--timeout-secs` requires `--json`;
-both `--json` and `--timeout-secs` conflict with `--apply`, and `--json` also
-conflicts with `--dry-run`). `update --apply` never prompts and needs no
-approval flag: selecting a runtime to update is itself the approval, and it
-leaves the active default alone unless you add `--activate`. `update` does
-accept `--yes`, for consistency with other mutating commands, but it grants
-nothing there — the approval line the update path prints never credits it.
+by rocm-cli.
 
-ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
-for it takes two things together: pin the version with `--version`, and name the
-exact GPU arch — the raw `gfx` code, not a family label:
+#### Compiler toolchain (--devel)
+
+Pass `--devel` to also install the compiler and headers needed to build GPU
+code. This roughly doubles the download.
+
+`--devel` isn't an addition to an existing runtime. A runtime is identified by
+the packages it was installed from, so running `rocm install sdk` and later
+`rocm install sdk --devel` at the same version leaves you with **two**
+side-by-side runtimes. The second is a fresh full install, not a toolchain
+bolted onto the first, and it becomes active.
+
+To tell the two apart:
+
+- `rocm runtimes list` marks each runtime `toolchain=included` or
+  `toolchain=excluded`.
+- `rocm examine` reports the active runtime's toolchain as
+  `active_runtime_toolchain`.
+- `rocm storage remove-old-installs` counts the two kinds separately, so
+  neither evicts the other.
+
+To reclaim the space, uninstall the one you don't want with
+`rocm runtimes uninstall <runtime-key>`.
+
+#### Approval prompt
+
+If no managed runtime is the active default, `install sdk` doesn't prompt.
+Otherwise it asks first, because the new install becomes the active default.
+The prompt applies to any install, including a `--family` or `--channel` you
+haven't installed before, just as it does for a same-family upgrade.
+
+To approve without a prompt, for example in scripts or CI, where the prompt
+would otherwise refuse:
+
+- `--approve-replacing-active-default` approves the change of active default.
+  The refusal message recommends it, and ROCm CLI's own non-interactive
+  surfaces (chat, MCP, and the dashboard) pass it.
+- `--yes` gives the same approval and also approves installing required system
+  packages, such as OpenMPI for vLLM. That requires `sudo`, so use it only where
+  something can answer a sudo password prompt. An unattended job can't, unless
+  it has passwordless sudo configured.
+
+#### Install location
+
+In the default managed install root, the root and its manifest are keyed by
+version. An upgrade or downgrade keeps the previous install on disk. Only a
+same-version reinstall reuses the same root.
+
+`--prefix` changes this. The folder you name is used as-is for every version, so
+successive installs into one prefix replace each other in place. If the venv
+already there no longer runs its own Python, it is removed outright and rebuilt.
+The approval prompt doesn't cover this, because it asks only about changing the
+active default runtime, not about what a named prefix loses.
+
+#### Driver installation
+
+`install driver` installs the AMD kernel driver on Linux, using DKMS or a native
+package.
+
+#### Updates
+
+`update` checks for a newer ROCm package.
+
+| Flag | Description |
+| --- | --- |
+| `--apply` | Installs the update. Never prompts and needs no approval flag, because selecting a runtime to update is the approval. Leaves the active default alone unless you add `--activate`. |
+| `--dry-run` | Previews what `--apply` would do without changing anything. Doesn't require `--apply`. |
+| `--runtime`, `--activate` | Require `--apply` or `--dry-run`. |
+| `--json` | Prints the check result as a single line of JSON instead of text. Conflicts with `--apply` and `--dry-run`. |
+| `--timeout-secs` | Bounds the network calls of the check. Requires `--json`. Conflicts with `--apply`. |
+| `--yes` | Accepted for consistency with other mutating commands, but grants nothing on `update`. The approval line the update path prints never credits it. |
+
+#### ROCm 10 and newer
+
+ROCm 10 and newer ship from a different source layout. You opt in by passing two
+things together: pin the version with `--version`, and name the exact GPU arch,
+using the raw `gfx` code rather than a family label:
 
 ```
 rocm install sdk --version 10.0.0 --family gfx1200 --dry-run
@@ -365,9 +407,9 @@ selected framework package carries the same ROCm build identifier before it
 creates or changes a managed runtime.
 
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources it always has, and
-it never quietly retries against the ROCm 10 sources when a lookup comes up
-empty — it tells you what it could not find instead.
+`install sdk` resolves the same release and nightly sources as before. It doesn't
+quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
+you what it couldn't find instead.
 
 ### Runtime management
 
@@ -384,6 +426,13 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 rocm runtimes adopt-system [--root <path>] [--runtime-id ID]
                            [--runtime-key KEY] [--activate] [--replace]
 ```
+
+`list` shows each runtime's version, GPU family, mode, and whether it carries
+the compiler toolchain (`toolchain=included|excluded`). Runtimes are told apart
+by the packages they were installed from, not by version alone, so one version
+can appear more than once: a `--devel` install and a plain one of the same
+version are two separate runtimes, as are two installs that resolved different
+GPU device payloads.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
@@ -422,18 +471,26 @@ rocm storage remove-downloads [--dry-run] [--yes]
 ```
 
 `remove-old-installs` keeps the two most recent installs for each channel,
-format, and GPU family, and never touches the install in use, the rollback
-target, or a folder rocm-cli did not create. "Most recent" means most recently
-installed rather than highest version, so after a deliberate downgrade the
-older version counts as the newer install. Because the count applies per
-channel, format, and GPU family, a machine that has tried several channels
-keeps `--keep` installs for each of them. Anything it declines to remove is
+format, GPU family, and toolchain choice, and never touches the install in use,
+the rollback target, or a folder rocm-cli did not create. "Most recent" means
+most recently installed rather than highest version, so after a deliberate
+downgrade the older version counts as the newer install. Because the count
+applies per channel, format, GPU family, and toolchain choice, a machine that
+has tried several channels keeps `--keep` installs for each of them — and a
+runtime-only install never evicts a `--devel` one, since the two are separate
+runtimes serving different purposes rather than newer and older versions of the
+same thing. Anything it declines to remove is
 listed with the reason, and `--dry-run` shows the whole plan without changing
 anything. `remove-downloads` clears cached archives that rocm-cli can download
 again; a cache folder that is a link to somewhere else is left alone rather
-than followed. The report also lists the
-`uv` package cache and downloaded models; those are shared with other tools
-and are never removed by rocm-cli.
+than followed. The two archive rows the report prints are tagged
+`note: can be downloaded again; safe to remove`, so it is visible which rows
+`remove-downloads` acts on. The report also lists `local server records` — one
+JSON record plus the engine's log for each `rocm serve --managed` launch, kept
+after the server stops; `rocm services list --all` lists them, and no `rocm
+storage` command removes them — and the `uv` package cache, the Hugging Face
+model cache, and downloaded models; those last three are shared with other
+tools and are never removed by rocm-cli.
 
 ### Inference engines
 
@@ -518,7 +575,7 @@ model across multiple GPUs is not supported. Because selection uses the
 Manage background servers started with `--managed`:
 
 ```
-rocm services list [--all]
+rocm services list [--all] [--json]
 rocm services logs <service-id>
 rocm services stop <service-id> [--yes]
 rocm services restart <service-id> [--yes]
@@ -537,7 +594,56 @@ status correction all count as touching it. Pass `--older-than-hours <n>` for a
 different threshold, or `--any-age` to take every record that is not running
 however recent — that is the flag `prune` names in its own summary when it
 reports how many records it kept for being too recent. The two cannot be
-combined.
+combined. A file whose record has not been written *yet* belongs to a server
+that is still starting, not to something left behind, so `prune` waits for any
+managed launch already under way to finish publishing its record before it looks
+at the directory. That wait lasts as long as the launch does and has no timeout,
+so it is usually imperceptible but is not bounded: on an interactive terminal
+`prune` prints `Waiting for a launch already under way…` while it waits,
+including under `--dry-run`. That notice goes to stderr and is suppressed when
+stderr is not a terminal, so a piped or scripted prune waits silently. The same
+lock runs in the other direction, so a `rocm serve`
+started while a `prune` is scanning waits for the prune.
+
+`--json` prints the service records verbatim, for scripting and for the remote
+orchestration below.
+
+### Remote machines (preview)
+
+Run a model on a different GPU machine and reach it from your own. Both machines
+join a [Tailscale](https://tailscale.com) network; the GPU machine serves the
+model on its own loopback address and publishes that port onto the network, so
+the endpoint keeps working after the command exits and answers from any of your
+machines rather than only the one that started it.
+
+```console
+rocm remote targets [--tag <tag>]
+rocm remote doctor <machine> [--symptom <text>]
+rocm remote serve <machine> <model> [--engine <engine>] [--gpu <index>]
+                                    [--tailnet-port <port>] [--install-rocm]
+rocm remote status [<session>]
+rocm remote attach <session>
+rocm remote stop <session> [--force]
+```
+
+`targets` lists machines on your network — it does not check whether they can
+actually serve, which is what `doctor` is for. `serve` prepares the machine
+(installing the CLI if it is missing), starts the model, publishes the endpoint
+and prints the address together with an API key.
+
+**The endpoint is reachable by every machine on your network that your network's
+access rules allow**, not just yours. That API key is what stops anyone else
+using it, so `rocm remote` always sets one — unlike local serving, which is
+credential-free because only your own machine can reach it.
+
+`status` reports the model and the endpoint separately, because either can fail
+alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
+withdraws the endpoint and stops the model, and keeps the session listed if it
+cannot confirm both — use `--force` to forget one whose machine is gone.
+
+Communication with the machine uses your existing `ssh` setup. Set
+`ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
+default.
 
 ### Dashboard
 
@@ -795,6 +901,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More docs
 
+- Architecture and module map: `docs/architecture.md`
 - Testing and verification: `docs/testing.md`
 - Developer manual QA: `docs/manual-testing.md`
 - Engine plugin policy: `docs/engine-plugins.md`

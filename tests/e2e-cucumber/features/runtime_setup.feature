@@ -1,5 +1,15 @@
 Feature: Runtime configuration
 
+  # The acceptance criterion for the runtime-only default, kept engine-agnostic
+  # on purpose: every GPU lane must check that a fresh install registers,
+  # activates, still carries an inference engine, and omits the compiler
+  # toolchain. Pinning this to one engine would drop that check on the lanes
+  # where that engine is not the effective one.
+  #
+  # The last two Thens are the same fact from the two surfaces that can
+  # disagree: what the install recorded, and what the diagnostic tells the user
+  # it recorded. The toolchain is now something a user can end up without, so
+  # `rocm examine` staying silent about it is its own defect.
   @id:runtime-install-sdk-active @requires-gpu @nightly
   Scenario: runtime-01 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
@@ -7,6 +17,8 @@ Feature: Runtime configuration
     Then a runtime is registered
     And the runtime is set as active
     And the runtime includes an inference engine
+    And the runtime excludes the compiler toolchain
+    And the inspection reports the active runtime has no compiler toolchain
 
   # Dogfooding #17: re-provisioning was observed writing inside the previous
   # runtime, producing a recursively nested `runtimes/wheel/.../runtimes/wheel/`
@@ -297,3 +309,64 @@ Feature: Runtime configuration
     Then the request plan shows an install command carrying no replacement consent
     And the executed command carries the replacement consent
     And the execution section says the consent came from the user's --yes
+
+  # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
+  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
+  # to the newest build if the pin is too old to have shipped a matching
+  # ROCm-version asset; revert to the packaged default if neither verifies).
+  # The unit tests exercise that state machine directly against injected
+  # install/align steps, but nothing else asserts that `rocm engines install
+  # lemonade` actually surfaces the outcome to a real user -- this is the one
+  # part of that path with no other e2e coverage.
+  #
+  # `--reinstall` re-extracts the packaged embeddable, resetting
+  # `backend_versions.json` to its pinned defaults, so this fires
+  # deterministically even against a shared runtime tree where an earlier
+  # scenario already left Lemonade's backend aligned (a plain install would
+  # find nothing left to do and print no alignment line at all). Verified
+  # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
+  # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
+  # predates a matching ROCm-version asset), and Tier 2's newest build
+  # succeeds -- producing exactly the line this scenario asserts.
+  #
+  # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
+  # environment and has no llama.cpp backend to align; `@nightly` for the same
+  # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
+  # and a real backend download, not something to repeat on every PR.
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
+    Given a managed runtime is active
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+
+  # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
+  # `backend_versions.json` -- the alignment runs on every Lemonade install, so
+  # without the opt-out a manual pin is silently overwritten the next time the
+  # engine is installed. Mirrors the vLLM torch-alignment opt-out (scenario 4)
+  # and its reasoning: a gate honoured only by the unit tests looks identical to
+  # a working one from every surface a user can see, so this asserts it from the
+  # CLI's own output -- the second Then does the enforcement proving (it reads
+  # the packaged pin and checks for the alignment/revert log lines); the first
+  # Then only proves the CLI read the variable and named it, which is a weaker
+  # claim on its own. Same lane as scenario 16 and for the same reason -- a real
+  # managed SDK and a real backend, on the serialized nightly GPU runners.
+  @id:runtime-lemonade-backend-alignment-opt-out @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-17 - Opting out of the Lemonade backend alignment keeps the packaged pin
+    Given a managed runtime is active
+    And the user has opted out of realigning Lemonade's backend
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's backend alignment was skipped by the opt-out
+    And the packaged pin survives the install
+
+  # The other half: that a runtime installed without the toolchain can actually
+  # serve. vLLM compiles Triton kernels at runtime, which is the case most
+  # likely to need `devel`, so it is the one worth proving end to end.
+  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @nightly
+  Scenario: runtime-18 - A runtime-only SDK install serves vLLM inference
+    Given a machine with no CLI-managed runtimes
+    When the user installs the SDK
+    Then the runtime excludes the compiler toolchain
+    When the user serves a model on GPU from the installed runtime
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model

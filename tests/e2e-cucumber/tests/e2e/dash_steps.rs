@@ -21,6 +21,11 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
 const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 
+/// The services overlay's own panel title, drawn by `draw_services_manager` on
+/// the overlay's border row. It is on screen exactly while the overlay is, so
+/// it proves both that the overlay opened and - as an absence - that it closed.
+const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
+
 /// The Observe instances table's TTFT cell while the scripted mock is serving:
 /// its histogram pins time-to-first-token at exactly 50 ms
 /// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
@@ -186,6 +191,152 @@ async fn open_observe_view(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 
+#[when("the user opens the managed services overlay")]
+async fn open_services_overlay(world: &mut E2eWorld) {
+    // `s` opens the services overlay, but only from the Observe tab, so the
+    // step before this one is load-bearing.
+    //
+    // Sent exactly once, never through `send_until`: once the overlay has focus
+    // the *same* key stages a stop approval for the selected row
+    // (`services_manager::on_key` -> `request_lifecycle`), so a second copy
+    // still queued in the terminal when the title appears would put a stop
+    // modal over the overlay in any scenario whose list is not empty.
+    // `send_until` says so itself - idempotent keys only.
+    //
+    // One send is enough here because the preceding step (`the user opens the
+    // Observe view`) returns only after the dashboard has *acted on* a key, so
+    // the event loop is provably reading by the time this runs. That startup
+    // race is the only thing the retry bought, and it is already closed. Any
+    // future ordering that drops that guarantee has to re-establish it before
+    // this step, not restore the retry.
+    let tui = session(world);
+    tui.send("s")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay key: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the overlay reports the record that is no longer running")]
+async fn services_overlay_reports_past_attempts(world: &mut E2eWorld) {
+    // The overlay renders only the live instances the daemon scrapes, so the
+    // failed record left no trace here at all. The count is read from the
+    // registry at launch, so it survives the daemon never having seen it.
+    //
+    // Asserted as the one note line the overlay renders, pointer included: the
+    // count is only useful attached to the command that can show the record,
+    // which the overlay itself cannot. Waiting for the pointer separately would
+    // also pass with it rendered anywhere else on screen, or detached from the
+    // count it belongs to.
+    session(world)
+        .wait_for_screen(
+            "1 local server record(s) are no longer running - see `rocm services list --all`",
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the overlay never counted the failed record and named how to see it: {e}")
+        });
+}
+
+#[when("the user closes the managed services overlay")]
+async fn close_services_overlay(world: &mut E2eWorld) {
+    // An open overlay eats the quit key - it closes the overlay instead - so a
+    // scenario that opened one has to close it before the quit step, or the
+    // dashboard is still running when that step gives up.
+    //
+    // What proves it closed is the overlay's *own* title going away. A panel
+    // title the overlay was covering proves nothing on its own: which Observe
+    // rows the overlay's rectangle covers depends on that tab's layout - the
+    // no-live-data banner shifts the band down a row - so with live telemetry
+    // such a title moves out from under the overlay and is visible while the
+    // overlay is still up. This step would then return early and the quit key
+    // would be eaten after all. `SERVICES_OVERLAY_TITLE` is drawn by the
+    // overlay itself, so its absence cannot be satisfied while it is open.
+    //
+    // Sent exactly once, for the reason `open_services_overlay` gives: Esc past
+    // the overlay is not idempotent either - on the Observe tab it opens the
+    // launcher menu (`KeyAction::OpenMenu`) - and the event loop has provably
+    // been reading keys since the overlay opened.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay close key: {e}"));
+    tui.wait_until_gone(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to close the services overlay: {e}"));
+}
+
+#[when("the user opens the Chat view")]
+async fn open_chat_view(world: &mut E2eWorld) {
+    // Same resend-until-it-takes rationale as `open_observe_view`: nothing
+    // before this step proves the event loop is reading input yet.
+    session(world)
+        .send_until("5", "● Chat", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to switch to the Chat tab: {e}"));
+}
+
+#[when("the user opens instance detail")]
+async fn open_instance_detail(world: &mut E2eWorld) {
+    // `Enter` on the Observe tab opens the selected instance's detail popup
+    // (`KeyAction::OpenDetail`); the demo session always seeds at least one
+    // instance, so the default selection (index 0) is always present. Enter
+    // toggles `Modal::Detail` open/closed, so it is NOT safe to resend via
+    // `send_until` (its own doc comment restricts that to idempotent keys) —
+    // a resend while the popup is already open would immediately close it.
+    // Plain `send` + `wait_for_screen` instead.
+    let tui = session(world);
+    // The `● Observe` marker asserted by `open_observe_view` only proves the
+    // tab switch rendered — the demo replay's `InstanceDiscovered` events
+    // land afterward. Sending Enter before they do finds an empty instance
+    // list (`selection_len()` == 0), so `OpenDetail` is silently ignored.
+    // Wait for the populated table before the (non-retryable) Enter.
+    tui.wait_for_screen("Instances · AI metrics", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("instance list did not populate: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to send Enter: {e}"));
+    tui.wait_for_screen("Instance · ", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("instance detail did not open: {e}"));
+}
+
+#[when("the user shrinks the terminal until the detail body overflows")]
+async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
+    // `open_observe_view` already enlarged the terminal (`use_detail_size`)
+    // before this scenario reached the detail popup, and the demo fixtures'
+    // `launch_args`/`env_vars` don't overflow the args/env panes at *that*
+    // size — this is the terminal size small enough to force it relative to
+    // the size the scenario is actually at, not relative to the true default.
+    let tui = session(world);
+    tui.use_overflow_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+    // The resize is synchronous in the emulator but the app only learns of it
+    // asynchronously via SIGWINCH, so this step does not itself prove a
+    // redraw at the new geometry happened — `"Instance · "` was already on
+    // screen before the resize (see `open_instance_detail`), so waiting on it
+    // here is satisfied immediately regardless of whether the app redrew.
+    // The `Then` step's own `wait_for_screen` on the scroll hint is what
+    // actually gates on the post-resize render.
+}
+
+#[when("the user opens the services manager")]
+async fn open_services_manager(world: &mut E2eWorld) {
+    // Bound to `s` only on the Observe tab (`OpenServices`) — a manager opened
+    // from a non-domain tab, which is exactly the case
+    // `should_pane_back_out`'s doc comment calls out as needing Esc to close it.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
+}
+
+#[when("the user presses Escape")]
+async fn press_escape(world: &mut E2eWorld) {
+    session(world)
+        .send("\x1b")
+        .unwrap_or_else(|e| panic!("failed to send Escape: {e}"));
+}
+
 #[when("the user opens dashboard help")]
 async fn open_dashboard_help(world: &mut E2eWorld) {
     session(world)
@@ -207,6 +358,28 @@ async fn open_command_palette(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to open the command palette: {e}"));
 }
 
+#[when("the user opens the theme picker")]
+async fn open_theme_picker(world: &mut E2eWorld) {
+    let tui = session(world);
+    // `t` toggles `Modal::ThemePicker` open/closed, so it is NOT safe to resend
+    // via `send_until` (its own doc comment restricts that to idempotent
+    // keys) — a resend after the picker is already open would immediately
+    // close it. Nothing before this step proves the event loop is reading
+    // input yet, so wait for the Home tab's readiness marker before the
+    // (non-retryable) `t`, same rationale as `open_instance_detail`.
+    tui.wait_for_screen("Updates", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("dashboard home view did not become ready: {e}"));
+    tui.send("t")
+        .unwrap_or_else(|e| panic!("failed to open the theme picker: {e}"));
+    tui.wait_for_screen(
+        "Theme — j/k select, Enter apply, Esc cancel",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("theme picker did not open: {e}"));
+}
+
 #[when("the user chooses Serving")]
 async fn choose_serving(world: &mut E2eWorld) {
     let tui = session(world);
@@ -216,6 +389,69 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to select Serving: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
+}
+
+#[when("the user opens onboarding setup")]
+async fn open_onboarding_setup(world: &mut E2eWorld) {
+    // `n` opens the onboarding wizard from the Observe tab
+    // (`KeyAction::OpenOnboarding`). Same resend-until-it-takes rationale as
+    // `open_observe_view`: nothing before this proves the event loop is
+    // reading input yet. The wizard's panel title is step-independent, so it
+    // is a safe marker regardless of which step renders first.
+    session(world)
+        .send_until("n", "Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open onboarding setup: {e}"));
+}
+
+#[when("the user continues past the onboarding welcome screen")]
+async fn continue_past_onboarding_welcome(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to continue past the welcome screen: {e}"));
+}
+
+#[when("the user chooses to install the ROCm SDK")]
+async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
+    // "Install ROCm SDK (pip)" is the choose-menu's default (first) entry, so
+    // confirming needs no prior navigation keys.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
+}
+
+#[when("the user browses for an install folder")]
+async fn browse_for_install_folder(world: &mut E2eWorld) {
+    session(world)
+        .send("\t")
+        .unwrap_or_else(|e| panic!("failed to open the install-folder browser: {e}"));
+}
+
+#[when("the user chooses the current folder")]
+async fn choose_current_folder(world: &mut E2eWorld) {
+    // "[ use this folder ]" is the browser's first, already-selected entry.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose the current folder: {e}"));
+}
+
+#[when("the user closes onboarding setup")]
+async fn close_onboarding_setup(world: &mut E2eWorld) {
+    // Two `Esc`: the first backs Configure out to Choose, the second closes
+    // the wizard entirely — it owns every key while open (see
+    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
+    // until it is gone.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to leave Configure: {e}"));
+    tui.wait_until_gone("Tab browse folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Configure sub-view did not close: {e}"));
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
+    tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("onboarding wizard did not close: {e}"));
 }
 
 #[when("the user accepts the local endpoint")]
@@ -259,6 +495,32 @@ async fn send_gpu_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+
+#[when("the user sends a message that triggers a tool approval")]
+async fn send_approval_trigger_message(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Wait for the accepted, empty chat surface before typing so the input is
+    // ready to receive focus.
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    // `i` focuses the input; then the message, then Enter to submit. The
+    // phrase must match `MockAgentClient`'s trigger ("install the sdk") without
+    // colliding with `send_gpu_message`'s "how is gpu-2 doing".
+    tui.send("i")
+        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    tui.send("please install the sdk")
+        .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+
+#[when("the user confirms the approval prompt without moving the cursor")]
+async fn confirm_approval_without_moving(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to press Enter on the approval prompt: {e}"));
 }
 
 async fn quit_tui(world: &mut E2eWorld, surface: &str) {
@@ -412,6 +674,26 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the dashboard reports live GPU telemetry")]
+async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    tui.wait_for_screen_where(
+        "a nonzero GPU count with a known model",
+        |screen| {
+            let nonzero_gpu_count = screen
+                .lines()
+                .any(|line| line.contains("GPUs · ") && !line.contains("GPUs · 0"));
+            nonzero_gpu_count && !screen.contains("Unknown GPU")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("GPU telemetry did not appear: {e}"));
+}
+
 #[then("ROCm setup actions are displayed")]
 async fn rocm_actions_displayed(world: &mut E2eWorld) {
     session(world)
@@ -426,6 +708,30 @@ async fn gpu_response_displayed(world: &mut E2eWorld) {
         .wait_for_screen("GPU-2 is running hot", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the assistant's response did not appear: {e}"));
+}
+
+#[then("a tool approval prompt is displayed")]
+async fn approval_prompt_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Review: Install TheRock ROCm SDK?", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the approval prompt did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Approve (y)") && screen.contains("Deny (n)"),
+        "approval prompt is missing its Approve/Deny buttons:\n{screen}"
+    );
+}
+
+#[then("the tool call is shown as declined")]
+async fn tool_call_shown_declined(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone("Review: Install TheRock ROCm SDK?", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the approval prompt is still open after Enter: {e}"));
+    tui.wait_for_screen("Action declined.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the declined-tool-call message did not appear: {e}"));
 }
 
 #[then("the managed model's response is displayed")]
@@ -667,8 +973,96 @@ async fn navigation_guidance_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
     let screen = tui.screen_text();
     assert!(
-        screen.contains("next / previous tab") && screen.contains("Home tab"),
+        screen.contains("next / previous tab")
+            && screen.contains("Home tab")
+            && screen.contains("jump ±60s"),
         "navigation or contextual guidance missing:\n{screen}"
+    );
+}
+
+#[then("the services manager is displayed")]
+async fn services_manager_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Services — managed inference servers", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
+}
+
+#[then("the services manager is closed")]
+async fn services_manager_closed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone("Services — managed inference servers", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services manager is still open after Escape: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("● Observe"),
+        "Escape left the Observe tab entirely, not just the manager:\n{screen}"
+    );
+    // Belt-and-suspenders: `wait_until_gone` above is the primary regression
+    // check (the manager itself closed). This additionally guards against
+    // Esc falling through to open the main menu instead — "Options"/"Quit"
+    // are unique to `Modal::Menu`.
+    assert!(
+        !screen.contains("Options") && !screen.contains("Quit"),
+        "the main menu is open on top of the closed manager:\n{screen}"
+    );
+}
+
+#[then("instance details are displayed")]
+async fn instance_details_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Instance · ", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("instance details did not appear: {e}"));
+}
+
+#[then("the instance detail footer shows the scroll hint")]
+async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("↑/↓ scroll", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!("footer did not show the scroll hint once the detail body overflowed: {e}")
+        });
+}
+
+#[then("the instance detail footer does not show the scroll hint")]
+async fn detail_footer_does_not_show_scroll_hint(world: &mut E2eWorld) {
+    // Pins the precondition the later shrink step's barrier depends on: the
+    // enlarged pre-shrink geometry must genuinely have no hint yet, or the
+    // shrink step's own wait would silently revert to a no-op (its marker
+    // already present) for the same reason a prior round of this scenario
+    // was flagged for. A plain read is correct here — this runs right after
+    // `open_instance_detail`'s own wait, with no action in between that
+    // could still be in flight.
+    let screen = session(world).screen_text();
+    assert!(
+        !screen.contains("↑/↓ scroll"),
+        "footer must not show the scroll hint before the terminal shrinks:\n{screen}"
+    );
+}
+
+#[then("the instance detail body shows a scrollbar")]
+async fn detail_body_shows_scrollbar(world: &mut E2eWorld) {
+    // Runs immediately after the scroll-hint `Then`, which already
+    // synchronized to the post-resize frame via `wait_for_screen` — no
+    // further redraw is expected between the two assertions, so a plain
+    // read is correct here too.
+    let screen = session(world).screen_text();
+    assert!(
+        screen.contains('║') || screen.contains('█'),
+        "detail body did not show a scrollbar once it overflowed:\n{screen}"
+    );
+}
+
+#[then("the backdrop behind the popup is dimmed")]
+async fn backdrop_is_dimmed(world: &mut E2eWorld) {
+    let tui = session(world);
+    assert!(
+        tui.corner_backdrop_is_dimmed(),
+        "the screen behind the popup was not dimmed:\n{}",
+        tui.screen_text()
     );
 }
 
@@ -685,12 +1079,84 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the dashboard menu is displayed")]
+async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
+    // "Quit" is used here as a marker for `Modal::Menu`'s three items
+    // (Options/Help/Quit). Unlike "Options", "Quit" appears nowhere else in
+    // the TUI's rendered chrome, so it unambiguously identifies the menu.
+    session(world)
+        .wait_for_screen("Quit", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
+}
+
+#[then("the dashboard menu is closed")]
+async fn dashboard_menu_is_closed(world: &mut E2eWorld) {
+    // A bare Escape send is not guaranteed to have been acted on yet by the
+    // time the next step runs — confirm `Modal::Menu` actually closed before
+    // quitting, the same way `services_manager_closed` does. Without this,
+    // an unlanded close leaves the menu open and swallows the subsequent
+    // quit keystroke (`Modal::Menu` has no `q` arm), hanging until the
+    // quit step's timeout.
+    session(world)
+        .wait_until_gone("Options", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard menu is still open after Escape: {e}"));
+}
+
 #[then("Serving actions are displayed")]
 async fn serving_actions_displayed(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen("Serving actions", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("Serving actions did not appear: {e}"));
+}
+
+#[then("the onboarding welcome screen is displayed")]
+async fn onboarding_welcome_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Let's get ROCm set up on this machine.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding welcome screen did not appear: {e}"));
+}
+
+#[then("the onboarding setup choices are displayed")]
+async fn onboarding_choices_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Install ROCm SDK (pip)", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding setup choices did not appear: {e}"));
+}
+
+#[then("the SDK Configure step is displayed")]
+async fn sdk_configure_step_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("default managed folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the SDK Configure step did not appear: {e}"));
+}
+
+#[then("the install-folder browser is displayed")]
+async fn install_folder_browser_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Pick an install folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
+}
+
+#[then("the Configure step shows the chosen folder instead of the placeholder")]
+async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the Folder row shows a chosen path rather than the unset placeholder",
+            |screen| {
+                screen.contains("Folder:")
+                    && !screen.contains("default managed folder · Tab to browse")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
 }
 
 #[then("the managed model is displayed")]

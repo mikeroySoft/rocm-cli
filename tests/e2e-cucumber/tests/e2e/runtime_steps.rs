@@ -484,6 +484,162 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
+/// Record the Lemonade backend-alignment opt-out for this scenario's next
+/// `rocm` command. Mirrors `setup_torch_alignment_opt_out` above.
+#[given("the user has opted out of realigning Lemonade's backend")]
+async fn setup_lemonade_backend_alignment_opt_out(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT", "1".into()));
+}
+
+/// `--reinstall` re-extracts the packaged embeddable, which resets
+/// `backend_versions.json` to its pinned defaults -- so this fires the
+/// alignment's Tier 1/Tier 2/revert state machine deterministically every time,
+/// even against a shared runtime tree where an earlier scenario already left
+/// Lemonade's backend aligned (in which case a plain, non-forcing install would
+/// find nothing left to do and print no alignment line at all).
+///
+/// Goes through `run_rocm_with_scenario_env` (not `run_rocm_ok`) so a Given can
+/// attach the alignment opt-out to this invocation, and keeps stderr so a Then
+/// can read the opt-out's own explanation of why it skipped.
+#[when("the user reinstalls the lemonade engine")]
+async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+}
+
+/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
+/// install's version does not match Lemonade's packaged pin, Tier 1's install
+/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
+/// build succeeds -- producing exactly this line. This is the one part of the
+/// alignment path with no other e2e coverage: the unit tests exercise the
+/// Tier 1/Tier 2/revert state machine directly (against injected install/align
+/// steps), but nothing else asserts that `rocm engines install lemonade`
+/// actually surfaces the outcome to the user.
+#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
+async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output
+            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
+        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+    );
+}
+
+/// The CLI names the variable whenever it is set, so a user can tell it was
+/// read -- this alone does not prove alignment was actually skipped.
+///
+/// The announcement now fires unconditionally as the first thing
+/// `prepare_llamacpp_backend_for_active_rocm` does when the variable is set,
+/// before any of the not-Linux/no-SDK-version/unreadable-pin/pin-matches
+/// skips run, so it can no longer distinguish "the opt-out was honoured"
+/// from "the variable was set and alignment ran anyway". That guarantee is
+/// proven elsewhere: the crate's own unit tests --
+/// `prepare_disabled_early_return_skips_every_lookup_and_installs_unforced`
+/// gates the real production early return on every per-PR and merge-queue
+/// lane, and `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
+/// pins the state machine's own half of the contract -- and the sibling
+/// `the packaged pin survives the install` step below (its `Aligned …` /
+/// `could not align …` absence checks, run on the gated e2e lane).
+#[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
+async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().expect("no install stderr");
+    assert!(
+        stderr.contains("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT"),
+        "the skipped alignment does not name the variable that skipped it:\n{stderr}"
+    );
+}
+
+/// The `version=` field on the active runtime's line in `rocm runtimes list`
+/// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
+///
+/// Read independently of Lemonade's own reporting, on purpose: this is the
+/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
+/// rewritten to match it, so it must not come from anything alignment itself
+/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// branch -- that surface is a different, later change).
+fn active_runtime_version(world: &E2eWorld) -> String {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .and_then(|line| line.split_once("version="))
+        .map_or_else(
+            || panic!("no active runtime line with a version= field:\n{stdout}"),
+            |(_, rest)| rest.split_whitespace().next().unwrap_or_default(),
+        )
+        .to_owned()
+}
+
+/// The packaged pin was not rewritten.
+///
+/// Reads `resources/backend_versions.json` inside the runtime tree the install
+/// itself reports (`env_path:`) and compares it against the active runtime's
+/// own version (from `rocm runtimes list`, not from anything Lemonade's
+/// alignment reports), rather than inferring the outcome from an absent log
+/// line alone. Both checks matter: the revert path can fail to restore the
+/// pin (best-effort, matching its sibling warnings) while still printing no
+/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// failed-restore from an honestly untouched pin -- hence also checking for
+/// the revert path's own "could not align ... reverting" warning, which does
+/// fire whenever a restore was attempted. `--reinstall` (the When's own
+/// mechanism) always re-extracts the packaged embeddable first, and the
+/// disabled gate returns before any write to `backend_versions.json` at all
+/// (see `prepare_llamacpp_backend_for_active_rocm_impl`'s early return, the
+/// real production enforcement point), so the llama.cpp tag limb of the same
+/// file is provably untouched whenever both checks below hold -- both Tier 2
+/// and the revert path's own restore write sit behind that same gate.
+#[then("the packaged pin survives the install")]
+async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        !output.contains("Aligned Lemonade's ROCm") && !stderr.contains("Aligned Lemonade's ROCm"),
+        "the backend was realigned even though the user opted out:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("could not align Lemonade's ROCm backend to"),
+        "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
+    );
+
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let pinned_version = parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
+
+    let active_version = active_runtime_version(world);
+    assert_ne!(
+        pinned_version, active_version,
+        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
+         opted out"
+    );
+}
+
 /// The engine inventory reports a usable engine runtime.
 ///
 /// A precondition only. It deliberately has no Then counterpart: `engines list`
@@ -693,7 +849,7 @@ async fn assert_release_device_payload(world: &mut E2eWorld) {
     );
     assert_eq!(
         requested_rocm_extras(preview_rocm_spec(output)),
-        format!("libraries,devel,device-{detected}"),
+        format!("libraries,device-{detected}"),
         "the install does not request exactly this host's device payload:\n{output}"
     );
 
@@ -771,6 +927,135 @@ async fn assert_runtime_has_stack(world: &mut E2eWorld) {
     assert!(
         stdout.contains("torch") || stdout.contains("vllm"),
         "no inference stack found in runtime:\n{stdout}"
+    );
+}
+
+#[then("the runtime excludes the compiler toolchain")]
+async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated state root")
+        .path();
+    let registry = root.join("data/runtimes/registry");
+    let entries = std::fs::read_dir(&registry).unwrap_or_else(|error| {
+        panic!(
+            "failed to read runtime registry {}: {error}",
+            registry.display()
+        )
+    });
+    let manifests = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "expected one freshly installed runtime manifest in {}: {manifests:?}",
+        registry.display()
+    );
+
+    let manifest_path = &manifests[0];
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    assert_eq!(
+        manifest.get("devel").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default SDK install recorded the compiler toolchain as present: {manifest}"
+    );
+
+    // The specs are the authoritative record — they are what `uv` was handed,
+    // and `InstalledRuntimeManifest::includes_devel` reads the answer back out
+    // of them. Asserting the `devel` field alone would miss the install args
+    // and the manifest disagreeing, which is the drift this guards.
+    //
+    // `wheel_composition` is legitimately absent on a tarball install and on an
+    // adopted runtime, so an unwrap here would report a reachable manifest
+    // state as a missing-field crash the moment this step is reused outside a
+    // wheel install. Name the precondition instead: the failure a future
+    // scenario author needs to read is "this step only applies to wheel
+    // installs", not "Option::unwrap on a None value".
+    let format = manifest
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<absent>");
+    let specs = manifest
+        .get("wheel_composition")
+        .and_then(|composition| composition.get("package_specs"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "this step reads the extras a wheel install requested, but runtime {} \
+                 (format={format}) records no wheel_composition.package_specs. Tarball \
+                 installs and adopted runtimes have none — use this step only on a \
+                 wheel-format install.\n{manifest}",
+                manifest_path.display()
+            )
+        });
+    let rocm_spec = specs
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find(|spec| spec.starts_with("rocm["))
+        .expect("no rocm requirement in the recorded package_specs");
+    let extras = rocm_spec
+        .strip_prefix("rocm[")
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(extras, _)| extras)
+        .expect("malformed rocm requirement in the recorded package_specs");
+    assert!(
+        !extras
+            .split(',')
+            .map(str::trim)
+            .any(|extra| extra == "devel"),
+        "default SDK install requested the toolchain: {rocm_spec}"
+    );
+
+    let python = manifest
+        .get("python_executable")
+        .and_then(serde_json::Value::as_str)
+        .expect("wheel runtime manifest has no python_executable");
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print('present' if any(d.metadata['Name'].lower() == 'rocm-sdk-devel' for d in m.distributions()) else 'absent')",
+        ])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to inspect the installed runtime with {python}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "failed to enumerate installed runtime packages:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "absent",
+        "default SDK install pulled rocm-sdk-devel back transitively"
+    );
+}
+
+/// The manifest half of this is `the runtime excludes the compiler toolchain`,
+/// which reads the recorded specs directly. This is the half a user can see:
+/// `rocm examine` is where someone looks when a build cannot find `hipcc`, and
+/// a manifest that records the right thing while the diagnostic stays silent
+/// about it is indistinguishable, from the outside, from one that does not.
+#[then("the inspection reports the active runtime has no compiler toolchain")]
+async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
+    let examine = crate::run_rocm_ok(world, &["examine"]);
+    let reported = super::examine_steps::field_value(&examine, "active_runtime_toolchain")
+        .unwrap_or_else(|| {
+            panic!("`rocm examine` reported no toolchain state for the active runtime:\n{examine}")
+        });
+    assert_eq!(
+        reported, "excluded",
+        "the SDK was installed without --devel, but `rocm examine` reports the active \
+         runtime's toolchain as `{reported}`:\n{examine}"
     );
 }
 
