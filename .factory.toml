@@ -16,7 +16,8 @@ exclusive = true
 
 [[gate.check]]
 name = "smoke"
-run = ["python3", "scripts/smoke_local.py"]
+# Upstream sync gates a detached candidate destined for main; supply its intended ref.
+run = ["env", "ROCM_CLI_RELEASE_REF=main", "python3", "scripts/smoke_local.py"]
 exclusive = true
 
 [leak_scan]

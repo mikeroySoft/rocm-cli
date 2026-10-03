@@ -28,6 +28,11 @@ Run the cross-platform smoke test:
 python scripts/smoke_local.py
 ```
 
+Factory's smoke gate sets `ROCM_CLI_RELEASE_REF=main` when building its detached
+integration candidate. `main` identifies the intended target ref; the version
+still includes the candidate's actual commit hash. This keeps the strict
+branch/tag metadata check without changing the `-mrs` version suffix.
+
 If the workspace is already built:
 
 ```bash
