@@ -23,6 +23,9 @@ excludes = [
   ".tmp-*/**",
   "third_party/**",
   ".agents/**",
+  # GitHub reads issue-template front matter only at byte 0; a header above it
+  # hides the template. Fork-only file, kept identical to Factory's shipped copy.
+  ".github/ISSUE_TEMPLATE/agent_task.md",
 ]
 
 [[rules]]

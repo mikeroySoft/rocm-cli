@@ -1,26 +1,19 @@
-<!--
-Copyright © Advanced Micro Devices, Inc., or its affiliates.
-
-SPDX-License-Identifier: MIT
--->
-
 ---
 name: Agent task
-about: Fully specified work item for the AI factory
+about: Fully specified work item for the agent factory
 title: ''
 labels: needs-triage
 assignees: ''
-type: Task
 
 ---
 
 <!--
 Conventions:
 - One observable change per ticket; split multi-outcome work.
-- Declare dependencies in the body as "blocked by #N" — the dispatcher skips
+- Declare dependencies in the body as "Blocked by: #N" — the dispatcher skips
   blocked tickets until the blocker closes.
 - Add the `chore` label for mechanical work (renames, doc sync, version bumps);
-  it routes to a lighter worker.
+  it routes to the chore worker.
 -->
 
 **Scope**
