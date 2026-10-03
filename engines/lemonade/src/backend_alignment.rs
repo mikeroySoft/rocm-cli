@@ -59,7 +59,7 @@ fn lemonade_backend_alignment_disabled() -> bool {
 
 /// Align Lemonade's ROCm llama.cpp backend to the active managed runtime.
 /// If no matching asset can be verified, fail rather than install Lemonade's
-/// packaged private TheRock runtime.
+/// separately pinned TheRock runtime.
 pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
@@ -286,7 +286,7 @@ fn align_llamacpp_backend_to_version(
     }
 
     // A failed alignment must not reinstall Lemonade's packaged pin: that
-    // backend install also downloads a private TheRock runtime.
+    // backend install also downloads a separate TheRock runtime.
     bail!(
         "No verified Lemonade llama.cpp ROCm backend is available for active runtime version {target_version}"
     )
@@ -1424,8 +1424,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_alignment_never_installs_the_packaged_private_runtime() {
-        let dir = scratch_dir("alignment-no-private-therock");
+    fn failed_alignment_never_installs_the_packaged_therock_runtime() {
+        let dir = scratch_dir("alignment-no-packaged-therock");
         let path = dir.join("backend_versions.json");
         write_backend_versions_fixture(&path, "7.13.0", "b9752");
         let mut manifest = test_manifest(dir.clone());
@@ -1436,7 +1436,7 @@ mod tests {
             "7.13.0",
             false,
             |_manifest, _target, _force, _label| false,
-            |_manifest, _force| panic!("fallback must not install private therock"),
+            |_manifest, _force| panic!("fallback must not install packaged therock"),
             || Ok("b10952".to_owned()),
         );
         assert!(result.unwrap_err().to_string().contains("10.0.0"));

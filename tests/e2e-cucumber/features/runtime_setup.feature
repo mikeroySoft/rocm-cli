@@ -312,7 +312,7 @@ Feature: Runtime configuration
 
   # Lemonade's llama.cpp backend is pinned to the active managed ROCm SDK:
   # first try the packaged build, then the latest build. If neither provides
-  # a verified match, installation fails rather than downloading a private
+  # a verified match, installation fails rather than downloading a separate
   # TheRock runtime using Lemonade's packaged pin.
   # The unit tests exercise that state machine directly against injected
   # install/align steps, but nothing else asserts that `rocm engines install
