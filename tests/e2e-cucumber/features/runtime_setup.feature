@@ -310,10 +310,10 @@ Feature: Runtime configuration
     And the executed command carries the replacement consent
     And the execution section says the consent came from the user's --yes
 
-  # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
-  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
-  # to the newest build if the pin is too old to have shipped a matching
-  # ROCm-version asset; revert to the packaged default if neither verifies).
+  # Lemonade's llama.cpp backend is pinned to the active managed ROCm SDK:
+  # first try the packaged build, then the latest build. If neither provides
+  # a verified match, installation fails rather than downloading a private
+  # TheRock runtime using Lemonade's packaged pin.
   # The unit tests exercise that state machine directly against injected
   # install/align steps, but nothing else asserts that `rocm engines install
   # lemonade` actually surfaces the outcome to a real user -- this is the one

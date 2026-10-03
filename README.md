@@ -502,6 +502,11 @@ rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 
 Supported engines: `lemonade`, `vllm`.
 
+On Linux with an active managed ROCm runtime, Lemonade installs a llama.cpp
+backend matched to that runtime. If neither the packaged nor latest llama.cpp
+build has a verified match, installation fails and names the active runtime
+instead of downloading Lemonade's separately pinned TheRock runtime.
+
 ### Model serving
 
 Start a local OpenAI-compatible model server:

@@ -57,19 +57,9 @@ fn lemonade_backend_alignment_disabled() -> bool {
     std::env::var_os(LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV).is_some()
 }
 
-/// Point Lemonade's `llamacpp:rocm` backend at the ROCm version rocm-cli already has
-/// installed and active, instead of Lemonade's hardcoded pin (which does not track
-/// whatever the user separately installed via `rocm install sdk`).
-///
-/// Best-effort and defensive at every step: if there is no managed rocm-cli SDK, the
-/// pinned version already matches, or an aligned attempt cannot be verified to actually
-/// resolve its GPU library, this falls back to (or reverts to) today's unmodified
-/// pinned-version install — never a regression, and never a silent CPU fallback
-/// (AGENTS.md §6): an aligned backend is only kept once [`rocm_backend_resolves`]
-/// confirms it.
-///
-/// Returns the aligned version string when one was applied and verified, so the caller
-/// can surface it in the install response.
+/// Align Lemonade's ROCm llama.cpp backend to the active managed runtime.
+/// If no matching asset can be verified, fail rather than install Lemonade's
+/// packaged private TheRock runtime.
 pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
@@ -92,6 +82,13 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
                 install_best_llamacpp_backend,
                 latest_llamacpp_rocm_stable_tag,
             )
+            .with_context(|| {
+                let key = RocmCliConfig::load(paths)
+                    .ok()
+                    .and_then(|config| config.active_runtime_key)
+                    .unwrap_or_else(|| target_version.to_owned());
+                format!("Lemonade cannot use active managed ROCm runtime {key}")
+            })
         },
     )
 }
@@ -209,10 +206,8 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
     )
 }
 
-/// The Tier 1 / Tier 2 / revert state machine, isolated from the config and active-SDK
-/// lookups above so it can be exercised in tests against a temp `backend_versions.json`
-/// with the install/align/latest-tag steps injected, instead of spawning a real
-/// `lemond` and reaching GitHub.
+/// The Tier 1 / Tier 2 alignment state machine, isolated from runtime lookups
+/// so tests can exercise failed downloads without starting Lemonade.
 ///
 /// `disabled` is the resolved value of [`lemonade_backend_alignment_disabled`], passed
 /// in rather than read here so a test can drive both branches without touching process
@@ -231,7 +226,7 @@ fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
     backend_versions_path: &Path,
     target_version: &str,
-    pinned_version: &str,
+    _pinned_version: &str,
     disabled: bool,
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
@@ -244,9 +239,8 @@ fn align_llamacpp_backend_to_version(
     if let Err(error) =
         write_backend_versions_therock_version(backend_versions_path, target_version)
     {
-        eprintln!("Warning: could not pin Lemonade's backend to ROCm {target_version}: {error:#}");
-        fallback_install(manifest, false)?;
-        return Ok(None);
+        return Err(error)
+            .with_context(|| format!("Could not align Lemonade to ROCm {target_version}"));
     }
 
     // Tier 1: keep Lemonade's own pinned llama.cpp build, just point it at the active
@@ -291,54 +285,11 @@ fn align_llamacpp_backend_to_version(
         return Ok(Some(target_version.to_owned()));
     }
 
-    // Neither tier produced a verified GPU backend. Revert everything — including
-    // the llama.cpp build tag, so the fallback install below isn't itself
-    // misdirected — and retry once more with Lemonade's original pinned defaults.
-    // Every step below is best-effort, matching its sibling warnings: a failure to
-    // restore the pin still lets the fallback install run rather than hard-failing
-    // the whole install, though it does leave the pin holding the unverified
-    // target version until a later run corrects it.
-    eprintln!(
-        "Warning: could not align Lemonade's ROCm backend to {target_version}; reverting to the \
-         default pinned version."
-    );
-    if let Err(error) =
-        write_backend_versions_therock_version(backend_versions_path, pinned_version)
-    {
-        eprintln!(
-            "Warning: could not restore Lemonade's default pinned backend version \
-             ({pinned_version}): {error:#}"
-        );
-    }
-    if latest_tag_applied {
-        // Best-effort, matching the therock.version restore above: a failure here
-        // must not skip the fallback reinstall below. Restore the original tag when
-        // there was one; otherwise Tier 2 pinned a key that did not exist before, so
-        // removing it (not writing some placeholder) is what "reverted" means.
-        let restore_result = match pinned_tag.as_deref() {
-            Some(tag) => write_backend_versions_llamacpp_tag(backend_versions_path, tag),
-            None => remove_backend_versions_llamacpp_tag(backend_versions_path),
-        };
-        if let Err(error) = restore_result {
-            eprintln!(
-                "Warning: could not restore Lemonade's default pinned llama.cpp build tag: \
-                 {error:#}"
-            );
-        }
-    }
-    let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(manifest);
-    match fallback_install(manifest, true) {
-        Ok(()) => {
-            resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, true);
-            Ok(None)
-        }
-        Err(error) => {
-            // Restore the pre-alignment backend before propagating: a failed
-            // fallback install must not leave the host with no ROCm backend at all.
-            resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, false);
-            Err(error)
-        }
-    }
+    // A failed alignment must not reinstall Lemonade's packaged pin: that
+    // backend install also downloads a private TheRock runtime.
+    bail!(
+        "No verified Lemonade llama.cpp ROCm backend is available for active runtime version {target_version}"
+    )
 }
 
 /// Attempt one llama.cpp backend install aligned to `target_version`'s ROCm pairing
@@ -469,23 +420,6 @@ fn write_backend_versions_llamacpp_tag(path: &Path, tag: &str) -> Result<()> {
         .and_then(Value::as_object_mut)
         .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
         .insert("rocm-stable".to_owned(), Value::String(tag.to_owned()));
-    fs::write(path, serde_json::to_vec_pretty(&value)?)
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// Remove `resources/backend_versions.json`'s `llamacpp.rocm-stable` key entirely,
-/// restoring the "never pinned" state — the counterpart to
-/// [`write_backend_versions_llamacpp_tag`] for reverting Tier 2's pin when there was
-/// no prior tag to restore it to.
-fn remove_backend_versions_llamacpp_tag(path: &Path) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut value: Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    value
-        .get_mut("llamacpp")
-        .and_then(Value::as_object_mut)
-        .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
-        .remove("rocm-stable");
     fs::write(path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
@@ -1203,10 +1137,8 @@ mod tests {
 
     #[test]
     fn resolve_rocm_llamacpp_backend_dirs_aside_restores_on_failure() {
-        // The bug this guards: a failed final install (e.g. the revert branch's
-        // fallback_install erroring out) must never leave the host with zero ROCm
-        // backend directories -- the whole reason to set builds aside instead of
-        // deleting them outright.
+        // A failed alignment install must restore the original ROCm backend
+        // directory instead of leaving the host without one.
         let dir = scratch_dir("aside-restores-on-failure");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
@@ -1492,82 +1424,22 @@ mod tests {
     }
 
     #[test]
-    fn align_reverts_the_llamacpp_tag_when_tier2_pinned_a_newer_one_and_still_fails() {
-        // Regression test: the tag restore used to be silently skipped whenever
-        // deleted, and nothing caught it -- both tiers must fail here so the
-        // revert path actually runs, and the tag must come back to its original
-        // value rather than staying on Tier 2's newer pin.
-        let dir = scratch_dir("align-revert-restores-tag");
+    fn failed_alignment_never_installs_the_packaged_private_runtime() {
+        let dir = scratch_dir("alignment-no-private-therock");
         let path = dir.join("backend_versions.json");
         write_backend_versions_fixture(&path, "7.13.0", "b9752");
         let mut manifest = test_manifest(dir.clone());
-
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
             "10.0.0",
             "7.13.0",
             false,
-            |_manifest, _target, _force_reinstall, _label| false,
-            |_manifest, force_reinstall| {
-                assert!(force_reinstall);
-                Ok(())
-            },
+            |_manifest, _target, _force, _label| false,
+            |_manifest, _force| panic!("fallback must not install private therock"),
             || Ok("b10952".to_owned()),
         );
-
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(
-            read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned())
-        );
-        assert_eq!(
-            read_backend_versions_llamacpp_tag(&path),
-            Some("b9752".to_owned()),
-            "the llama.cpp tag must be restored to its original value, not left on Tier 2's pin"
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn align_removes_the_llamacpp_tag_on_revert_when_none_was_pinned_before() {
-        // The resource file may have no `llamacpp.rocm-stable` key at all (an
-        // embeddable that never shipped a pin). Tier 2 still writes one; reverting
-        // must remove it again rather than leaving it in place with no original
-        // value to restore it to.
-        let dir = scratch_dir("align-revert-removes-tag");
-        let path = dir.join("backend_versions.json");
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&json!({
-                "llamacpp": {},
-                "therock": { "version": "7.13.0" },
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut manifest = test_manifest(dir.clone());
-
-        let result = align_llamacpp_backend_to_version(
-            &mut manifest,
-            &path,
-            "10.0.0",
-            "7.13.0",
-            false,
-            |_manifest, _target, _force_reinstall, _label| false,
-            |_manifest, force_reinstall| {
-                assert!(force_reinstall);
-                Ok(())
-            },
-            || Ok("b10952".to_owned()),
-        );
-
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(
-            read_backend_versions_llamacpp_tag(&path),
-            None,
-            "no tag was pinned before Tier 2; reverting must remove it, not invent a value"
-        );
+        assert!(result.unwrap_err().to_string().contains("10.0.0"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1589,111 +1461,13 @@ mod tests {
                 align_calls += 1;
                 false
             },
-            |_manifest, force_reinstall| {
-                assert!(
-                    force_reinstall,
-                    "the revert fallback always forces a reinstall"
-                );
-                Ok(())
-            },
+            |_manifest, _force_reinstall| panic!("failed alignment must not reinstall"),
             // Already the latest tag: Tier 2's own reinstall must not be attempted.
             || Ok("b9752".to_owned()),
         );
 
-        assert_eq!(result.unwrap(), None);
+        assert!(result.unwrap_err().to_string().contains("10.0.0"));
         assert_eq!(align_calls, 1, "only tier 1 was attempted");
-        assert_eq!(
-            read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned()),
-            "reverted to the original pinned version"
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn align_reverts_and_still_runs_fallback_when_the_restore_write_fails() {
-        // Regression test: a failure while restoring the original pinned version must
-        // not abort the install — the fallback reinstall below it is the recovery
-        // path, and every sibling warning in this function is best-effort.
-        let dir = scratch_dir("align-revert-write-fails");
-        let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
-        let mut manifest = test_manifest(dir.clone());
-        let mut fallback_called = false;
-
-        // Corrupt the file's `therock` object between tier attempts and the revert, so
-        // the revert's own write fails.
-        let result = align_llamacpp_backend_to_version(
-            &mut manifest,
-            &path,
-            "10.0.0",
-            "7.13.0",
-            false,
-            |_manifest, _target, _force_reinstall, _label| {
-                fs::write(
-                    &path,
-                    serde_json::to_vec_pretty(&json!({"llamacpp": {}})).unwrap(),
-                )
-                .unwrap();
-                false
-            },
-            |_manifest, force_reinstall| {
-                fallback_called = true;
-                assert!(force_reinstall);
-                Ok(())
-            },
-            || bail!("network unavailable"),
-        );
-
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "never propagates the restore-write failure"
-        );
-        assert!(fallback_called, "the fallback reinstall still ran");
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn align_revert_restores_the_backend_dir_when_the_fallback_install_fails() {
-        // The bug this guards: the revert branch used to delete the ROCm backend
-        // directories before the fallback install, with no recovery if that install
-        // then failed -- leaving the host with no ROCm backend at all. Both tiers
-        // fail here (forcing the revert), and the fallback install also fails, so
-        // the pre-existing backend must come back rather than staying deleted.
-        let dir = scratch_dir("align-revert-fallback-install-fails");
-        let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
-        let mut manifest = test_manifest(dir.clone());
-        let llamacpp = dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        let rocm_dir = llamacpp.join("rocm");
-        fs::create_dir_all(&rocm_dir).unwrap();
-        fs::write(rocm_dir.join(&server), b"pre-existing").unwrap();
-
-        let result = align_llamacpp_backend_to_version(
-            &mut manifest,
-            &path,
-            "10.0.0",
-            "7.13.0",
-            false,
-            |_manifest, _target, _force_reinstall, _label| false,
-            |_manifest, force_reinstall| {
-                assert!(force_reinstall);
-                bail!("network unavailable")
-            },
-            || Ok("b10952".to_owned()),
-        );
-
-        assert!(
-            result.is_err(),
-            "the fallback install's failure must be propagated"
-        );
-        assert_eq!(
-            fs::read(rocm_dir.join(&server)).unwrap(),
-            b"pre-existing",
-            "the pre-existing backend must be restored, not left deleted"
-        );
         fs::remove_dir_all(&dir).ok();
     }
 
