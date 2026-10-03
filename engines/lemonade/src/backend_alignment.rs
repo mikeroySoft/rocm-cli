@@ -72,10 +72,29 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
         best_llamacpp_backend_for_host,
         install_best_llamacpp_backend,
         |manifest, backend_versions_path, target_version, pinned_version, disabled| {
+            let runtime_key = RocmCliConfig::load(paths)
+                .ok()
+                .and_then(|config| config.active_runtime_key)
+                .unwrap_or_else(|| target_version.to_owned());
+            #[cfg(feature = "e2e-test-hooks")]
+            if std::env::var_os("ROCM_E2E_LEMONADE_ALIGNMENT_FAILURE").is_some() {
+                return align_llamacpp_backend_to_version(
+                    manifest,
+                    backend_versions_path,
+                    target_version,
+                    &runtime_key,
+                    pinned_version,
+                    disabled,
+                    |_manifest, _target, _force, _label| false,
+                    |_manifest, _force| bail!("unexpected fallback install"),
+                    || Ok("e2e-newer-build".to_owned()),
+                );
+            }
             align_llamacpp_backend_to_version(
                 manifest,
                 backend_versions_path,
                 target_version,
+                &runtime_key,
                 pinned_version,
                 disabled,
                 try_llamacpp_backend_alignment,
@@ -83,11 +102,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
                 latest_llamacpp_rocm_stable_tag,
             )
             .with_context(|| {
-                let key = RocmCliConfig::load(paths)
-                    .ok()
-                    .and_then(|config| config.active_runtime_key)
-                    .unwrap_or_else(|| target_version.to_owned());
-                format!("Lemonade cannot use active managed ROCm runtime {key}")
+                format!("Lemonade cannot use active managed ROCm runtime {runtime_key}")
             })
         },
     )
@@ -226,7 +241,8 @@ fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
     backend_versions_path: &Path,
     target_version: &str,
-    _pinned_version: &str,
+    runtime_key: &str,
+    pinned_version: &str,
     disabled: bool,
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
@@ -285,10 +301,22 @@ fn align_llamacpp_backend_to_version(
         return Ok(Some(target_version.to_owned()));
     }
 
+    if let Err(error) =
+        write_backend_versions_therock_version(backend_versions_path, pinned_version)
+    {
+        eprintln!("Warning: could not restore Lemonade's TheRock pin: {error:#}");
+    }
+    let tag_restore = match pinned_tag {
+        Some(tag) => write_backend_versions_llamacpp_tag(backend_versions_path, &tag),
+        None => remove_backend_versions_llamacpp_tag(backend_versions_path),
+    };
+    if let Err(error) = tag_restore {
+        eprintln!("Warning: could not restore Lemonade's llama.cpp pin: {error:#}");
+    }
     // A failed alignment must not reinstall Lemonade's packaged pin: that
     // backend install also downloads a separate TheRock runtime.
     bail!(
-        "No verified Lemonade llama.cpp ROCm backend is available for active runtime version {target_version}"
+        "No verified Lemonade llama.cpp ROCm backend is available for active runtime {runtime_key} (ROCm {target_version})"
     )
 }
 
@@ -420,6 +448,19 @@ fn write_backend_versions_llamacpp_tag(path: &Path, tag: &str) -> Result<()> {
         .and_then(Value::as_object_mut)
         .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
         .insert("rocm-stable".to_owned(), Value::String(tag.to_owned()));
+    fs::write(path, serde_json::to_vec_pretty(&value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn remove_backend_versions_llamacpp_tag(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    value
+        .get_mut("llamacpp")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
+        .remove("rocm-stable");
     fs::write(path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
@@ -1258,6 +1299,7 @@ mod tests {
             &mut manifest,
             &path,
             "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
             "7.13.0",
             true,
             |_manifest, _target, _force_reinstall, _label| {
@@ -1359,6 +1401,7 @@ mod tests {
             &mut manifest,
             &path,
             "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
             "7.13.0",
             false,
             |_manifest, _target, force_reinstall, _label| {
@@ -1392,6 +1435,7 @@ mod tests {
             &mut manifest,
             &path,
             "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
             "7.13.0",
             false,
             |_manifest, _target, force_reinstall, _label| {
@@ -1433,13 +1477,54 @@ mod tests {
             &mut manifest,
             &path,
             "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
             "7.13.0",
             false,
             |_manifest, _target, _force, _label| false,
             |_manifest, _force| panic!("fallback must not install packaged therock"),
             || Ok("b10952".to_owned()),
         );
-        assert!(result.unwrap_err().to_string().contains("10.0.0"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("release-wheel-multi-arch-10-0-0-feaf90daccc2630b")
+        );
+        assert_eq!(
+            read_backend_versions_therock_version(&path).as_deref(),
+            Some("7.13.0")
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path).as_deref(),
+            Some("b9752")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_alignment_restores_absent_llamacpp_tag() {
+        let dir = scratch_dir("alignment-absent-tag");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        remove_backend_versions_llamacpp_tag(&path).unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
+            "7.13.0",
+            false,
+            |_manifest, _target, _force, _label| false,
+            |_manifest, _force| panic!("fallback must not install packaged therock"),
+            || Ok("b10952".to_owned()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            read_backend_versions_therock_version(&path).as_deref(),
+            Some("7.13.0")
+        );
+        assert_eq!(read_backend_versions_llamacpp_tag(&path), None);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1455,6 +1540,7 @@ mod tests {
             &mut manifest,
             &path,
             "10.0.0",
+            "release-wheel-multi-arch-10-0-0-feaf90daccc2630b",
             "7.13.0",
             false,
             |_manifest, _target, _force_reinstall, _label| {

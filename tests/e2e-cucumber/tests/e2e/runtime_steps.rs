@@ -484,6 +484,60 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
+fn private_therock_entries(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[given("Lemonade backend alignment is forced to fail")]
+async fn force_lemonade_alignment_failure(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_LEMONADE_ALIGNMENT_FAILURE", "1".into()));
+    let (output, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let root = output
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with('*'))
+        .find_map(|line| line.trim().strip_prefix("install_root: "))
+        .expect("active runtime install root");
+    let path = std::path::Path::new(root).join("engines/lemonade/runtime/bin/therock");
+    world.lemonade_private_therock_before = Some((path.clone(), private_therock_entries(&path)));
+}
+
+#[when("the user reinstalls lemonade with failed backend alignment")]
+async fn reinstall_lemonade_with_failed_alignment(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["engines", "install", "lemonade", "--reinstall"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the failure names the active runtime without installing a private TheRock")]
+async fn failed_lemonade_alignment_is_safe(world: &mut E2eWorld) {
+    assert_ne!(world.cli_rc, Some(0), "alignment unexpectedly succeeded");
+    let (output, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let key = output
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("active runtime key");
+    let stderr = world.cli_stderr.as_deref().expect("install stderr");
+    assert!(stderr.contains(key), "error does not name {key}: {stderr}");
+    let (path, before) = world.lemonade_private_therock_before.as_ref().unwrap();
+    assert_eq!(
+        &private_therock_entries(path),
+        before,
+        "private TheRock changed at {}",
+        path.display()
+    );
+}
+
 /// Record the Lemonade backend-alignment opt-out for this scenario's next
 /// `rocm` command. Mirrors `setup_torch_alignment_opt_out` above.
 #[given("the user has opted out of realigning Lemonade's backend")]
