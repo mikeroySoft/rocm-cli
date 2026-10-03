@@ -36,6 +36,8 @@ pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
 mod system_sdk;
+#[cfg(test)]
+mod test_env;
 pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
@@ -1808,15 +1810,43 @@ impl AppPaths {
         self.engine_dir(engine).join("logs")
     }
 
+    /// Where engine virtualenvs live, honouring `ROCM_CLI_ENGINE_ENVS_ROOT`.
+    ///
+    /// Read-side of a write-only contract at present: `apps/rocm` exports this
+    /// key into the children it spawns, and this is the only code that reads it
+    /// back, so no in-tree production path reaches here today. That predates
+    /// the seam below and is deliberate — the key exists for an engine process
+    /// to honour. Being `pub` says nothing either way: `unreachable_pub` is
+    /// switched off workspace-wide (see the root `Cargo.toml`), so nothing warns
+    /// about an unused one. Delete this and the key together if the contract is
+    /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
+    /// keeps the lookup honest meanwhile.
     pub fn engine_envs_root(&self) -> PathBuf {
-        env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").map_or_else(
+        self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
+    }
+
+    /// [`Self::engine_envs_root`] against a caller-supplied override.
+    ///
+    /// Lets a test drive the override without `std::env::set_var`, which is
+    /// process-global and races other tests under a threaded runner. Same seam
+    /// as [`discover_rocm_installs_in_layout`].
+    fn engine_envs_root_from(&self, override_root: Option<&Path>) -> PathBuf {
+        override_root.map_or_else(
             || self.data_dir.join("engines"),
-            |root| normalize_runtime_path_for_host(&root),
+            normalize_runtime_path_for_host,
         )
     }
 
     pub fn engine_envs_dir(&self, engine: &str) -> PathBuf {
         self.engine_envs_root().join(engine).join("envs")
+    }
+
+    /// [`Self::engine_envs_dir`] against a caller-supplied override.
+    #[cfg(test)]
+    fn engine_envs_dir_from(&self, engine: &str, override_root: Option<&Path>) -> PathBuf {
+        self.engine_envs_root_from(override_root)
+            .join(engine)
+            .join("envs")
     }
 
     pub fn engine_locks_dir(&self, engine: &str) -> PathBuf {
@@ -1845,6 +1875,17 @@ impl AppPaths {
     /// record write (see [`FileLock`]).
     pub fn managed_launch_lock_path(&self) -> PathBuf {
         self.services_dir().join("launch.lock")
+    }
+
+    /// Where `rocm remote` records the sessions it started on other machines.
+    ///
+    /// Kept beside [`Self::services_dir`] and following the same file-per-record
+    /// shape, but deliberately separate: these describe work running on a
+    /// *different* machine, and anything walking the local service registry
+    /// (status rendering, the daemon's recovery supervisor) must not mistake a
+    /// remote session for a local server it can supervise.
+    pub fn remote_sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("remote-sessions")
     }
 
     pub fn audit_dir(&self) -> PathBuf {
@@ -2714,6 +2755,52 @@ fn detect_driver_summary() -> DriverSummary {
     }
 }
 
+/// The amdgpu kernel module's version on Linux, if it reports one.
+///
+/// Prefers the sysfs attribute (a plain file read, no subprocess) that DKMS
+/// builds of amdgpu expose. Falls back to `modinfo`, which is the only source
+/// for the in-tree kernel module -- it doesn't populate
+/// `/sys/module/amdgpu/version` at all.
+fn detect_linux_amdgpu_driver_version() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+        let version = text.trim();
+        if !version.is_empty() {
+            return Some(version.to_owned());
+        }
+    }
+    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    if rc != 0 {
+        return None;
+    }
+    out.lines()
+        .find_map(|line| line.strip_prefix("version:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPU driver version for this machine.
+///
+/// Sourced however the current platform exposes it: the amdgpu kernel module
+/// on Linux, the AMD display driver on Windows, or -- inside WSL -- the
+/// Windows host's display driver, since that's the driver a WSL guest's GPU
+/// workloads actually depend on, not its own (driver-less) amdgpu module.
+pub fn detect_gpu_driver_version() -> Option<String> {
+    if is_wsl_host() {
+        return match detect_wsl_host_driver() {
+            WslHostDriverProbe::Version(version) => Some(version),
+            WslHostDriverProbe::Unreachable | WslHostDriverProbe::NoAmdDisplay => None,
+        };
+    }
+    if runtime_is_windows() {
+        return detect_windows_amd_display_driver();
+    }
+    if runtime_is_linux() {
+        return detect_linux_amdgpu_driver_version();
+    }
+    None
+}
+
 impl WslSummary {
     /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
     ///
@@ -2788,19 +2875,43 @@ pub(crate) struct RocmInstall {
     pub(crate) version: Option<String>,
 }
 
+/// The search roots and layout this host's installs use.
+fn host_rocm_search() -> (Vec<PathBuf>, RocmLayout) {
+    let (dirs, layout) = if runtime_is_windows() {
+        (WINDOWS_ROCM_SEARCH_DIRS, RocmLayout::Children)
+    } else {
+        (LINUX_ROCM_SEARCH_DIRS, RocmLayout::Siblings)
+    };
+    (dirs.iter().map(PathBuf::from).collect(), layout)
+}
+
 /// Every unmanaged ROCm install on this host, best candidate first.
 ///
 /// Supplies the platform's search roots, layout, and `$ROCM_PATH` to
 /// [`discover_rocm_installs_in_layout`].
 pub(crate) fn discover_rocm_installs() -> Vec<RocmInstall> {
     let env_override = std::env::var_os("ROCM_PATH").map(PathBuf::from);
-    let (dirs, layout) = if runtime_is_windows() {
-        (WINDOWS_ROCM_SEARCH_DIRS, RocmLayout::Children)
-    } else {
-        (LINUX_ROCM_SEARCH_DIRS, RocmLayout::Siblings)
-    };
-    let search_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+    let (search_dirs, layout) = host_rocm_search();
     discover_rocm_installs_in_layout(&search_dirs, env_override.as_deref(), layout)
+}
+
+/// [`discover_rocm_installs`] with the host's `$ROCM_PATH` and search roots
+/// supplied by the caller instead of read from the process.
+///
+/// Reading `$ROCM_PATH` inside [`discover_rocm_installs`] is what forced its
+/// callers' tests to mutate the process environment, and two of them racing on
+/// that global is what made the Windows lane flake — that lane runs `cargo test`
+/// (threads in one process) where `Test (affected crates)` runs `cargo nextest`
+/// (a process per test), so only Windows observed it. Not every Linux lane uses
+/// nextest, so that is where it fired rather than where it could. Passing the
+/// override in keeps those tests hermetic. Same seam as [`discover_rocm_installs_in`], but
+/// keeps the host's layout so the caller under test is the real one.
+#[cfg(test)]
+pub(crate) fn discover_rocm_installs_on_host_in(
+    search_dirs: &[PathBuf],
+    env_override: Option<&Path>,
+) -> Vec<RocmInstall> {
+    discover_rocm_installs_in_layout(search_dirs, env_override, host_rocm_search().1)
 }
 
 /// [`discover_rocm_installs_in_layout`] for the Linux sibling layout.
@@ -2991,6 +3102,18 @@ pub fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         detail,
         version,
     }
+}
+
+/// The best unmanaged ("legacy") ROCm install on this host, if any.
+///
+/// [`detect_legacy_rocm_summary`] resolves the same thing but as part of the
+/// full [`ExamineSummary`] probe; this is the standalone version+path for a
+/// caller like `rocm version` that wants just the SDK identity as a fallback
+/// once it's already established no managed TheRock runtime is active.
+pub fn detect_legacy_rocm_sdk() -> Option<(String, PathBuf)> {
+    let install = discover_rocm_installs().into_iter().next()?;
+    let version = install.version?;
+    Some((version, install.path))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // ROCm installs the runtime DLL as lowercase `amdhip64.dll`
@@ -3845,6 +3968,17 @@ fn managed_therock_python_executable(record: &TheRockFamilyManifest) -> Option<P
         .find(|candidate| candidate.is_file())
 }
 
+/// Version (e.g. `"10.0.0"`) of the active managed TheRock runtime.
+///
+/// Reflects the version recorded at install time. Returns `None` when there is no managed
+/// runtime (system or legacy ROCm) or the registry record is malformed or hand-edited.
+pub fn active_managed_therock_version(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    Ok(select_active_therock_record(paths, config).and_then(|record| record.version))
+}
+
 /// Pick the active runtime record (managed TheRock or system SDK): the one
 /// matching `config.active_runtime_key`, falling back to the most recently
 /// installed.
@@ -4146,6 +4280,8 @@ struct TheRockFamilyManifest {
     therock_family: Option<String>,
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
@@ -5100,6 +5236,92 @@ pub(crate) const fn detect_linux_sysfs_gfx_target() -> Option<String> {
 #[cfg(target_os = "linux")]
 fn detect_linux_kfd_gfx_target() -> Option<String> {
     detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+/// One GPU as the kernel's KFD topology describes it.
+///
+/// This is the *kernel's* answer to "which GPUs exist here", which is a
+/// different question from the one the PCI bus answers. In a container the bus
+/// still carries every card the host has, while KFD carries only the devices
+/// passed through — so this is what `examine` must count, and the PCI scan is
+/// only good for naming what it finds here.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KfdGpuNode {
+    /// The node's PCI address as `lspci -D` spells it (`0000:11:00.0`), or
+    /// empty when the node does not state a usable one.
+    pub(crate) pci_id: String,
+    /// The node's own gfx target (`gfx942`), or empty when unparseable.
+    ///
+    /// Per-node, so it can be attributed to a particular device: an APU+dGPU
+    /// host reports two different targets and each belongs to exactly one card.
+    pub(crate) gfx_target: String,
+}
+
+/// Every GPU the KFD topology describes, in node order, read from a
+/// caller-supplied nodes directory. `None` when the topology could not be read
+/// at all, which callers must treat as "cannot say" rather than as "no GPUs".
+///
+/// Same planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
+/// The `/sys` path lives in the probe that calls this
+/// (`examine::probe_gpus_kernel_membership`), so that probe's own wiring is
+/// drivable from a test too rather than only the reconcile it hands off to.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {
+    let mut nodes: Vec<((u64, String), KfdGpuNode)> = fs::read_dir(nodes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let version = kfd_node_gfx_target_version(&path)?;
+            if !kfd_gfx_target_version_is_gpu(version.trim()) {
+                return None;
+            }
+            let properties = fs::read_to_string(path.join("properties")).unwrap_or_default();
+            Some((
+                natural_node_order(&entry.file_name().to_string_lossy()),
+                KfdGpuNode {
+                    pci_id: kfd_node_pci_id(&properties).unwrap_or_default(),
+                    gfx_target: parse_linux_kfd_gfx_target(version.trim()).unwrap_or_default(),
+                },
+            ))
+        })
+        .collect();
+    // `read_dir` order is filesystem-defined, so sort on the node number for the
+    // same reason `detect_kfd_gfx_target_in` does: node 0 is HIP ordinal 0.
+    nodes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Some(nodes.into_iter().map(|(_, node)| node).collect())
+}
+
+/// The PCI address a KFD topology node reports, spelled as `lspci -D` spells it.
+///
+/// KFD states the address as two decimal properties. `domain` is the PCI domain;
+/// `location_id` is the kernel's `pci_dev_id()`, i.e. `(bus << 8) | devfn`, with
+/// `devfn` packing the device number in bits 3..8 and the function in bits 0..3.
+/// So `location_id 4352` (`0x1100`) in domain 0 is `0000:11:00.0`.
+///
+/// Verified against an 8-GPU MI300X host: nodes 2..9 report `location_id` 4352,
+/// 12032, 17920, 23808, 35584, 43520, 49664 and 55808, which decode to exactly
+/// the eight addresses `lspci -D` lists for its accelerators (EAI-8449).
+///
+/// `None` when the property is absent or zero. Zero is refused rather than
+/// decoded: `0000:00:00.0` is the host bridge, so emitting it would be a
+/// wrong-but-plausible address that could match an unrelated PCI entry.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_node_pci_id(properties: &str) -> Option<String> {
+    let location = kfd_property_value(properties, "location_id")?
+        .parse::<u32>()
+        .ok()?;
+    if location == 0 {
+        return None;
+    }
+    let domain = kfd_property_value(properties, "domain")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let bus = (location >> 8) & 0xff;
+    let device = (location >> 3) & 0x1f;
+    let function = location & 0x7;
+    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.{function}"))
 }
 
 /// The KFD-topology read, against a caller-supplied nodes directory.
@@ -7551,6 +7773,15 @@ pub struct ManagedServiceRecord {
     /// identity token. `None` until the engine state records one.
     #[serde(default)]
     pub engine_start_ticks: Option<u64>,
+    /// Whether this service must never come back up without an endpoint key.
+    ///
+    /// The bind address alone cannot answer that. A service bound to loopback is
+    /// unreachable from elsewhere *until something republishes the port* — a
+    /// tailnet publish, a proxy, a container port map — and the publish outlives
+    /// the process. So the requirement has to be recorded next to the service and
+    /// survive a restart, exactly as the key itself does.
+    #[serde(default)]
+    pub requires_api_key: bool,
     #[serde(default)]
     pub runtime_id: Option<String>,
     #[serde(default)]
@@ -7634,6 +7865,9 @@ impl ManagedServiceRecord {
             engine_pid: None,
             supervisor_start_ticks: None,
             engine_start_ticks: None,
+            // Off unless a caller says otherwise: local loopback serving stays
+            // credential-free, which is the unchanged default.
+            requires_api_key: false,
             runtime_id,
             env_id,
             device_policy,
@@ -10818,6 +11052,98 @@ Class Name:                Display
     }
 
     #[test]
+    fn active_managed_therock_version_reads_recorded_version() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "version": "10.0.0",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_is_none_without_runtime() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-none");
+        let config = RocmCliConfig::default();
+        assert_eq!(active_managed_therock_version(&paths, &config)?, None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_falls_back_to_most_recent() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // No active_runtime_key set: the most recently installed runtime wins.
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_prefers_active_runtime_key() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-active-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // The active key points at the older runtime, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("therock-release:older".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("7.13.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_therock_version_record(
+        registry: &Path,
+        name: &str,
+        version: &str,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": format!("therock-release:{name}"),
+                "family": "gfx120X-all",
+                "version": version,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn examine_render_includes_driver_and_state_counts() {
         let summary = ExamineSummary {
             os: "windows".to_owned(),
@@ -11262,6 +11588,110 @@ Class Name:                Display
 
         assert_eq!(count, Some(2));
         Ok(())
+    }
+
+    #[test]
+    fn kfd_nodes_carry_a_decoded_pci_address_and_their_own_target() -> Result<()> {
+        // The first three GPU nodes of a real 8-GPU MI300X host, verbatim from
+        // its `location_id` values, behind the two CPU nodes it also reports.
+        // `lspci -D` lists those cards at 0000:11:00.0, 0000:2f:00.0 and
+        // 0000:46:00.0, so the decode is checked against the machine rather
+        // than against itself.
+        let (root, _) = temp_app_paths("kfd-nodes-pci");
+        let nodes = root.join("nodes");
+        for node in ["0", "1"] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                "cpu_cores_count 56\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+            )?;
+        }
+        for (node, location) in [("2", 4352), ("3", 12032), ("4", 17920)] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                format!(
+                    "cpu_cores_count 0\nsimd_count 1216\ngfx_target_version 90402\n\
+                     location_id {location}\ndomain 0\n"
+                ),
+            )?;
+        }
+        let read = kfd_gpu_nodes_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        let expected: Vec<KfdGpuNode> = ["0000:11:00.0", "0000:2f:00.0", "0000:46:00.0"]
+            .into_iter()
+            .map(|pci_id| KfdGpuNode {
+                pci_id: pci_id.to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            })
+            .collect();
+        // The CPU nodes are excluded, and node order is preserved so entry 0 is
+        // the device HIP calls ordinal 0.
+        assert_eq!(read, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_nodes_keep_their_targets_apart_and_refuse_an_unusable_address() -> Result<()> {
+        // An APU + a discrete card. Each node states its own target, which is
+        // the whole point of reading them per-node: a single host-wide answer
+        // would stamp the APU's gfx1103 onto the discrete card.
+        //
+        // The dGPU node here also reports `location_id 0`. That decodes to
+        // 0000:00:00.0 -- the host bridge -- so it must come back empty rather
+        // than as an address that could match an unrelated PCI entry.
+        let (root, _) = temp_app_paths("kfd-nodes-mixed");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("0"))?;
+        fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 16\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+        )?;
+        fs::create_dir_all(nodes.join("1"))?;
+        fs::write(
+            nodes.join("1").join("properties"),
+            "simd_count 256\ngfx_target_version 110003\nlocation_id 25600\ndomain 0\n",
+        )?;
+        fs::create_dir_all(nodes.join("2"))?;
+        fs::write(
+            nodes.join("2").join("properties"),
+            "simd_count 768\ngfx_target_version 110000\nlocation_id 0\ndomain 0\n",
+        )?;
+        let read = kfd_gpu_nodes_in(&nodes);
+        // The host-wide answer is still the APU, which is why it must not be
+        // attributed to the discrete card.
+        let lowest = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            read,
+            Some(vec![
+                KfdGpuNode {
+                    pci_id: "0000:64:00.0".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                },
+                KfdGpuNode {
+                    pci_id: String::new(),
+                    gfx_target: "gfx1100".to_owned(),
+                },
+            ])
+        );
+        assert_eq!(lowest.as_deref(), Some("gfx1103"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_kfd_node_decodes_a_nonzero_function_and_domain() {
+        // devfn packs the device in bits 3..8 and the function in bits 0..3, and
+        // the domain is a separate property -- so neither is assumed to be zero.
+        // 0x8ffa = bus 0x8f, device 0x1f, function 2.
+        assert_eq!(
+            kfd_node_pci_id("location_id 36858\ndomain 5\n").as_deref(),
+            Some("0005:8f:1f.2")
+        );
+        // A node that states no location at all cannot be placed on the bus.
+        assert_eq!(kfd_node_pci_id("gfx_target_version 90402\n"), None);
     }
 
     #[test]
@@ -12425,28 +12855,95 @@ Class Name:                Display
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn engine_envs_dir_honors_dedicated_root_override() {
         let (root, paths) = temp_app_paths("engine-envs-root-override");
         let override_root = root.join("runtime").join("engines");
-        let previous = std::env::var_os("ROCM_CLI_ENGINE_ENVS_ROOT");
-        unsafe {
-            std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
-        }
 
+        // Passed in rather than set via `std::env::set_var`: the environment is
+        // process-global, so mutating it here would race any concurrent test
+        // that reads the same key under a threaded runner.
+        //
+        // What this assertion covers is the override being consulted and the
+        // `<root>/<engine>/envs` shape built on it. It deliberately does NOT
+        // claim to cover the host-normalisation step, and routing the expected
+        // value through the same call the production code makes is why: on a
+        // non-Windows target `normalize_runtime_path_for_host` returns its
+        // input unchanged (see `normalize_runtime_path_text_for_platform`) for
+        // any path these tests can produce, so dropping normalisation from the
+        // override arm cannot fail this on a Linux lane — nor, with an
+        // already-normal temp path, on a Windows one. Not the identity in the
+        // strict sense: the helper round-trips through `Path::display()`, which
+        // is lossy for a non-UTF-8 path. Temp paths here are UTF-8, so the
+        // distinction does not reach this assertion, but it is not a no-op.
+        // Making it fail would need the platform threaded through the seam, and
+        // the normaliser itself is already covered on every host by
+        // `runtime_path_normalization_accepts_windows_drive_forms` and its
+        // neighbours, which pass the platform in explicitly.
         assert_eq!(
-            paths.engine_envs_dir("vllm"),
+            paths.engine_envs_dir_from("vllm", Some(&override_root)),
             normalize_runtime_path_for_host(&override_root)
                 .join("vllm")
                 .join("envs")
         );
 
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", value),
-                None => std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT"),
-            }
-        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Serializes tests that replace a process-global env var while they run.
+    ///
+    /// Named `*_TEST_LOCK` so the env-mutation contract guard recognises the
+    /// discipline by suffix rather than by a hardcoded list of lock names.
+    static ENGINE_ENVS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The two tests around this one drive the seam, which deliberately does
+    /// not read the environment — so on their own the production lookup, and
+    /// the key it names, could both be deleted without failing anything. This
+    /// drives `engine_envs_dir` itself against a real variable.
+    #[test]
+    fn engine_envs_dir_reads_its_root_from_the_environment() {
+        let _guard = ENGINE_ENVS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = temp_app_paths("engine-envs-root-env");
+        let override_root = root.join("runtime").join("engines");
+
+        // Restored on drop rather than on the next line, so a panic inside
+        // `engine_envs_dir` cannot leave this key pointing at the directory
+        // removed below. `RestoredEnvVar` only restores; the lock above is what
+        // serializes, and the contract guard requires it here because
+        // `RestoredEnvVar::set(` is in its mutation list.
+        let restore =
+            crate::test_env::RestoredEnvVar::set("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
+        let resolved = paths.engine_envs_dir("vllm");
+        drop(restore);
+
+        // Same scope as the seam test above: this pins that `engine_envs_dir`
+        // reaches the variable, not that the value is host-normalised on the
+        // way through. See that test for why the normalisation step is not
+        // observable here.
+        assert_eq!(
+            resolved,
+            normalize_runtime_path_for_host(&override_root)
+                .join("vllm")
+                .join("envs"),
+            "engine_envs_dir must reach $ROCM_CLI_ENGINE_ENVS_ROOT"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn engine_envs_dir_falls_back_to_the_data_dir_without_an_override() {
+        // The other half of the override contract: with nothing supplied the
+        // root is the data dir, which is what the unset-environment production
+        // path resolves to.
+        let (root, paths) = temp_app_paths("engine-envs-root-default");
+
+        assert_eq!(
+            paths.engine_envs_dir_from("vllm", None),
+            paths.data_dir.join("engines").join("vllm").join("envs")
+        );
+
         fs::remove_dir_all(root).ok();
     }
 

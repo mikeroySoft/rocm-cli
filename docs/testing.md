@@ -16,11 +16,102 @@ Run the Rust test suite:
 cargo test --workspace --all-targets
 ```
 
+Note that `cargo test` runs every test as a thread in **one process**, which is
+also what the required `windows-build-and-test` lane does. See
+[Tests that touch the environment](#tests-that-touch-the-environment) before
+writing a test that sets an environment variable.
+
 Run clippy with warnings as errors:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+### Tests that touch the environment
+
+`std::env::set_var` / `remove_var` change state shared by every thread in the
+process. Under a threaded harness two tests touching the same key race, and one
+reads the other's value and fails an assertion unrelated to what it tests. This
+is enforced by a test, not by an `xtask` subcommand:
+`a_test_mutating_the_environment_serializes_itself` in `xtask` scans the whole
+tree and **fails the build** on an unguarded mutation inside a `#[test]` or
+`#[tokio::test]`. Run it on its own with:
+
+```bash
+cargo test -p xtask a_test_mutating_the_environment_serializes_itself
+```
+
+Best is not to touch the environment at all — pass the value in through a test
+seam, as `newest_rocm_install_dir_in` and `engine_envs_root_from` do. A seam
+cannot test the wiring it bypasses, though, so when exercising the real
+env-reading path *is* the point, take a process-wide lock for the duration of
+the test and restore the previous value before releasing it:
+
+```rust
+/// Stands in for the production code under test. It reads `KEY` itself, which
+/// is why the test cannot use a seam and has to set a real variable.
+fn production_function() -> String {
+    std::env::var("KEY").unwrap_or_default()
+}
+
+/// Serializes every test in this process that replaces `KEY`.
+static SOMETHING_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+#[test]
+fn reads_its_setting_from_the_environment() {
+    // Poison is not a failure here: a panicking sibling leaves the value
+    // restored or not, and either way this test still wants the lock.
+    let _guard = SOMETHING_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = std::env::var_os("KEY");
+    unsafe { std::env::set_var("KEY", "value") };
+    let observed = production_function();
+    match &previous {
+        Some(value) => unsafe { std::env::set_var("KEY", value) },
+        None => unsafe { std::env::remove_var("KEY") },
+    }
+    assert_eq!(observed, "value");
+}
+```
+
+The guard accepts `ScopedTestEnv` or **any** static named `*_TEST_LOCK` taken
+inside the test body. The suffix is the rule, so a new lock
+is recognised the day it is declared rather than when someone remembers to add
+it to a list. The exemption is per test function, not per file: one test taking
+a lock does not cover its neighbours.
+
+Two things the shape above gets right, both of which the guard checks only
+partly:
+
+- **Take the lock before the mutation.** A lock protects from where it is
+  acquired, not retroactively. The guard enforces this ordering.
+- **Use the same lock as every other test that touches that key.** Two tests
+  replacing one key under two different mutexes race each other while both
+  satisfy the guard — it cannot see which key a call names, because the keys
+  are string literals it strips before scanning. This one is on you.
+
+Restoring on the next line, as above, leaks the variable if the code under test
+panics — and because the lock is taken with `into_inner`, the next test to hold
+it reads what the panicking one left behind. `rocm-core`'s `RestoredEnvVar`
+(`crates/rocm-core/src/test_env.rs`) moves the restore into `Drop`, where
+unwinding runs it; prefer it where one exists. It restores but does not
+serialize, so the lock is still yours to take.
+
+Keep the mutation and the lock in the same test body. Three known blind spots,
+all of which the scan reports nothing for:
+
+- A `#[test]` that delegates its mutation to a helper — the helper's body is a
+  different scope, so the scan cannot see the two together. It matches call
+  text, so a wrapper hides the mutation until the wrapper itself is named in the
+  scanner's `MUTATIONS` list, as `RestoredEnvVar::set(` is. Add a new restoring
+  helper to that list, or it is outside the guard.
+- A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
+  `#[rstest]`. Neither is used in this tree.
+- `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
+  `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
+  arms on.
 
 Run the cross-platform smoke test:
 
@@ -37,6 +128,48 @@ If the workspace is already built:
 
 ```bash
 python scripts/smoke_local.py --skip-build
+```
+
+## Remote control-channel checks
+
+`rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
+tests use a scripted stand-in, which proves control flow but assumes those tools
+behave a certain way. Two scripts check that assumption against a real OpenSSH
+server in a container — no GPU, no ROCm, no tailnet, since the remote's `rocm`
+and `tailscale` are stand-ins:
+
+```bash
+tests/remote-ssh/run.sh       # the tools and their contracts
+tests/remote-ssh/run-e2e.sh   # the real binary, end to end
+```
+
+`run.sh` covers argument handling, exit-code propagation, delivering a
+credential on stdin, file copy, batch-mode refusal, that withdrawing a
+published endpoint actually removes it, and the shape Tailscale Funnel takes in
+the serve config — including that a port Funnel cannot serve is refused.
+
+`run-e2e.sh` runs the built `rocm` through the whole flow — discover, probe,
+serve, publish, reconcile status, re-publish after an out-of-band withdrawal,
+tear down, and refuse to publish over a Funnel-exposed port — and needs
+`cargo build -p rocm` first. It does not prove the endpoint carries traffic;
+that needs a real two-node tailnet.
+
+The `rocm remote` cucumber scenarios that need a second machine carry
+`@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the
+GitHub-hosted `E2E tests` lane sets. A working daemon alone is not enough — the
+self-hosted GPU runners have one but cannot reach the package mirror the fixture
+image builds from, so they skip those scenarios. To run them locally:
+
+```bash
+E2E_INCLUDE_DOCKER=1 cargo xtask e2e
+```
+
+On a network that intercepts TLS, point the container's package manager at
+plain-HTTP mirrors:
+
+```bash
+export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3.20/main \
+  --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
 ## CI test selection
@@ -264,7 +397,9 @@ Then it verifies:
   pip creates it inside the ROCm folder when packages are downloaded
 - a single TheRock-index pip install plan for pinned `rocm`, `torch`, and
   `torchvision` requirements with exactly one `device-<detected-gfx-target>`
-  extra (`rocm` also requests `libraries,devel`), plus pinned `torchaudio`
+  extra (`rocm` also requests `libraries`), plus pinned `torchaudio`, and that
+  the toolchain is not planned for unless asked (pass the script `--devel` to
+  check the opt-in path instead, which adds `devel` to the `rocm` extras)
 - on a host with no detectable AMD GPU the preview reports `device_target:
   undetermined` and renders the device extra as a placeholder; a real install
   refuses rather than falling back to every published device payload
@@ -628,6 +763,59 @@ asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
 
+`prune`'s leftover sweep carries a second, unrelated race: a file with no record
+beside it is also what a *launch in progress* looks like, because `rocm serve`
+writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+no age rule to hide that window behind. `serve` already holds the shared
+managed-launch lock across both writes, so `prune` acquires the same lock before
+it reads the directory.
+
+Testing that is awkward, because `FileLock::acquire` blocks and has no `try_`
+variant: a test that took the lock and then called `prune` on the same thread
+would simply deadlock. Both tests therefore stage the launch from a second
+thread and let the code under test block on it.
+
+- `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
+  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  written, runs `prune` on a worker, asserts the worker does *not* report
+  completion while the lock is held, then publishes the record and releases.
+  Two assertions fail independently if the acquire is removed: that negative
+  wait, and the endpoint key still being on disk with its original value. The
+  second only works because the record is published with
+  `plant_service_record_without_its_key` — the full planter rewrites the key, and
+  a rewritten key is present at the end whether or not the sweep deleted it,
+  which would leave only the timing assertion doing real work. The negative wait
+  in turn cannot pass vacuously: the worker physically cannot report anything
+  without first holding a lock the main thread has.
+- `service-cleanup-07` does the cross-process half, which the unit test cannot:
+  a thread holds the real `launch.lock` with `rocm_core::FileLock` while a
+  separate real `rocm services prune --any-age --yes` process runs, and only
+  publishes the record after a fixed delay sized to outlast that process's
+  startup. A fixed delay against a variable startup fails one-sidedly in the
+  unhelpful direction — a slow runner lets the prune arrive after the record is
+  already published, where the key survives for a reason unrelated to the lock.
+  The scenario's discriminating assertion is the key surviving, and it only
+  discriminates while the prune's startup is shorter than the hold. The wall
+  clock it also asserts (`the prune blocked until the launch published its
+  record`) is a one-sided sanity bound, not a cure for that: `cli_elapsed`
+  brackets the whole child process, so a long elapsed time does not establish
+  that the prune blocked on the lock. It catches a prune that returned *too
+  fast* to have waited; it cannot catch one that was merely slow to start.
+
+Both go red if the `FileLock::acquire` is removed from
+`prune_managed_service_records`, and `services_prune_sweeps_engine_state_left_behind_by_a_deleted_record`
+still pins that real leftovers are swept at any age, so a fix that simply
+stopped sweeping could not pass either.
+
+What neither pins is the lock's *scope*. `prune_managed_service_records` argues
+for holding the guard across the apply phase as well as the scan, and both tests
+still pass if it is released after the plan is built. That is not an oversight to
+fix with another test: the only behaviour the wider span changes needs a service
+id to repeat across runs (a backwards clock step), and a test that instead tried
+to slip a launch in between the two phases would be racing a microsecond-wide
+window and would pass on a timing-lucky run rather than flake. The scope is a
+documented conservative choice, not a covered property.
+
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
@@ -913,10 +1101,36 @@ Release trust checks:
 ```bash
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
+cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
 python scripts/release_readiness.py --self-test
-ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
+bash scripts/reclaim-gpu.sh --self-test
 ```
+
+The ROCDXG digest check pins the shell fragment the WSL driver plan generates
+as a whole string — so a change to its quoting, spacing or field order fails
+the test rather than slipping past a substring assertion — and then runs that
+same generated fragment against a real file, with only the digest and the path
+redirected at a test payload: a matching digest, a mismatched one, a malformed
+one, and an empty one. That step is the only thing authenticating a package
+that is then installed as root, and this replaces the self-test that shipped
+with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
+`sha256sum`, so it is Unix-only.
+
+`reclaim-gpu.sh` frees the GPU from engine processes a killed prior run leaked.
+The self-hosted Linux GPU lanes run it before their GPU preflight; the two
+native Windows lanes have no bash and restate the rule in PowerShell instead,
+with their root list pinned to the script's by an `xtask` contract test. The
+WSL lanes skip the proactive reclaim before preflight — they provision a fresh
+guest per job and unregister it afterwards, so no prior run's processes survive
+into them — but they still call the script for `--report-holders` when their
+preflight fails, as the other bash lanes do. The two native Windows lanes call
+it at neither point: their preflight failure path has no PowerShell equivalent
+of the diagnostic. Its `--self-test`
+needs no GPU — it spawns decoy processes and asserts which ones the matching
+rule selects — so it runs on the GitHub-hosted lane rather than only where GPU
+hardware is held, under the same `heavy` path filter as the other checks there
+(which any change under `scripts/` reaches).
 
 The release-readiness self-test is cross-platform and uses only workspace-local
 temporary files under `.rocm-work/tests/release-readiness`. It also checks exact
@@ -1081,7 +1295,9 @@ it must be an exact runtime key or an unambiguous runtime id. It requires
 TheRock SDK wheel directories.
 For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
 7.13 before building from source; otherwise `q_gemm.hip` can fail on missing
-`half`/`half2` `atomicAdd` overloads.
+`half`/`half2` `atomicAdd` overloads. Building from source needs the compiler
+toolchain, so install the runtime with `rocm install sdk --devel` (see
+[vllm.md](vllm.md)).
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
@@ -1121,16 +1337,32 @@ Both forms run the same catalog. The host-side one collects its facts over
 `wsl.exe` with a POSIX shell, so the target distro needs neither `rocm-cli` nor
 Python.
 
-Interactive ROCDXG install inside WSL:
+ROCDXG install inside WSL:
 
 ```bash
-bash scripts/wsl_setup_rocdxg.sh
+rocm install driver            # review the plan
+rocm install driver --yes      # run it
+rocm examine                   # expect driver_status: wsl_rocdxg_ready
 rocm diagnose
 ```
 
-To require checksum verification for the downloaded ROCDXG `.deb`, provide the
-expected package digest from a trusted release source:
+The last two are the plan's own `post_install_checks`, so running them is what
+confirms the install took rather than merely that the commands exited zero.
+
+The `.deb` is verified against a digest pinned per ROCDXG release, so the
+default path needs nothing set. To exercise a release rocm-cli has no digest
+for, supply one — or opt out explicitly, which is the only way to reach an
+unverified install:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
+
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
 ```
+
+The install is covered by unit tests over the generated plan (`cargo test -p
+rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
+`/dev/dxg` and dxcore present, since the plan refuses before installing
+otherwise.

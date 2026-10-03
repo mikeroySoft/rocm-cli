@@ -118,16 +118,32 @@ happen before activation. Run the current host's set with
 
 ## WSL ROCDXG Package Verification
 
-`scripts/wsl_setup_rocdxg.sh` does not bake in a production checksum for the
-ROCDXG `.deb`. Operators can require verification by providing the expected
-digest:
+The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
+`apt-get install`, which runs its maintainer scripts as root. rocm-cli therefore
+carries a SHA-256 digest for each published ROCDXG release and checks the
+download against it before the install step; on a mismatch the plan stops before
+anything runs as root. Verification is on by default and needs nothing set.
+
+`ROCM_CLI_ROCDXG_SHA256` supplies a digest for a release rocm-cli has none for,
+and overrides the pinned digest for one it does:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
 
-When `ROCDXG_SHA256` is set, the script verifies the downloaded `.deb` before
-`apt install` and fails on malformed or mismatched digests.
+A version with no pinned digest and no supplied one is refused: the plan is
+built unsupported with no commands, so the failure mode of an unset variable is
+a plan that will not run rather than an unauthenticated root install.
+
+`ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1` is the only route to an unverified install.
+It is deliberately explicit, and the plan then carries a command that prints a
+warning naming the version it is not checking, so the choice is visible in the
+plan under review and in `state.json` rather than being inferred from a missing
+variable. The value is matched against a fixed allowlist of affirmative
+spellings — `1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON` — after trimming
+surrounding whitespace; anything else, including `0` and `false`, leaves
+verification on.
 
 ## Runtime Metadata Verification
 
@@ -211,6 +227,22 @@ untrusted host; rocm-cli always resolves the hardcoded default base instead.
 Set the gate and the specific base variable together, and only in tests or
 deliberate manual QA against a fixture server. The `therock-next` E2E scenarios
 use exactly this pairing to exercise next-layout dispatch hermetically.
+
+## ComfyUI Source Archive Override
+
+rocm-cli hardcodes the URL it downloads the ComfyUI source archive from. It
+can be overridden, for fixture-server testing only, and only in builds
+compiled with the `e2e-test-hooks` Cargo feature:
+
+```text
+ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE
+```
+
+Unlike the TheRock base overrides above, this needs no separate "allow" gate:
+the override *logic* does not exist at all in a build without
+`e2e-test-hooks` — the accessor compiled in that configuration ignores the
+environment entirely and unconditionally returns the hardcoded default URL, so
+a stray environment variable can never redirect a production install.
 
 ## Remaining Owner Step
 

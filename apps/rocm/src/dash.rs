@@ -66,11 +66,28 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
-        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
-        amd_smi_skip_kfd_preflight: false,
+        amd_smi_skip_device_preflight: false,
+        // Runs once per dashboard launch here, not per refresh tick, so the
+        // extra subprocess spawn is negligible.
+        amd_smi_gpu_reachable: gpu_reachable_for_preflight(
+            rocm_core::is_wsl_host(),
+            rocm_core::has_usable_amd_gpu(),
+        ),
         test_clock_offset_path: dash_test_clock_offset_path(),
     }
+}
+
+/// The verdict may only substitute for the device open on WSL: `has_usable_amd_gpu()`
+/// is deliberately fail-open on an unprobeable platform (so it never blocks a
+/// launch), which is the wrong polarity for this pre-flight's hang guard — an
+/// unknown verdict must NOT skip the real `/dev/kfd` open. Restricting the
+/// substitution to WSL (where there is no device node the dash crates can
+/// probe directly, only the shared ROCDXG-plumbing probe this same function
+/// backs) keeps bare-metal behaviour byte-identical to a plain `/dev/kfd` check.
+const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) -> bool {
+    is_wsl_host && has_usable_gpu
 }
 
 #[cfg(feature = "e2e-test-hooks")]
@@ -230,7 +247,58 @@ pub fn resolved_args(
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
+        // Records for local servers that are no longer running. The overlay
+        // renders only the live instances the daemon surfaces, so nothing there
+        // would otherwise admit that a failed server was ever recorded.
+        services_past_attempts: services_past_attempts(paths),
     }
+}
+
+/// Managed-service records that are no longer running, read from the same
+/// registry `rocm services` reads. A status-only file read: no readiness
+/// probes, no daemon.
+///
+/// **Known divergence — this can read lower than `rocm services list --all`,
+/// which is the command the overlay's own note points at.** The CLI path goes
+/// through `main.rs::load_managed_services`, which per record calls
+/// `refresh_from_engine_state` and then
+/// `refresh_managed_service_runtime_liveness`, demoting a crashed server's
+/// stale `running` record to `stopped` and writing it back. `stopped` is not a
+/// scrapeable status, so the CLI counts it; the raw status here is still
+/// `running`, so this does not. The two agree again as soon as any
+/// `rocm services` invocation rewrites the record.
+///
+/// Not refreshed here, for two reasons, in this order:
+///
+/// 1. It would not actually make the surfaces agree. This is a one-shot
+///    snapshot taken in `resolved_args` before the TUI starts (see
+///    `ResolvedArgs::services_past_attempts` — "a snapshot, not a live feed"),
+///    and nothing recomputes it for the life of the session. A server that
+///    crashes a minute into the dashboard diverges again regardless of how
+///    accurate this read was at launch. Closing the gap properly needs a live
+///    feed, not a better snapshot.
+/// 2. The CLI's verdict is not reachable without network I/O.
+///    `refresh_managed_service_runtime_liveness` decides liveness from
+///    `managed_service_endpoint_readiness`, which probes the endpoint — a model
+///    listing bounded by `SERVICE_LIVENESS_CHECK_TIMEOUT`, and for a record
+///    that lists but has not latched a verification, a real inference request
+///    bounded by `INFERENCE_PROBE_TIMEOUT` (8s). Those are per record and would
+///    be paid serially on the plain synchronous thread that `resolved_args`
+///    runs on, delaying the dashboard's first paint by seconds on exactly the
+///    hosts that serve models. It also *writes* records, which launching a
+///    read-only view should not do.
+///
+/// A cheaper approximation exists — adopt the engine state file and check the
+/// recorded pids with `process_is_running`, both local — but it is deliberately
+/// not taken: it trades this undercount for an *overcount* whenever a record's
+/// pids are dead while its endpoint still answers, and duplicates the CLI's
+/// liveness classification in a second place that could drift from it. Reading
+/// low is the safer failure: the note under this count invites the user to run
+/// `rocm services list --all`, which then shows them the true figure.
+fn services_past_attempts(paths: &AppPaths) -> usize {
+    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+    let records = load_service_records(&paths.services_dir());
+    discover_managed_services(&records).past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -265,7 +333,7 @@ fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
 
 /// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
 /// applies at creation so there is no umask window; a pre-existing directory is
-/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+/// tightened best-effort afterward (matching `server.rs`/`agent/clients.rs`).
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -862,6 +930,108 @@ mod tests {
         }
     }
 
+    /// The services overlay renders only live instances, so the count of
+    /// records that are no longer running has to be adapted by the bin like
+    /// `model_recipes` / `runtimes` / `automations` are.
+    ///
+    /// This is also the only test here that pins that the count is read off
+    /// `services_dir()` at all — its sibling
+    /// [`resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed`]
+    /// asserts 0 and so still passes against an empty registry. Keep both.
+    #[test]
+    fn resolved_args_counts_records_that_are_no_longer_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(args.services_past_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the divergence documented on [`services_past_attempts`]: this count
+    /// is a raw status read, so a crashed server whose record still says
+    /// `running` is NOT counted here, while `rocm services list --all` refreshes
+    /// liveness, demotes it to `stopped` and does count it.
+    ///
+    /// Witnessed rather than left implicit because the overlay's note sends the
+    /// user to that very command, so the two surfaces can disagree in front of
+    /// them. The record below is stale by construction: its status still says
+    /// `running`, and there is no process or listener behind it. That status
+    /// string is the whole of what decides the count — this path never consults
+    /// a pid and never probes the port, and the on-disk view it deserializes
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
+    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// if someone later adds one, this test fails and they are pointed at the
+    /// doc comment explaining the trade-off rather than silently flipping a
+    /// launch-time read into network I/O.
+    ///
+    /// Asserting 0 would also hold if the registry were never read, so this test
+    /// does not on its own show that any record reached the count;
+    /// [`resolved_args_counts_records_that_are_no_longer_running`] is what pins
+    /// that. Keep the two together.
+    #[test]
+    fn resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-stale-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        // A crashed server as this path can see one: the status string was never
+        // rewritten, so it still says `running`.
+        std::fs::write(
+            p.services_dir().join("stale.json"),
+            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(
+            args.services_past_attempts, 0,
+            "the overlay count is a raw status snapshot; refreshing it here \
+             would put per-service endpoint probes on the dashboard launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn runner_options_wires_services_dir_to_registry() {
         let p = paths();
@@ -889,6 +1059,32 @@ mod tests {
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
         );
+    }
+
+    #[test]
+    fn runner_options_never_skips_the_device_preflight() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Truth-tables the WSL gate as a pure function, independent of the test
+    /// host's actual environment: a regression back to the un-gated
+    /// `has_usable_amd_gpu()` would flip the `(false, true)` bare-metal case
+    /// to `true`, since the fail-open verdict fires on any unprobeable
+    /// platform, not just WSL.
+    ///
+    /// This pins the helper's body only. The call site's binding — that
+    /// `runner_options` passes `is_wsl_host()` itself rather than a literal —
+    /// is not pinned by any test: on an ordinary CI host with no usable GPU,
+    /// `has_usable_amd_gpu()` is already `false`, so a mutant literal `true`
+    /// there is indistinguishable from the real call from this crate's tests.
+    #[test]
+    fn gpu_reachable_for_preflight_only_substitutes_on_wsl() {
+        assert!(!gpu_reachable_for_preflight(false, true));
+        assert!(!gpu_reachable_for_preflight(false, false));
+        assert!(!gpu_reachable_for_preflight(true, false));
+        assert!(gpu_reachable_for_preflight(true, true));
     }
 
     #[test]
