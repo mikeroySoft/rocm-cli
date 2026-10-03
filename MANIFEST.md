@@ -495,9 +495,12 @@ repository.
 | tokio-tungstenite | 0.28.0 | MIT |
 | tokio-util | 0.7.18 | MIT |
 | toml | 1.1.6+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_datetime | 0.6.11 | MIT OR Apache-2.0 |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_edit | 0.22.27 | MIT OR Apache-2.0 |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_write | 0.1.2 | MIT OR Apache-2.0 |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | tower | 0.5.3 | MIT |
 | tower-http | 0.6.11 | MIT |
@@ -598,6 +601,7 @@ repository.
 | windows_x86_64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
+| winnow | 0.7.15 | MIT |
 | winnow | 1.0.3 | MIT |
 | winreg | 0.10.1 | MIT |
 | wiremock | 0.6.5 | MIT/Apache-2.0 |
