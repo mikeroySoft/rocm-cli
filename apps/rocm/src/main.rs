@@ -30651,7 +30651,7 @@ install therock";
         // a record written by an ordinary public-bind launch must not claim the
         // service asked for `--require-api-key` — the branch order means a record
         // that claims it wins, and its remediation drops `--allow-public-bind`.
-        let (root, paths) = test_paths("restart-public-no-key");
+        let (root, paths) = test_paths("restart-public-bind-no-key");
         paths.ensure()?;
         let mut record = ManagedServiceRecord::new(
             &paths,
