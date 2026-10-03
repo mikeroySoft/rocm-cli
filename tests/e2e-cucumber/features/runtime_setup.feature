@@ -339,13 +339,6 @@ Feature: Runtime configuration
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
 
-  @id:runtime-lemonade-backend-alignment-failure @requires-gpu @requires-engine:lemonade @nightly
-  Scenario: runtime-16b - Failed Lemonade alignment does not add a private ROCm runtime
-    Given a managed runtime is active
-    And Lemonade backend alignment is forced to fail
-    When the user reinstalls lemonade with failed backend alignment
-    Then the failure names the active runtime without installing a private TheRock
-
   # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
   # `backend_versions.json` -- the alignment runs on every Lemonade install, so
   # without the opt-out a manual pin is silently overwritten the next time the
@@ -377,3 +370,10 @@ Feature: Runtime configuration
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  @id:runtime-lemonade-backend-alignment-failure @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-19 - Failed Lemonade alignment does not add a separate ROCm runtime
+    Given a managed runtime is active
+    And Lemonade backend alignment is forced to fail
+    When the user reinstalls lemonade with failed backend alignment
+    Then the failure names the active runtime without installing a separate TheRock

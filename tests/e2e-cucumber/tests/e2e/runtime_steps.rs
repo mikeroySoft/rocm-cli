@@ -484,7 +484,7 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
-fn private_therock_entries(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+fn separate_therock_entries(path: &std::path::Path) -> std::collections::BTreeSet<String> {
     std::fs::read_dir(path)
         .into_iter()
         .flatten()
@@ -504,7 +504,7 @@ async fn force_lemonade_alignment_failure(world: &mut E2eWorld) {
         .find_map(|line| line.trim().strip_prefix("install_root: "))
         .expect("active runtime install root");
     let path = std::path::Path::new(root).join("engines/lemonade/runtime/bin/therock");
-    world.lemonade_private_therock_before = Some((path.clone(), private_therock_entries(&path)));
+    world.lemonade_separate_therock_before = Some((path.clone(), separate_therock_entries(&path)));
 }
 
 #[when("the user reinstalls lemonade with failed backend alignment")]
@@ -518,7 +518,7 @@ async fn reinstall_lemonade_with_failed_alignment(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[then("the failure names the active runtime without installing a private TheRock")]
+#[then("the failure names the active runtime without installing a separate TheRock")]
 async fn failed_lemonade_alignment_is_safe(world: &mut E2eWorld) {
     assert_ne!(world.cli_rc, Some(0), "alignment unexpectedly succeeded");
     let (output, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
@@ -529,11 +529,11 @@ async fn failed_lemonade_alignment_is_safe(world: &mut E2eWorld) {
         .expect("active runtime key");
     let stderr = world.cli_stderr.as_deref().expect("install stderr");
     assert!(stderr.contains(key), "error does not name {key}: {stderr}");
-    let (path, before) = world.lemonade_private_therock_before.as_ref().unwrap();
+    let (path, before) = world.lemonade_separate_therock_before.as_ref().unwrap();
     assert_eq!(
-        &private_therock_entries(path),
+        &separate_therock_entries(path),
         before,
-        "private TheRock changed at {}",
+        "separate TheRock changed at {}",
         path.display()
     );
 }
