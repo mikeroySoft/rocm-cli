@@ -197,6 +197,9 @@ Expected result:
 - The engine uses ROCm GPU execution.
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
+- With an active managed runtime and no matching llama.cpp asset, installation
+  fails naming the active runtime key; no separate Lemonade `bin/therock` runtime
+  is downloaded.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
 While the log stream is attached, verify detach and stop behave differently:

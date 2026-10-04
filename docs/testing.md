@@ -640,6 +640,12 @@ rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --device gpu_required --managed
 on the GPU through the adopted SDK's `bin`/`lib` paths with no CPU fallback and
 no TheRock download.
 
+For managed-runtime Lemonade alignment failures, run
+`cargo test -p rocm-engine-lemonade --all-targets`; the regression test asserts
+that no packaged-pin fallback installer runs. On a GPU host without a matching
+llama.cpp release, `rocm engines install lemonade --reinstall` must fail naming
+the active runtime rather than create `engines/lemonade/runtime/bin/therock`.
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity
