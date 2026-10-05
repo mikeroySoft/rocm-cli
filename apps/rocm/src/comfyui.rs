@@ -2024,7 +2024,11 @@ mod tests {
 
         let paths = test_paths("comfyui-uv-failure");
         fs::create_dir_all(&paths.cache_dir)?;
-        let uv_path = paths.cache_dir.join("fake-uv");
+        // The fake uv must be spawnable, and `std::env::temp_dir()` can sit on
+        // a `noexec` mount (mikeroySoft/rocm-cli#48), which fails the spawn
+        // before `run_uv_logged_command` ever sees uv's exit status.
+        let exec_dir = exec_capable_test_dir("comfyui-uv-failure")?;
+        let uv_path = exec_dir.join("fake-uv");
         fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
         fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
 
@@ -2049,8 +2053,31 @@ mod tests {
             "error should name the concrete log path so a failed install's log stays discoverable: {message}"
         );
 
+        fs::remove_dir_all(&exec_dir).ok();
         fs::remove_dir_all(&paths.cache_dir).ok();
         Ok(())
+    }
+
+    /// A fresh scratch directory beside the running test binary. The binary is
+    /// executing from there, so that filesystem demonstrably permits exec —
+    /// unlike `std::env::temp_dir()`, which may be mounted `noexec`.
+    #[cfg(unix)]
+    fn exec_capable_test_dir(name: &str) -> Result<PathBuf> {
+        let exe = std::env::current_exe().context("locate the running test binary")?;
+        let base = exe
+            .parent()
+            .context("test binary has no parent directory")?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = base.join(format!(
+            "rocm-cli-exec-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create exec-capable test dir {}", dir.display()))?;
+        Ok(dir)
     }
 
     #[test]
