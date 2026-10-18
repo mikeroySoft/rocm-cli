@@ -16,6 +16,8 @@
 //! stay behaviorally identical.
 
 use crate::examine::{Examination, WslFacts};
+#[cfg(test)]
+use crate::rocm_install::discover_rocm_installs_in;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -100,9 +102,14 @@ pub struct DiagnoseReport {
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
-    /// Set when the host is out of scope for this catalog (e.g. WSL2). When
-    /// present, `matched` is empty — the catalog is deliberately not run, to
-    /// avoid emitting bare-metal-Linux diagnoses that don't apply.
+    /// Set when the catalog has no entries at all for the running platform, and
+    /// carrying the routing note that says so.
+    ///
+    /// Decided purely by whether the catalog covers the running platform — never
+    /// by a score. When this is `Some`, no checker ran, so `matched` is empty and
+    /// `has_match` is false; a consumer must not wait for sub-threshold rows
+    /// alongside it. Pinned by
+    /// `an_out_of_scope_report_never_carries_matched_entries`.
     #[serde(default)]
     pub out_of_scope: Option<String>,
     /// The verdict on a model, when `--model` named one.
@@ -309,6 +316,73 @@ const KEYWORDS_MSVC_REDIST: KeywordTable = &[
     (r"msvcp140\.dll", 30, "error mentions msvcp140.dll"),
 ];
 
+/// The oldest Visual C++ runtime that programs built with a current toolset can
+/// run on, as `major.minor`.
+///
+/// Evidence: Visual Studio 2022 17.10 made the standard library's `mutex`
+/// constructor `constexpr`. A program built that way and run on an older
+/// `msvcp140.dll` reads a null pointer in the mutex code and dies with an access
+/// violation (0xC0000005). Microsoft's STL issue tracker has the report: 14.32
+/// crashed and 14.40.33810 worked, and the maintainers closed it as by design,
+/// because a redistributable must be at least as new as the toolset that built
+/// the program. 17.10 ships runtime 14.40. On the machine this check was written
+/// from, 14.29.30133 crashed the llama.cpp server that Lemonade installs and
+/// 14.51 ran it.
+///
+/// Confidence: high that anything below 14.40 breaks; not confirmed that 14.40
+/// itself is enough for every build. A program built with a newer toolset can
+/// ask for a newer runtime, so 14.40 is a floor and the fix tells the user to
+/// install the latest one. It is a floor on purpose: raising it would flag
+/// runtimes that work.
+const MSVC_REDIST_MIN_VERSION: [u32; 2] = [14, 40];
+
+/// Score for a runtime older than [`MSVC_REDIST_MIN_VERSION`] with no symptom.
+/// Equal to [`HIGH_CONFIDENCE`]: the version is read from the machine and the
+/// threshold is a known break, so no symptom is needed to act on it.
+const MSVC_REDIST_OUTDATED_SCORE: i32 = 75;
+
+/// Symptom text for [`check_21_msvc_redist_outdated`].
+///
+/// An access violation is generic: any native crash prints one. So the code
+/// alone stays under [`MIN_SCORE_FOR_MATCH`] (25), the DLL name alone does too
+/// (30), and the two together (55) reach "likely". A crash report that names
+/// `msvcp140` as the faulting module is specific (55 alone), and with the
+/// exception code it reaches high confidence (80). This table is scored with
+/// overlap collapsing, so the faulting-module line and the DLL name inside it
+/// are one signal, not two.
+const KEYWORDS_MSVC_REDIST_OUTDATED: KeywordTable = &[
+    (
+        r"faulting module (?:name|path)?\s*:?\s*(?:[^\s,]*[\\/])?msvcp140",
+        55,
+        "crash report names msvcp140 as the faulting module",
+    ),
+    (
+        r"0xc0000005|-1073741819|3221225477|access violation",
+        25,
+        "access violation exit or exception code",
+    ),
+    (r"msvcp140\.dll", 30, "error mentions msvcp140.dll"),
+];
+
+/// Whether `version` (for example `14.29.30133.0`) is older than `minimum`.
+///
+/// `false` for an empty or unparsable version: unknown is not old, and a false
+/// match would send a user to reinstall a runtime that is fine. Parts missing on
+/// either side count as zero, so `14.40` equals `14.40.0.0`.
+fn msvc_redist_older_than(version: &str, minimum: &[u32]) -> bool {
+    let Some(found) = crate::examine::parse_dotted_version(version) else {
+        return false;
+    };
+    for i in 0..found.len().max(minimum.len()) {
+        let have = found.get(i).copied().unwrap_or(0);
+        let want = minimum.get(i).copied().unwrap_or(0);
+        if have != want {
+            return have < want;
+        }
+    }
+    false
+}
+
 const KEYWORDS_REPO_BROKEN: KeywordTable = &[
     (r"404.*repo\.radeon\.com", 50, "404 against repo.radeon.com"),
     (
@@ -364,6 +438,79 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
     ("out_of_registers", 30, "compiler OUT_OF_REGISTERS"),
 ];
 
+// vLLM's startup OOM. The distinctive signature is a torch/HIP allocation
+// failure while the engine is reserving KV-cache VRAM; a bare "out of memory"
+// on its own is deliberately sub-threshold so this only claims the failure mode
+// when the vLLM/HIP shape of the error is present.
+//
+// None of these tokens are vLLM-specific on their own: `torch.OutOfMemoryError:
+// CUDA out of memory` is the identical shape any ROCm PyTorch job emits (ROCm's
+// PyTorch build reports the CUDA-compat name), so this table alone cannot tell
+// vLLM's OOM apart from an arbitrary training script hitting the same
+// allocator error. `check_16_vllm_oom` therefore scores *only* the lines
+// carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
+// pasted log: an OOM on an unanchored line contributes nothing at all.
+//
+// Weighting splits the *allocator message* from the *exception class name*:
+//   - The HIP allocator's own messages (`HIP out of memory`, the
+//     `hipErrorOutOfMemory` status) and the CUDA-compat message ROCm's PyTorch
+//     prints clear `MIN_SCORE_FOR_MATCH` on their own — with the required
+//     anchor already establishing this is vLLM's line, one of those messages is
+//     a genuine OOM signal.
+//   - The bare exception *class* (`torch.OutOfMemoryError`, with or without the
+//     `.cuda.` module path) and a bare `out of memory` stay sub-threshold: any
+//     PyTorch job emits the class name, so it must corroborate rather than
+//     carry the verdict alone (`torch_oom_class_alone_is_not_a_vllm_match`).
+// This table alone is scored through `keyword_score_collapsing_overlaps`, which
+// de-duplicates overlapping spans, so `HIP out of memory` counts once (as the
+// 50-point message), not also as the nested 25-point `out of memory` — one
+// phrase yields one evidence bullet. Every other table keeps the catalog's
+// default "each entry is an independent signal" scoring.
+const KEYWORDS_VLLM_OOM: KeywordTable = &[
+    (
+        "hip out of memory",
+        50,
+        "error mentions 'HIP out of memory'",
+    ),
+    (
+        // ROCm's HIP runtime OOM status code, e.g. `RuntimeError:
+        // hipErrorOutOfMemory`. `\boutofmemory\b` does not match inside it (no
+        // word boundary after `hipError`), so it needs its own entry.
+        r"hiperroroutofmemory",
+        50,
+        "error mentions hipErrorOutOfMemory",
+    ),
+    (
+        r"cuda out of memory",
+        50,
+        "error mentions 'CUDA out of memory' (ROCm reports the CUDA-compat name)",
+    ),
+    (
+        // The exception class name, under either `torch.OutOfMemoryError` or the
+        // `.cuda.` module path ROCm's PyTorch reports it under. Sub-threshold
+        // alone: it is the class every PyTorch OOM raises, not vLLM's signature.
+        r"torch\.(?:cuda\.)?outofmemoryerror",
+        45,
+        "error mentions torch.OutOfMemoryError",
+    ),
+    (
+        r"tried to allocate .*(?:gib|mib)",
+        30,
+        "error names an allocation it could not satisfy",
+    ),
+    (
+        r"\boutofmemory\b",
+        30,
+        "error mentions standalone OutOfMemory",
+    ),
+    ("out of memory", 25, "error mentions 'out of memory'"),
+    (
+        r"gpu[-_]memory[-_]utilization",
+        20,
+        "log mentions gpu_memory_utilization (vLLM VRAM reservation)",
+    ),
+];
+
 /// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
 /// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
 ///
@@ -393,15 +540,49 @@ const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
 ];
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
+///
+/// Every entry that matches counts as an independent signal. This is the
+/// behaviour every table in the catalog except [`KEYWORDS_VLLM_OOM`] is tuned
+/// for -- see [`keyword_score_collapsing_overlaps`] for why that one differs and
+/// why the difference must not be generalized.
 fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, false)
+}
+
+/// Like [`keyword_score`], but collapses matches whose spans overlap to the
+/// strongest one, so a single phrase cannot masquerade as two independent
+/// signals (e.g. `HIP out of memory` must not also count the `out of memory`
+/// nested inside it).
+///
+/// This is **deliberately not** applied to the rest of the catalog. Several
+/// older tables pair a greedy `.*` pattern with a second, genuinely independent
+/// keyword, and the greedy span swallows it: `api-ms-win-crt-.*\.dll` runs to
+/// the last `.dll` on the line and covers an independent `msvcp140.dll`,
+/// `dkms .*failed` covers an independent `dpkg: error`, and so on. Since
+/// collapsing can only lower a score, applying it there would push real
+/// diagnoses below [`MIN_SCORE_FOR_MATCH`] and make them vanish
+/// (`overlap_dedup_does_not_demote_other_catalog_keyword_tables` pins this).
+/// [`KEYWORDS_VLLM_OOM`] is safe because its overlaps are true nestings of
+/// literal phrases, not artifacts of a greedy wildcard.
+fn keyword_score_collapsing_overlaps(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, true)
+}
+
+fn keyword_score_impl(
+    symptom: &str,
+    table: KeywordTable,
+    collapse_overlaps: bool,
+) -> (i32, Vec<String>) {
     if symptom.is_empty() {
         return (0, Vec::new());
     }
     let sym = symptom.to_lowercase();
-    let mut hits: Vec<(i32, &'static str)> = Vec::new();
+    let mut hits: Vec<(i32, &'static str, usize, usize)> = Vec::new();
     for (pattern, weight, label) in table {
-        if Regex::new(pattern).is_ok_and(|re| re.is_match(&sym)) {
-            hits.push((*weight, label));
+        if let Ok(re) = Regex::new(pattern)
+            && let Some(m) = re.find(&sym)
+        {
+            hits.push((*weight, label, m.start(), m.end()));
         }
     }
     if hits.is_empty() {
@@ -409,9 +590,18 @@ fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
     }
     // Mirror diagnose.py's `hits.sort(reverse=True)`: weight desc, then label desc.
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(a.1)));
-    hits.truncate(2);
-    let score = hits.iter().map(|(w, _)| *w).sum();
-    let labels = hits.iter().map(|(_, l)| (*l).to_owned()).collect();
+    // Keep the strongest hit for any overlapping span: the same substring must
+    // not contribute two evidence bullets (nor two weights toward the score).
+    let mut kept: Vec<(i32, &'static str, usize, usize)> = Vec::new();
+    for hit in hits {
+        let overlaps = collapse_overlaps && kept.iter().any(|k| hit.2 < k.3 && k.2 < hit.3);
+        if !overlaps {
+            kept.push(hit);
+        }
+    }
+    kept.truncate(2);
+    let score = kept.iter().map(|(w, ..)| *w).sum();
+    let labels = kept.iter().map(|(_, l, ..)| (*l).to_owned()).collect();
     (score, labels)
 }
 
@@ -1059,7 +1249,7 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
         )
     } else {
         format!(
-            "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
+            "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU - do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
     // The catalog classes this NEEDS-ARG, which is what the marker now says:
@@ -1267,28 +1457,60 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let sdk_path = &e.hip_sdk_path;
-    if sdk_path.is_empty() {
-        score += 35;
-        evidence.push("No HIP SDK install found under C:\\Program Files\\AMD\\ROCm".to_owned());
-    } else if !e.hipinfo_present {
-        score += 30;
-        evidence.push(format!(
-            "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
-        ));
-    }
-    // Skipped for a managed runtime for the reason this checker's own note
-    // already gives: those wheels bring their own HIP runtime, so a missing
-    // system HIP SDK is not evidence against them.
-    if e.has_amd_gpu
+
+    // A missing or broken HIP SDK is only evidence of a fault when something on
+    // this host actually calls into HIP: an ambient PyTorch HIP build, a
+    // llama.cpp binary built with GGML_HIP=ON, or -- scored first below -- the
+    // user's own pasted error. The CLI's own default (Lemonade's bundled
+    // llama.cpp on Vulkan) never touches the system HIP SDK, and a
+    // managed-runtime PyTorch wheel brings its own runtime too. Scoring the
+    // SDK's absence unconditionally used to rank this fix first on exactly
+    // those hosts: the ones least likely to need it.
+    //
+    // The pasted error is the strongest of the three signals, not the weakest.
+    // `amdhip64.dll was not found` or `'hipInfo' is not recognized` is a
+    // *running* process failing to load HIP, which is a fact about this host
+    // that no probe can contradict -- the framework probe answering "nothing
+    // detected" means it did not find a framework it knows, not that nothing
+    // here calls into HIP. Gating the SDK evidence on the detected framework
+    // alone dropped the +35 from the textbook case this entry exists for: a
+    // Windows host with no SDK, pasting precisely that error.
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_HIP_SDK_MISSING);
+    let pytorch_is_ambient_hip_build = e.has_amd_gpu
         && e.framework == "pytorch"
         && e.framework_rocm_version.starts_with("hip=")
-        && e.framework_source != "managed-runtime"
-    {
-        score += 25;
-        evidence
-            .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
+        && e.framework_source != "managed-runtime";
+    let llama_cpp_is_hip_build =
+        e.has_amd_gpu && e.framework == "llama-cpp" && e.framework_rocm_version == "GGML_HIP=ON";
+    let symptom_names_hip_loading = kw_score > 0;
+    let needs_hip =
+        pytorch_is_ambient_hip_build || llama_cpp_is_hip_build || symptom_names_hip_loading;
+
+    if needs_hip {
+        if sdk_path.is_empty() {
+            score += 35;
+            evidence.push("No HIP SDK install found under C:\\Program Files\\AMD\\ROCm".to_owned());
+        } else if !e.hipinfo_present {
+            score += 30;
+            evidence.push(format!(
+                "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
+            ));
+        }
+        if pytorch_is_ambient_hip_build {
+            score += 25;
+            // Two wordings, because this clause is about PyTorch needing a
+            // system HIP SDK and the arm above already said what is wrong with
+            // the one here. Saying "the HIP SDK is not present" beside "HIP SDK
+            // at C:\... but hipInfo.exe is missing" put two contradictory lines
+            // in one finding, and the user had no way to tell which was true.
+            evidence.push(if sdk_path.is_empty() {
+                "PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned()
+            } else {
+                "PyTorch is a HIP build, so it needs a working system HIP SDK".to_owned()
+            });
+        }
     }
-    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_HIP_SDK_MISSING);
+
     score += kw_score;
     evidence.extend(kw_ev);
 
@@ -1390,7 +1612,7 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         return zero("fix-15-msvc-redist", "MSVC runtime missing");
     }
     let fix = Fix {
-        summary: "Install the Microsoft Visual C++ 2015-2022 redistributable so the HIP SDK's amdhip64_*.dll can load.".to_owned(),
+        summary: "Install the Microsoft Visual C++ 2015-2022 redistributable so the programs that link it, such as the HIP SDK's amdhip64_*.dll and the llama.cpp server that Lemonade installs, can load.".to_owned(),
         commands: vec![
             "# Download & install (x64):".to_owned(),
             "#   https://aka.ms/vs/17/release/vc_redist.x64.exe".to_owned(),
@@ -1398,12 +1620,192 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
-        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing (the HIP SDK install) rather than this fix.".to_owned()],
+        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-15-msvc-redist",
-        "MSVC runtime missing (HIP DLLs cannot load)",
+        "MSVC runtime missing (programs that link it cannot load)",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+/// A required anchor before [`KEYWORDS_VLLM_OOM`] is even scored: the word
+/// "vllm" itself, or its distinctive VRAM-reservation flag. Without one of
+/// these, a generic HIP/CUDA/PyTorch OOM string is not evidence of *this*
+/// failure mode -- see the comment on [`KEYWORDS_VLLM_OOM`]. `tensor[-_]parallel`
+/// is deliberately NOT an anchor: it is a Megatron/DeepSpeed term (rocm-cli does
+/// not serve one model across GPUs), so anchoring on it would misattribute those
+/// frameworks' OOMs to vLLM.
+///
+/// `gpu[-_]memory[-_]utilization` is also a (20-point) entry in
+/// [`KEYWORDS_VLLM_OOM`], so a line that only echoes the flag -- a config dump,
+/// or a paste of rocm-cli's own low-VRAM hint, which prints
+/// `--gpu-memory-utilization` -- is both anchored and self-scoring. That is
+/// harmless *because* only anchored lines are scored: such a line is worth 20,
+/// far below [`MIN_SCORE_FOR_MATCH`], so it can surface as a weak signal in
+/// `matched` but can never carry a verdict, and it can no longer lend its anchor
+/// to an OOM elsewhere in the paste. It stays an anchor because the flag is
+/// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
+const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
+
+/// A canonical vLLM-OOM `--symptom` string guaranteed to clear
+/// [`MIN_SCORE_FOR_MATCH`].
+///
+/// It carries two independent signals (the torch exception class *and* the HIP
+/// allocator message) on one anchored line, so it scores even after overlap
+/// de-duplication. The vLLM engine falls back to this when a user's actual
+/// failing line would not itself be diagnosable, so the `rocm diagnose` command
+/// it prints always reports a cause.
+pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
+
+/// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
+/// `gpu_memory_utilization`), joined by newlines — the only text
+/// [`check_16_vllm_oom`] is allowed to score.
+///
+/// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
+/// re-enables the very misattribution the anchor exists to prevent (a
+/// `llama.cpp` OOM in a paste that also names vLLM). Returning the anchored
+/// lines rather than a yes/no gate is what makes that true: regex matching
+/// ignores line boundaries, so scoring the whole symptom behind a boolean gate
+/// still counted keyword hits from *unanchored* lines at full weight, and one
+/// benign `gpu_memory_utilization` config echo was enough to hand another
+/// framework's OOM a HIGH_CONFIDENCE vLLM verdict
+/// (`only_the_anchored_lines_are_scored_not_the_whole_paste`).
+///
+/// The join is by `\n` so that no pattern can straddle two lines: the regexes
+/// here are literals or use `.*`, which does not match a newline. Dropping the
+/// unanchored lines therefore cannot fabricate a match across the seam.
+///
+/// The same-line "anchor + OOM token" requirement falls out of this: an anchored
+/// line with no OOM token contributes nothing, so the score is 0 and the checker
+/// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
+/// anchor and the error on one line by construction.
+///
+/// The split is [`crate::terminal::rendered_lines`], not `str::lines()` and not
+/// a set of separator characters. `lines()` splits on `\n` and `\r\n` only, so a
+/// lone `\r` was ordinary text to it — and a bare CR is what every progress bar
+/// in this ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw
+/// terminal capture pasted into `rocm diagnose --symptom '...'` therefore
+/// collapsed into one giant "line", the anchor matched somewhere in it, and
+/// every keyword in the paste scored — exactly the whole-paste scoring this
+/// function exists to prevent, reinstated by one byte
+/// (`any_line_advance_is_a_boundary_not_scoreable_text`).
+///
+/// Adding `\r` to the split fixed that one byte and nothing else, because a
+/// two-character allowlist is not the boundary a terminal renders. Every other
+/// way of starting a new line — `ESC E` (`NEL`), `ESC D` (`IND`), `CSI n B`
+/// (`CUD`), which are terminfo's `nel`/`ind`/`cud1` and ordinary output from
+/// curses- and `rich`-style progress UIs — collapsed the paste just as
+/// completely, as did `\x0b`, `\x0c`, `\u{85}`, `U+2028`/`U+2029` and any stray
+/// control byte. Each one scored a `llama.cpp` OOM at 95 against a `vllm` anchor
+/// from a different rendered line, past a `HIGH_CONFIDENCE` threshold of 75, and
+/// cited the other engine's tokens as its evidence.
+///
+/// What this is *not* is a terminal emulator. The contract is one-sided, and
+/// [`crate::terminal::rendered_lines`] is where to read it — that doc carries
+/// the contract itself and points on to the module section holding the detail
+/// behind it, including the single shape in which two rendered rows still come
+/// back as one segment. It is deliberately not restated here: a second copy is
+/// a stale copy waiting to happen, and this function is where a stale one would
+/// do the damage. What matters at this call site is the direction of the error
+/// that remains: a capture whose cursor addressing that walk does not model
+/// loses a diagnosis rather than inventing one, and the canonical-symptom
+/// fallback already covers that. The misattribution is the failure mode with a
+/// user-visible cost, and this is what narrows it to the one shape that
+/// contract calls out.
+///
+/// Sharing that walk with the vLLM engine's sanitizer is also what keeps the
+/// `SGR` exception right. A colourised logger emits `ESC [ 31 m` *inside* a
+/// line, so a splitter that treats every escape as a boundary cuts a genuine
+/// `vllm: ... torch.OutOfMemoryError` between its anchor and its error token and
+/// silently stops diagnosing it (measured: 95 → 0).
+///
+/// `\r\n` yields an empty segment, which carries no anchor and is dropped.
+fn vllm_anchored_lines(symptom: &str) -> String {
+    let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
+        return String::new();
+    };
+    crate::terminal::rendered_lines(symptom)
+        .into_iter()
+        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
+/// mode.
+///
+/// The vLLM engine calls this to decide whether the user's actual failing line
+/// is worth routing into a `--symptom` example, or whether to fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`] so the printed command is guaranteed to report
+/// a cause rather than reading as "the tool checked and found nothing".
+#[must_use]
+pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
+    let e = Examination {
+        os_family: "linux".to_owned(),
+        ..Examination::default()
+    };
+    check_16_vllm_oom(&e, symptom).score >= MIN_SCORE_FOR_MATCH
+}
+
+/// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
+/// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
+/// the user must pass the error via `--symptom`, or arrive from the serve
+/// failure note that points here. `e` is therefore unused.
+fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
+    // Score the anchored lines only, never the whole paste. The anchor is the
+    // *only* thing separating this failure mode from any other framework's
+    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
+    // keyword hits from unanchored lines would still count at full weight. Any
+    // future change here must keep the scored text restricted to anchored lines.
+    let anchored = vllm_anchored_lines(symptom);
+    if anchored.is_empty() {
+        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
+    if score <= 0 {
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    // Two different faults share this error, and the remediation splits on which
+    // one it is: on a shared/busy GPU vLLM's fixed ~90% reservation collides
+    // with memory already in use, so lowering the reservation is the fix; for a
+    // model that genuinely does not fit, lowering it only trades an earlier OOM
+    // for a later one, so the wording must not present the knob as the answer in
+    // that case.
+    let summary = format!(
+        "{} If instead the model genuinely does not fit in this GPU's VRAM, lowering the \
+         reservation will not help - use a smaller or quantized model (rocm-cli serves one \
+         model on a single GPU; it does not shard a model across GPUs).",
+        crate::VLLM_GPU_MEMORY_UTILIZATION_HINT
+    );
+    let fix = Fix {
+        summary,
+        // Byte-identical to the `fix-16-vllm-oom` catalog recipe's block, and
+        // pinned there by `the_oom_plan_matches_the_catalog_copy`. The two are
+        // one plan in two modules and a user may meet either copy.
+        commands: vec![
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,".to_owned(),
+            "# or steer vLLM onto a less-busy device:".to_owned(),
+            "rocm serve <model> --gpu-memory-utilization 0.5".to_owned(),
+            "rocm serve <model> --gpu <index>".to_owned(),
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the".to_owned(),
+            "# problem; pick a smaller or quantized model (single-GPU serving only).".to_owned(),
+        ],
+        fix_id: "fix-16-vllm-oom".to_owned(),
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup".to_owned(),
+        notes: vec![
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.".to_owned(),
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-16-vllm-oom",
+        "vLLM ran the GPU out of memory at startup",
         score,
         evidence,
         fix,
@@ -1719,6 +2121,131 @@ fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosis {
+    const ID: &str = "info-20-gpu-no-rocm-support";
+    const TITLE: &str = "GPU has no ROCm/HIP support (Vulkan backend still works)";
+
+    // "This host has no ROCm/HIP support" is a claim about the whole machine,
+    // so one unsupported GPU is not enough to make it: an APU+dGPU laptop with
+    // a gfx90c iGPU next to a supported discrete card does have ROCm support,
+    // via the dGPU. Firing there would top-rank "GPU has no ROCm/HIP support"
+    // ahead of `fix-9-igpu-dgpu` (40, below MIN_SCORE_FOR_MATCH) -- which is
+    // the entry that actually addresses that pairing -- and tell a user with
+    // working hardware the opposite of the truth. That is the same misleading
+    // top-ranked diagnosis this ticket exists to remove, on another host shape.
+    //
+    // An AMD GPU whose gfx target is empty is *undetected*, not supported, and
+    // it blocks the claim too: we cannot say the host has no ROCm support while
+    // a card we failed to identify is sitting in it.
+    //
+    // "Unsupported" is `host_gpu::gfx_target_has_no_rocm_build`, not a second
+    // list of target names here. That predicate is the one the install path
+    // already refuses on, it is token-normalised (so `gfx90c:xnack-` and
+    // uppercase answer the same), and it is deliberately narrower than
+    // `normalize_therock_family` returning `None` -- which also answers `None`
+    // for a target this catalog simply does not recognise yet. Conflating
+    // "confirmed unsupported" with "unrecognised" would turn a detection gap
+    // into a false claim about the hardware; keeping a bare copy of the target
+    // names here would let the two drift into disagreeing about the same card.
+    let targets = amd_gfx_targets(e);
+    let all_unsupported = !targets.is_empty()
+        && targets.len() == amd_gpu_count(e)
+        && targets
+            .iter()
+            .all(|gfx| crate::host_gpu::gfx_target_has_no_rocm_build(gfx));
+    if !all_unsupported {
+        return zero(ID, TITLE);
+    }
+    let gfx = targets.join(", ");
+
+    // A real `Fix`, classed `DIAGNOSE-ONLY` in the catalog, rather than
+    // `fix: None`. The class exists to say "detected, explained, no remedy",
+    // and routing through it keeps one promise true across every surface:
+    // `rocm diagnose` prints `apply with: rocm fix <id>` for every cause,
+    // README and `--help` say `rocm fix` takes that id, and `rocm fix
+    // info-20-gpu-no-rocm-support` answers -- by naming the problem and exiting
+    // 0 without touching the machine. A `None` here would have made the printed
+    // command a lie for this one id and left `--json` consumers a null to learn
+    // about.
+    let fix = Fix {
+        // Deliberately a claim about the GPU and not about what `rocm serve`
+        // will do. "`rocm serve` already picks a Vulkan engine on this host" was
+        // neither: `default_engine_for_host` answers lemonade here, but a
+        // configured default outranks it, and whether Lemonade then lands on
+        // Vulkan is its own runtime choice over
+        // `LLAMACPP_BACKEND_PRIORITY ["rocm","vulkan"]`. A note promising an
+        // outcome this catalog does not decide would be false for anyone who
+        // had set an engine. The wording below matches `therock`'s refusal for
+        // the same hardware, which is the other place a user meets this fact.
+        summary: "No ROCm/HIP runtime build exists for this architecture, so there is nothing to install or configure. Vulkan-based engines do not use ROCm and work on it; Lemonade, the default engine here, is one.".to_owned(),
+        fix_id: ID.to_owned(),
+        notes: vec![
+            "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.".to_owned(),
+            "To use this GPU for inference, serve with a Vulkan-capable engine. If you have set a default engine that needs ROCm, that one will not work here; `rocm serve --engine lemonade` does not need it.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+
+    finalize(
+        ID,
+        TITLE,
+        60,
+        vec![format!(
+            "Detected GPU architecture {gfx} has no ROCm/HIP runtime build. \
+             Vulkan-based engines (the default Lemonade backend) still work on it."
+        )],
+        fix,
+    )
+}
+
+fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-21-msvc-redist-outdated";
+    const TITLE: &str = "MSVC runtime too old (programs built with a recent toolset crash)";
+
+    // Belt and braces with the `windows` tag in `CHECKERS`: a non-Windows host
+    // has no such runtime, so it never matches, whatever it was handed.
+    if e.os_family != "windows" {
+        return zero(ID, TITLE);
+    }
+    let mut score = 0;
+    let mut evidence = Vec::new();
+    if msvc_redist_older_than(&e.msvc_redist_version, &MSVC_REDIST_MIN_VERSION) {
+        score += MSVC_REDIST_OUTDATED_SCORE;
+        evidence.push(format!(
+            "Visual C++ runtime {} in System32 is older than {}.{}",
+            e.msvc_redist_version, MSVC_REDIST_MIN_VERSION[0], MSVC_REDIST_MIN_VERSION[1]
+        ));
+    }
+    let (kw_score, kw_ev) =
+        keyword_score_collapsing_overlaps(symptom, KEYWORDS_MSVC_REDIST_OUTDATED);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    if score <= 0 {
+        return zero(ID, TITLE);
+    }
+    let fix = Fix {
+        summary: "Update the Microsoft Visual C++ 2015-2022 redistributable. Programs built with a recent toolset, such as the llama.cpp server that Lemonade installs, crash on a runtime older than 14.40.".to_owned(),
+        commands: vec![
+            "# Update the runtime (x64). This needs the Windows administrator prompt, so".to_owned(),
+            "# the command is shown here and not run for you:".to_owned(),
+            "winget install --id Microsoft.VCRedist.2015+.x64 --exact".to_owned(),
+            "# Or download and run the installer:".to_owned(),
+            "#   https://aka.ms/vs/17/release/vc_redist.x64.exe".to_owned(),
+            "# Then close and restart the program (or Lemonade) so it loads the new runtime.".to_owned(),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"".to_owned(),
+        notes: vec![
+            "The verify command prints the runtime version. It should read 14.40 or higher.".to_owned(),
+            "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.".to_owned(),
+            "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
 // ---------------------------------------------------------------------------
 // WSL2 catalog
 //
@@ -2003,7 +2530,8 @@ fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --install -d Ubuntu-24.04".to_owned(),
         ],
         fix_id: "fix-wsl-5-distro-too-old".to_owned(),
-        verify: "grep VERSION_ID /etc/os-release".to_owned(),
+        verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1"
+            .to_owned(),
         notes: vec![
             "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
         ],
@@ -2178,9 +2706,10 @@ const CHECKERS: &[Checker] = &[
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
+    (check_16_vllm_oom, &["linux", "wsl"]),
     // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
     // gated off native Windows. 17 rather than 16 because the vLLM
-    // out-of-memory entry reserves 16 on its own branch; the number is a stable
+    // out-of-memory entry above already holds 16; the number is a stable
     // handle, so the two do not get to share one.
     (check_17_torch_dlpack_cuda_variant, &["linux"]),
     (check_wsl_1_gpu_not_exposed, WSL_ONLY),
@@ -2201,6 +2730,12 @@ const CHECKERS: &[Checker] = &[
     // same 64 MB default a container does, so leaving this tagged `linux` alone
     // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
+    // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
+    // has nothing to read there and would never fire.
+    (check_20_gpu_unsupported_by_rocm, &["linux", "windows"]),
+    // Windows only: the runtime is read from the Windows System32 folder. A WSL
+    // distro is examined as a distro, so it has no such runtime to read.
+    (check_21_msvc_redist_outdated, &["windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2292,6 +2827,10 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // WSL2 used to be short-circuited here as out of scope. It is a real platform
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
+    //
+    // `fix-16-vllm-oom` opts into `wsl` in CHECKERS for that reason: it is a
+    // keyword-only check whose failure mode is just as real under WSL2, so it
+    // still answers there alongside the WSL entries.
     //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
@@ -2431,6 +2970,11 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         // HIGH_CONFIDENCE -- so a report of low-confidence matches showed ids but
         // never said what to run, which is what sent users guessing at the
         // ordinal.
+        //
+        // Unconditional, including for a `DIAGNOSE-ONLY` cause: `rocm fix` has
+        // an answer for every id in the catalog, and for that class the answer
+        // is to name the problem and change nothing. The `flags:` line above
+        // already said so, so the command is not a promise of a repair.
         let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         out.push('\n');
     }
@@ -2611,10 +3155,11 @@ mod tests {
 
     #[test]
     fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
-        // The Windows-shaped sibling of the check_8 gate, and the reason
-        // check_13's own note already gives: TheRock wheels bring their own HIP
-        // runtime, so a HIP-build torch on a host with no system HIP SDK says
-        // nothing when that torch came from a managed runtime.
+        // The Windows-shaped sibling of the check_8 gate: TheRock wheels bring
+        // their own HIP runtime, so a HIP-build torch on a host with no system
+        // HIP SDK says nothing when that torch came from a managed runtime --
+        // not even the base "no system HIP SDK" evidence, since nothing on this
+        // host actually needs one.
         let windows = |source: &str| Examination {
             os_family: "windows".to_owned(),
             has_amd_gpu: true,
@@ -2625,14 +3170,627 @@ mod tests {
         };
 
         let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        assert_eq!(
+            managed.score, 0,
+            "a managed runtime's own HIP build is not evidence a system HIP SDK \
+             is missing: {managed:?}"
+        );
+
         let ambient = check_13_hip_sdk_missing(&windows("path"), "");
         assert_eq!(
-            ambient.score - managed.score,
-            25,
-            "the HIP-build clause must apply to the ambient torch and only to it \
-             (managed {}, ambient {})",
-            managed.score,
-            ambient.score
+            ambient.score, 60,
+            "the ambient build needs both the base SDK-missing evidence (35) and \
+             the HIP-build clause (25): {ambient:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_scores_an_sdk_whose_hipinfo_is_missing_only_when_something_needs_hip() {
+        // The `else if !hipinfo_present` arm: an SDK directory is present but
+        // its bin/hipInfo.exe is gone -- a half-installed or hand-pruned SDK.
+        // This PR moved that arm inside the `needs_hip` gate, so it now has to
+        // be read as two cases, not one: the same broken SDK is evidence on a
+        // host that calls into HIP, and silence on one that does not.
+        let host = |framework: &str, rocm_version: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: "C:\\Program Files\\AMD\\ROCm\\6.4".to_owned(),
+            hipinfo_present: false,
+            framework: framework.to_owned(),
+            framework_rocm_version: rocm_version.to_owned(),
+            framework_source: "path".to_owned(),
+            ..Examination::default()
+        };
+
+        let needs_hip = check_13_hip_sdk_missing(&host("pytorch", "hip=7.14.60850"), "");
+        assert_eq!(
+            needs_hip.score, 55,
+            "a broken SDK under an ambient HIP torch scores the missing-hipInfo \
+             evidence (30) plus the HIP-build clause (25), and NOT the \
+             SDK-absent 35 -- the SDK directory is present: {needs_hip:?}"
+        );
+        assert!(
+            needs_hip
+                .evidence
+                .iter()
+                .any(|ev| ev.contains("hipInfo.exe is missing")),
+            "the missing-hipInfo evidence must name what is broken: {needs_hip:?}"
+        );
+
+        // Same half-installed SDK, nothing on the host built against HIP: the
+        // Lemonade/Vulkan shape of ROCMAI-546. A broken SDK nobody calls into
+        // is not a fault worth ranking.
+        let no_hip = check_13_hip_sdk_missing(&host("llama-cpp", ""), "");
+        assert_eq!(
+            no_hip.score, 0,
+            "with no HIP-based setup the SDK's state is not evidence of \
+             anything: {no_hip:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_contradict_itself_about_whether_the_hip_sdk_is_there() {
+        // The PyTorch clause has two wordings, chosen on `sdk_path.is_empty()`,
+        // and the choice had nothing standing on it: forcing that condition to
+        // `true` left every fix-13 test green while putting "the HIP SDK is not
+        // present on this host" in the same finding as "HIP SDK at C:\... but
+        // hipInfo.exe is missing". A user reading two opposite lines under one
+        // cause has no way to tell which is true, which is the whole reason the
+        // branch exists.
+        //
+        // Both arms are asserted together because the failure is a pair: the
+        // wording that is right for one host is wrong for the other, so a test
+        // holding only one arm is satisfied by a constant.
+        let host = |sdk_path: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: sdk_path.to_owned(),
+            hipinfo_present: false,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: "path".to_owned(),
+            ..Examination::default()
+        };
+
+        let absent = check_13_hip_sdk_missing(&host(""), "");
+        let absent_text = absent.evidence.join("\n");
+        assert!(
+            absent_text.contains("the HIP SDK is not present on this host"),
+            "with no SDK anywhere, the PyTorch clause has to say the SDK is \
+             absent: {absent:?}"
+        );
+        assert!(
+            !absent_text.contains("needs a working system HIP SDK"),
+            "and must not instead imply one is there but not working: {absent:?}"
+        );
+
+        let broken = check_13_hip_sdk_missing(&host("C:\\Program Files\\AMD\\ROCm\\6.4"), "");
+        let broken_text = broken.evidence.join("\n");
+        assert!(
+            broken_text.contains("needs a working system HIP SDK"),
+            "with an SDK directory present, the clause is about it not working, \
+             not about it being absent: {broken:?}"
+        );
+        assert!(
+            !broken_text.contains("the HIP SDK is not present on this host"),
+            "saying the SDK is absent beside `HIP SDK at C:\\... but hipInfo.exe \
+             is missing` puts two contradictory lines in one finding: {broken:?}"
+        );
+        // And the line it would contradict is in that same finding, so the
+        // assertion above is about a real pairing and not a hypothetical one.
+        assert!(
+            broken_text.contains("hipInfo.exe is missing"),
+            "the arm this wording exists to agree with must be present: {broken:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence() {
+        // ROCMAI-546: the laptop that opened this ticket. A GPU with no ROCm/HIP
+        // support (gfx90c) served over Lemonade's bundled, Vulkan-built
+        // llama.cpp -- nothing on the host ever calls into HIP, so the absence
+        // of a system HIP SDK must not itself read as a fault.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![Gpu {
+                name: "AMD Radeon Vega 7".to_owned(),
+                gfx_target: "gfx90c".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            // Lemonade's llama.cpp build advertises Vulkan, not HIP/ROCm.
+            framework_rocm_version: String::new(),
+            ..Examination::default()
+        };
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-13-hip-sdk-missing"),
+            "fix-13 must not fire with no HIP-based setup configured: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        let info = report
+            .matched
+            .iter()
+            .find(|d| d.id == "info-20-gpu-no-rocm-support")
+            .expect("the no-ROCm-support diagnosis must appear with the detected gfx target");
+        assert!(
+            info.evidence.iter().any(|ev| ev.contains("gfx90c")),
+            "the diagnosis must name the detected GPU architecture: {info:?}"
+        );
+        let fix = info
+            .fix
+            .as_ref()
+            .expect("every catalog entry carries a Fix, including the fixless one");
+        assert_eq!(
+            fix.class,
+            crate::fix::FixClass::DiagnoseOnly,
+            "the class is where \"detected, explained, no remedy\" is recorded, and it is \
+             what every consumer reads to tell this entry from a repair: {info:?}"
+        );
+        assert!(
+            !fix.auto_applicable && fix.commands.is_empty() && fix.verify.is_empty(),
+            "nothing to run, nothing to copy, nothing to verify: {info:?}"
+        );
+        assert_eq!(
+            report.matched.first().map(|d| d.id.as_str()),
+            Some("info-20-gpu-no-rocm-support"),
+            "the no-ROCm-support diagnosis, not fix-13, must rank first: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The textbook fix-13 host: Windows, an AMD GPU, no HIP SDK, no framework
+    /// the probe recognises — and a pasted error that is HIP failing to load.
+    ///
+    /// The gate that stops fix-13 top-ranking a Vulkan host must not also stop
+    /// it on this one. The error text *is* the HIP-use evidence: something on
+    /// the machine tried to load HIP and could not, which no framework probe
+    /// can contradict — "no framework detected" means none that `examine`
+    /// knows, not that nothing here calls into HIP. Gating on the detected
+    /// framework alone dropped the +35 from exactly the case the entry exists
+    /// for, taking `'hipInfo' is not recognized` from 80 to 45 and
+    /// `could not find HIP` from 75 to 40 — both below `MIN_SCORE_FOR_MATCH`,
+    /// so `has_match` went false and the user was routed upstream for a
+    /// problem the catalog has a fix for.
+    ///
+    /// Measured, not reasoned: these three numbers were read off a run on the
+    /// base branch before the gate existed.
+    #[test]
+    fn fix_13_scores_a_pasted_hip_load_failure_with_no_framework_detected() {
+        let windows_no_sdk = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            // No framework, and no HIP SDK: `hip_sdk_path` empty is the +35 arm.
+            ..Examination::default()
+        };
+
+        for (symptom, expected) in [
+            (
+                "'hipInfo' is not recognized as an internal or external command",
+                80,
+            ),
+            ("could not find HIP", 75),
+            ("amdhip64.dll was not found", 85),
+        ] {
+            let finding = check_13_hip_sdk_missing(&windows_no_sdk, symptom);
+            assert_eq!(
+                finding.score, expected,
+                "the pasted error is what establishes that this host loads HIP, so the \
+                 SDK-absent 35 belongs on top of the keyword score for {symptom:?}: {finding:?}"
+            );
+            assert!(
+                finding
+                    .evidence
+                    .iter()
+                    .any(|ev| ev.contains("No HIP SDK install found")),
+                "and the finding has to say the SDK is missing, which is the thing to \
+                 fix, not only quote the error back: {finding:?}"
+            );
+            let report = diagnose(&windows_no_sdk, symptom);
+            assert!(
+                report.has_match,
+                "{symptom:?} must establish a cause rather than routing the user \
+                 upstream: {:?}",
+                report
+                    .matched
+                    .iter()
+                    .map(|d| (&d.id, d.score))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A pasted HIP-loading error still opens fix-13 when no AMD GPU was
+    /// detected at all — deliberately, and this is the test that says so.
+    ///
+    /// `symptom_names_hip_loading` is the one of `needs_hip`'s three disjuncts
+    /// not gated on `e.has_amd_gpu`, and the asymmetry is the point. The other
+    /// two read a *probe* ("PyTorch here is a HIP build"), which is only
+    /// meaningful beside a GPU. This one reads a *fact the user supplied*: a
+    /// process on this machine tried to load HIP and failed. A GPU probe
+    /// answering "nothing detected" is itself one of the things a broken HIP
+    /// install causes, so letting it veto the user's own error would silence
+    /// the entry on the hosts most likely to need it — a headless box whose
+    /// driver did not load, or a WSL guest where the probe sees no card.
+    /// Installing the HIP SDK is the right next step either way; if there
+    /// genuinely is no AMD GPU, fix-13 ranks beside the other causes rather
+    /// than suppressing them.
+    #[test]
+    fn fix_13_still_answers_a_pasted_hip_error_when_no_amd_gpu_was_detected() {
+        let no_gpu = Examination {
+            os_family: "windows".to_owned(),
+            // The probe found nothing: no `has_amd_gpu`, no `gpus` entries.
+            ..Examination::default()
+        };
+        let finding = check_13_hip_sdk_missing(&no_gpu, "amdhip64.dll was not found");
+        assert_eq!(
+            finding.score, 85,
+            "the same score as the host with a detected GPU: the pasted error is the \
+             evidence, and an absent-GPU probe does not weaken it: {finding:?}"
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|ev| ev.contains("No HIP SDK install found")),
+            "and the SDK's absence is still named as the thing to put right: {finding:?}"
+        );
+        // Nothing here is an unsupported-GPU host, so the entry that outranks
+        // fix-13 on the ticket's laptop must stay silent rather than firing on
+        // a machine whose hardware was never identified.
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&no_gpu, "").score,
+            0,
+            "an undetected GPU is not a confirmed-unsupported one"
+        );
+    }
+
+    /// The gate still holds on the host it was built for: a pasted error that
+    /// says nothing about HIP opens nothing.
+    ///
+    /// Without this, "let a keyword count as HIP use" could be read as "let any
+    /// symptom count", which would put the entry back where it started.
+    #[test]
+    fn fix_13_stays_silent_for_a_symptom_that_does_not_name_hip() {
+        let finding = check_13_hip_sdk_missing(
+            &Examination {
+                os_family: "windows".to_owned(),
+                has_amd_gpu: true,
+                ..Examination::default()
+            },
+            "the server exits with code 3221225781 on startup",
+        );
+        assert_eq!(
+            finding.score, 0,
+            "an unrelated paste on a Vulkan host is not evidence the HIP SDK is \
+             missing: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_keeps_its_weak_signal_for_a_native_rocm_llama_cpp_build() {
+        // Regression guard for the other half of the acceptance criteria: a host
+        // that genuinely runs a HIP-built llama.cpp (e.g. a manual/vLLM build,
+        // as opposed to Lemonade's Vulkan one) with no system HIP SDK keeps the
+        // base SDK-missing evidence rather than being gated to silence.
+        //
+        // "Keeps", not "still fires": 35 is below MIN_SCORE_FOR_MATCH, so this
+        // is a WEAK entry that does not set `has_match`. The name used to say
+        // "still fires", which claimed more than the assertion pins -- the score
+        // is the same 35 the pre-gate code produced, so the number alone cannot
+        // tell the two versions apart. What this test actually guards is the
+        // `llama_cpp_is_hip_build` arm of `needs_hip`: drop that arm and the
+        // score falls to 0.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            framework_rocm_version: "GGML_HIP=ON".to_owned(),
+            ..Examination::default()
+        };
+        let finding = check_13_hip_sdk_missing(&e, "");
+        assert_eq!(
+            finding.score, 35,
+            "a HIP-built llama.cpp with no system HIP SDK must still score the base \
+             SDK-missing evidence: {finding:?}"
+        );
+        assert!(
+            finding.score > 0 && finding.score < MIN_SCORE_FOR_MATCH,
+            "and it stays a weak signal, not a match: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_fire_for_a_hip_built_llama_cpp_binary_with_no_amd_gpu() {
+        // A HIP/ROCm-advertising llama.cpp binary on PATH is not, by itself,
+        // evidence this host has AMD hardware to run it on -- the same reasoning
+        // `pytorch_is_ambient_hip_build` already applies. Without it, this host
+        // would get the same spurious fix-13 the Lemonade/Vulkan laptop did.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: false,
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            framework_rocm_version: "GGML_HIP=ON".to_owned(),
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_13_hip_sdk_missing(&e, "").score,
+            0,
+            "no AMD GPU means nothing on this host needs the HIP SDK"
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_without_a_confirmed_unsupported_gpu() {
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&Examination::default(), "").score,
+            0,
+            "a host with no GPUs at all must not match"
+        );
+
+        let supported = Examination {
+            gpus: vec![Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&supported, "").score,
+            0,
+            "a gfx target ROCm supports must not match: {:?}",
+            check_20_gpu_unsupported_by_rocm(&supported, "")
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_when_a_supported_gpu_sits_beside_the_unsupported_one() {
+        // An APU+dGPU laptop: a gfx90c iGPU next to a supported discrete card.
+        // This host *does* have ROCm support, through the dGPU, so the
+        // whole-machine claim must not be made -- and in particular must not
+        // out-rank `fix-9-igpu-dgpu`, which is the entry for this pairing.
+        let apu_plus_dgpu = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            has_apu: true,
+            has_discrete_amd: true,
+            gpus: vec![
+                Gpu {
+                    name: "AMD Radeon Vega 7".to_owned(),
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "AMD Radeon RX 7900 XTX".to_owned(),
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ],
+            env: std::collections::BTreeMap::from([(
+                "HIP_VISIBLE_DEVICES".to_owned(),
+                "1".to_owned(),
+            )]),
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&apu_plus_dgpu, "").score,
+            0,
+            "a supported dGPU beside the unsupported iGPU means the host is not \
+             without ROCm support: {:?}",
+            check_20_gpu_unsupported_by_rocm(&apu_plus_dgpu, "")
+        );
+
+        let report = diagnose(&apu_plus_dgpu, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "info-20-gpu-no-rocm-support"),
+            "and it must not reach the report at all, where its flat 60 would \
+             rank above fix-9-igpu-dgpu's 40: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_while_another_amd_gpu_is_still_unidentified() {
+        // An AMD GPU with an empty gfx target is undetected, not supported.
+        // Claiming the host has no ROCm support while a card we could not
+        // identify is in it would turn a detection gap into a false claim --
+        // the same trap `host_gpu::gfx_target_has_no_rocm_build`'s doc comment
+        // avoids.
+        let e = Examination {
+            has_amd_gpu: true,
+            gpus: vec![
+                Gpu {
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "AMD unknown device".to_owned(),
+                    gfx_target: String::new(),
+                    is_amd: true,
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&e, "").score,
+            0,
+            "an unidentified AMD GPU blocks the whole-machine claim: {:?}",
+            check_20_gpu_unsupported_by_rocm(&e, "")
+        );
+    }
+
+    #[test]
+    fn rendering_offers_a_command_for_a_diagnose_only_cause_that_ranks_first() {
+        // The reason this entry is a `DIAGNOSE-ONLY` catalog member rather than
+        // a `fix: None`: the report promises an `apply with:` line for every
+        // cause, README and `--help` repeat that promise, and `rocm fix` has to
+        // keep it for this id too. What marks it as unfixable is the flags
+        // line, not a missing command.
+        let report = DiagnoseReport {
+            matched: vec![
+                Diagnosis {
+                    id: "info-20-gpu-no-rocm-support".to_owned(),
+                    title: "GPU has no ROCm/HIP support".to_owned(),
+                    score: 60,
+                    evidence: vec!["gfx90c has no ROCm/HIP runtime build".to_owned()],
+                    fix: Some(Fix {
+                        fix_id: "info-20-gpu-no-rocm-support".to_owned(),
+                        summary: "No ROCm/HIP runtime build exists for this architecture."
+                            .to_owned(),
+                        class: crate::fix::FixClass::DiagnoseOnly,
+                        ..Fix::default()
+                    }),
+                },
+                Diagnosis {
+                    id: "fix-9-igpu-dgpu".to_owned(),
+                    title: "iGPU+dGPU collision".to_owned(),
+                    score: 55,
+                    evidence: vec!["both an AMD APU and an AMD discrete GPU".to_owned()],
+                    fix: Some(Fix {
+                        fix_id: "fix-9-igpu-dgpu".to_owned(),
+                        summary: "Pin HIP_VISIBLE_DEVICES.".to_owned(),
+                        ..Fix::default()
+                    }),
+                },
+            ],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: Route {
+                target: "github".to_owned(),
+                url: "https://example.invalid".to_owned(),
+            },
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 5);
+        assert!(
+            out.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+            "every cause carries the command that acts on it, this one included:\n{out}"
+        );
+        assert!(
+            out.contains("no reliable fix (`rocm fix` will NOT change anything)"),
+            "and the flags line is what says the command will not repair anything:\n{out}"
+        );
+        assert!(
+            out.contains("`apply with:` line"),
+            "the closing pointer to the runnable causes survives unchanged:\n{out}"
+        );
+    }
+
+    #[test]
+    fn check_20_names_the_detected_architecture_and_carries_no_commands() {
+        let e = Examination {
+            gpus: vec![Gpu {
+                gfx_target: "gfx90c".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        let finding = check_20_gpu_unsupported_by_rocm(&e, "");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "a confirmed-unsupported GPU is a real finding: {finding:?}"
+        );
+        let fix = finding
+            .fix
+            .as_ref()
+            .expect("the catalog entry is carried even though it has no remedy");
+        assert_eq!(
+            fix.fix_id, "info-20-gpu-no-rocm-support",
+            "the embedded fix-id has to be the catalog id `rocm fix` resolves: {finding:?}"
+        );
+        assert!(
+            fix.commands.is_empty() && fix.verify.is_empty(),
+            "there is nothing to run and nothing to verify: {finding:?}"
+        );
+        assert!(
+            finding.evidence.iter().any(|ev| ev.contains("gfx90c")),
+            "the evidence must name the architecture: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn rendering_keeps_the_apply_with_line_for_a_cause_with_nothing_to_run() {
+        let report = DiagnoseReport {
+            matched: vec![check_20_gpu_unsupported_by_rocm(
+                &Examination {
+                    gpus: vec![Gpu {
+                        gfx_target: "gfx90c".to_owned(),
+                        is_amd: true,
+                        ..Gpu::default()
+                    }],
+                    ..Examination::default()
+                },
+                "",
+            )],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: Route {
+                target: "github".to_owned(),
+                url: "https://example.invalid".to_owned(),
+            },
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 5);
+        assert!(
+            out.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+            "the id the report prints has to be one `rocm fix` accepts:\n{out}"
+        );
+        assert!(
+            out.contains("gfx90c"),
+            "the evidence must still render:\n{out}"
+        );
+        // Not rendered from the checker's own `class` -- `check_20` returns the
+        // `Fix::default()` PRINT-ONLY until `take_applicability_from_the_catalog`
+        // fills it from the catalog, which is what the full `diagnose()` path does and
+        // what `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`
+        // asserts. This one pins the lines that do not depend on it.
+        assert!(
+            !out.contains("   $ "),
+            "a cause with no commands must not print an empty command block:\n{out}"
+        );
+        assert!(
+            !out.contains("verify after fix:"),
+            "and nothing to verify means no verify line:\n{out}"
         );
     }
 
@@ -3385,6 +4543,28 @@ mod tests {
     }
 
     #[test]
+    fn the_oom_plan_matches_the_catalog_copy() {
+        // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
+        // already opened: the executable lines agreed, so the cross-check over
+        // the fixes shared with the catalog
+        // (`diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`)
+        // saw nothing -- it filters `#` lines by construction -- while the comments explaining
+        // *which of the two faults each step addresses* had drifted apart. That
+        // prose is the whole point of this entry: the two faults need opposite
+        // responses, so a user meeting the `diagnose` copy and a user meeting
+        // the `rocm fix` copy must be told the same thing.
+        let report = diagnose(&linux_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
     fn the_extension_name_alone_does_not_establish_the_variant_failure() {
         // The extension appearing in a traceback says it is involved, not that
         // it loaded the CUDA variant. Holding this under the threshold is what
@@ -3629,7 +4809,7 @@ mod tests {
         std::fs::create_dir_all(install.join("bin")).expect("plant a fake versioned install");
         std::fs::write(install.join("bin").join("rocminfo"), "").expect("plant the install marker");
 
-        let discovered = crate::discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+        let discovered = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
         let found = discovered
             .first()
             .expect("the resolver must find a versioned-only install");
@@ -3772,6 +4952,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ROCMAI-543: every string `rocm diagnose` can put on a redirectable
+    /// stream has to be plain ASCII, or a Windows console on the OEM code page
+    /// (437) renders UTF-8 punctuation as mojibake like `ΓÇö`.
+    ///
+    /// Driven off `CHECKERS` rather than off a list of individual messages.
+    /// The catalog *is* the registry of everything this command can say, so a
+    /// check added later is covered the day it lands and no single sentence
+    /// needs a pinned copy here -- a test that restates the constant it checks
+    /// protects very little. Both surfaces are asserted because both are
+    /// redirectable: the rendered text report, and the `--json` payload, which
+    /// `serde_json` emits as raw UTF-8 rather than `\u` escapes.
+    ///
+    /// Two of this fix's conversions sit on branches a default `Examination`
+    /// never reaches -- the dGPU/APU pairing in `check_9_igpu_dgpu_collision`
+    /// and `check_16_vllm_oom`'s "does not fit" wording -- so the corpus lights
+    /// them deliberately and the coverage guard at the end fails if it stops.
+    #[test]
+    fn every_message_the_diagnose_catalog_can_emit_is_ascii() {
+        let corpus: Vec<(&str, Examination, &str)> = vec![
+            ("linux, no symptom", linux_base(), ""),
+            ("wsl, no symptom", wsl_base(), ""),
+            (
+                "linux apu+dgpu, crash",
+                igpu_dgpu_host("linux"),
+                "torch crashes with a segfault",
+            ),
+            (
+                "windows apu+dgpu, crash",
+                igpu_dgpu_host("windows"),
+                "torch crashes with a segfault",
+            ),
+            ("linux vllm oom", linux_base(), VLLM_OOM_CANONICAL_SYMPTOM),
+            ("wsl vllm oom", wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM),
+        ];
+
+        let mut everything_seen = String::new();
+        for (label, examination, symptom) in &corpus {
+            // Every catalog entry, not only the ones that scored high enough to
+            // be reported on this host: a message is still shipped text when the
+            // host it describes is not the one under test.
+            for (check, _) in CHECKERS {
+                let diagnosis = check(examination, symptom);
+                let json = serde_json::to_string(&diagnosis).expect("a Diagnosis serializes");
+                assert!(
+                    json.is_ascii(),
+                    "{label}: diagnosis `{}` carries non-ASCII punctuation, which renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): {json}",
+                    diagnosis.id
+                );
+                everything_seen.push_str(&json);
+            }
+
+            let report = diagnose(examination, symptom);
+            let text = render_report_text(&report, report.matched.len());
+            assert!(
+                text.is_ascii(),
+                "{label}: `rocm diagnose` text output must be ASCII-only (ROCMAI-543):\n{text}"
+            );
+            let json = serde_json::to_string(&report).expect("a DiagnoseReport serializes");
+            assert!(
+                json.is_ascii(),
+                "{label}: `rocm diagnose --json` output must be ASCII-only (ROCMAI-543): {json}"
+            );
+            everything_seen.push_str(&text);
+        }
+
+        // An invariant test that quietly stops reaching the branches it was
+        // written for passes for the wrong reason. These markers sit beside the
+        // converted punctuation without containing it, so they stay true
+        // whichever way the dash goes and only fail if the corpus rots.
+        assert!(
+            everything_seen.contains("Discrete GPU(s):"),
+            "the corpus no longer reaches check_9's dGPU/APU branch, so its wording is unguarded"
+        );
+        assert!(
+            everything_seen.contains("reservation will not help"),
+            "the corpus no longer reaches check_16's does-not-fit wording, so it is unguarded"
+        );
     }
 
     #[test]
@@ -4465,6 +5725,42 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_scope_report_never_carries_matched_entries() {
+        // The serialized JSON contract on `out_of_scope`: when it is set the
+        // catalog did not run, so `matched` cannot hold anything -- not even a
+        // weak sub-threshold signal. One direction only: a covered platform with
+        // nothing wrong also has an empty `matched`, with `out_of_scope` unset.
+        // Nothing else in the tree pins the pair, which is how the field's own
+        // doc comment came to claim the opposite. Two independent mechanisms
+        // uphold it today -- `diagnose` clears `matched` when `out_of_scope` is
+        // set, and `run_all_checks` filters on the same platform family
+        // `catalog_covers` consults -- so this fails once both are gone, which
+        // is exactly the "a checker somehow ran on an uncovered host" shape the
+        // JSON contract must not develop.
+        let mut uncovered = linux_base();
+        uncovered.os_family = "other".to_owned();
+        let mut windows = linux_base();
+        windows.os_family = "windows".to_owned();
+        for e in [linux_base(), wsl_base(), windows, uncovered] {
+            // A symptom that scores for at least one entry where the catalog
+            // applies, so "matched is empty" is a real consequence of the
+            // platform being uncovered rather than of a silent symptom.
+            let report = diagnose(&e, VLLM_OOM_CANONICAL_SYMPTOM);
+            assert!(
+                report.out_of_scope.is_none() || report.matched.is_empty(),
+                "out_of_scope set with matched entries on {}: {:?}",
+                e.os_family,
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+            assert!(
+                report.out_of_scope.is_none() || !report.has_match(),
+                "out_of_scope set alongside has_match on {}",
+                e.os_family
+            );
+        }
+    }
+
+    #[test]
     fn non_wsl_still_diagnoses_normally() {
         let mut e = linux_base();
         e.in_render_group = Some(false);
@@ -4628,6 +5924,885 @@ mod tests {
         ];
         let report = diagnose(&e, "");
         assert!(report.matched.iter().any(|d| d.id == "fix-11-iommu"));
+    }
+
+    #[test]
+    fn vllm_oom_signature_is_a_high_confidence_match() {
+        // The distinctive vLLM startup OOM: torch/HIP allocation failure, with
+        // the vLLM anchor that tells this apart from an arbitrary PyTorch OOM.
+        let report = diagnose(
+            &linux_base(),
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-16-vllm-oom");
+        assert!(top.score >= HIGH_CONFIDENCE, "score was {}", top.score);
+        assert!(report.has_match());
+        // The remediation must stay conditional: the reservation knob is right
+        // for a tenancy collision and wrong for a model that does not fit.
+        let fix = top.fix.as_ref().unwrap();
+        assert!(!fix.auto_applicable, "OOM workaround must be print-only");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+        assert!(
+            fix.summary.contains("does not fit"),
+            "the 'genuinely does not fit' caveat must survive: {}",
+            fix.summary
+        );
+    }
+
+    #[test]
+    fn generic_pytorch_oom_without_a_vllm_signal_does_not_match() {
+        // The reviewed false positive: `torch.OutOfMemoryError: CUDA out of
+        // memory` scores 45+45=90 under the keyword table alone, but nothing
+        // about that string is vLLM-specific -- any ROCm PyTorch job emits the
+        // identical shape (ROCm's PyTorch build reports the CUDA-compat name).
+        // Without an explicit vLLM anchor, this failure mode must not fire.
+        let report = diagnose(&linux_base(), "torch.OutOfMemoryError: CUDA out of memory");
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "a bare framework OOM with no vLLM signal must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn torch_oom_class_alone_is_not_a_vllm_match() {
+        // `outofmemory` is nested inside the exception class name. It must not
+        // count as a second, independent signal and turn one token into a
+        // high-confidence vLLM diagnosis for an arbitrary PyTorch workload.
+        let report = diagnose(&linux_base(), "vllm: torch.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak keyword signal remains visible");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn a_bare_out_of_memory_stays_below_the_match_threshold() {
+        // Without the vLLM/HIP shape, "out of memory" alone must not claim this
+        // failure mode -- it scores (the `vllm` anchor is present and "out of
+        // memory" is a keyword), but stays below MIN_SCORE_FOR_MATCH.
+        let report = diagnose(&linux_base(), "vllm: the process was killed: out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak `out of memory` keyword signal must remain visible in `matched`");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare OOM must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn vllm_oom_is_not_available_on_native_windows() {
+        // vLLM is Linux/WSL-only (native Windows is unsupported), so the checker
+        // must not fire on a Windows examination even with the error text.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(&e, "vllm: torch.OutOfMemoryError: HIP out of memory.");
+        assert!(report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn vllm_oom_keyword_diagnosis_is_available_on_wsl() {
+        let mut e = linux_base();
+        e.is_wsl = true;
+        let report = diagnose(
+            &e,
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(report.out_of_scope.is_none());
+        assert!(report.has_match());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn wsl_sub_threshold_vllm_signal_is_preserved_in_matched() {
+        // A weak (sub-threshold) vLLM OOM signal on WSL must still surface in
+        // `matched` per the `DiagnoseReport::matched` contract: `run_all_checks`
+        // drops only zero-score results, so a score-25 mention is reported as a
+        // WEAK row rather than silently discarded.
+        //
+        // This used to also assert that the weak hit did not bury a WSL
+        // out-of-scope routing note. There is no such note any more -- WSL2 is a
+        // covered platform with its own catalog entries -- so what is left to pin
+        // is the half that still has teeth: the entry survives in `matched`, and
+        // it does not promote itself into a match.
+        //
+        // `wsl_base()` (a healthy WSL GPU stack) rather than a default
+        // examination: a default one has no /dev/dxg, so fix-wsl-1 would fire at
+        // 55 and the report would match for reasons that have nothing to do with
+        // the signal under test.
+        let report = diagnose(&wsl_base(), "vllm: out of memory");
+        assert!(!report.has_match());
+        assert!(
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform, not an out-of-scope one"
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("a nonzero sub-threshold hit must stay in `matched`, not be dropped");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope() {
+        // The other side of the has_match gate: a real, at-or-above-threshold
+        // vLLM OOM on WSL is surfaced, and ranks top on a host whose own WSL GPU
+        // stack is healthy -- so the verdict is the OOM, not an incidental WSL
+        // finding.
+        let report = diagnose(&wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        assert!(report.has_match());
+        assert!(report.out_of_scope.is_none());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn hip_error_out_of_memory_status_is_a_match() {
+        // Regression: `RuntimeError: hipErrorOutOfMemory` previously scored 0
+        // (`\boutofmemory\b` has no word boundary after `hipError`), so the
+        // engine printed a diagnose command that reported nothing.
+        let report = diagnose(&linux_base(), "vllm: RuntimeError: hipErrorOutOfMemory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("hipErrorOutOfMemory must now be recognized");
+        assert!(
+            oom.score >= MIN_SCORE_FOR_MATCH,
+            "hipErrorOutOfMemory should clear the threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn torch_cuda_module_path_oom_class_is_recognized() {
+        // Regression: ROCm's PyTorch reports the class under the `.cuda.` module
+        // path (`torch.cuda.OutOfMemoryError`); the class pattern must match it.
+        // It is still the (sub-threshold) class name, not a stronger message.
+        let report = diagnose(&linux_base(), "vllm: torch.cuda.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the torch.cuda.* class name must be recognized as evidence");
+        assert!(oom.score > 0, "score was {}", oom.score);
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "the bare class name must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn hip_out_of_memory_yields_a_single_evidence_line() {
+        // Overlap guard: "HIP out of memory" must not be counted both as the
+        // 50-point HIP message and the 25-point `out of memory` nested inside
+        // it. One phrase, one evidence bullet.
+        let report = diagnose(&linux_base(), "vllm: HIP out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("HIP out of memory must match");
+        let fix = oom.fix.as_ref().unwrap();
+        let evidence_lines = oom
+            .evidence
+            .iter()
+            .filter(|e| e.to_lowercase().contains("out of memory"))
+            .count();
+        assert_eq!(
+            evidence_lines, 1,
+            "one phrase must yield one evidence line, got {:?}",
+            oom.evidence
+        );
+        assert_eq!(oom.score, 50, "the HIP message carries the match alone");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {
+        // The vLLM-OOM table needs overlapping spans collapsed ("out of memory"
+        // nested inside "HIP out of memory"). Other tables must NOT get that
+        // treatment: several of them pair a greedy `.*` pattern with a second,
+        // genuinely independent keyword, and the greedy span swallows the
+        // independent one. Collapsing there silently loses real diagnoses,
+        // because a keyword score can only fall.
+        //
+        // Each case below pins the score these tables produced before the
+        // de-duplication was introduced.
+
+        // `api-ms-win-crt-.*\.dll` (35) runs to the *last* `.dll` on the line,
+        // covering the independent `msvcp140.dll` (30). Two distinct missing
+        // DLLs, two signals -- 65 clears MIN_SCORE_FOR_MATCH, 35 does not.
+        let (score, ev) = keyword_score(
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+            KEYWORDS_MSVC_REDIST,
+        );
+        assert_eq!(
+            score, 65,
+            "two distinct missing DLLs are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `dkms .*failed` (45) spans the whole line, covering `dpkg: error` (25).
+        let (score, ev) = keyword_score(
+            "dkms status: dpkg: error processing amdgpu-dkms, build failed",
+            KEYWORDS_DPKG_BROKEN,
+        );
+        assert_eq!(
+            score, 70,
+            "a DKMS failure and a dpkg error are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `amdhip64.*not found` (50) spans past `could not find hip` (40):
+        // 90 is HIGH confidence, 50 is only a bare match.
+        let (score, ev) = keyword_score(
+            "amdhip64.dll: could not find hip runtime, not found",
+            KEYWORDS_HIP_SDK_MISSING,
+        );
+        assert_eq!(score, 90, "both HIP-SDK signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+
+        // `404.*repo\.radeon\.com` (50) runs to the *last* repo.radeon.com on
+        // the line, covering `unable to locate package rocm` (35).
+        let (score, ev) = keyword_score(
+            "e: failed to fetch https://repo.radeon.com/rocm/apt/jammy/release 404 not found, \
+             unable to locate package rocm, retrying https://repo.radeon.com/rocm/apt",
+            KEYWORDS_REPO_BROKEN,
+        );
+        assert_eq!(score, 85, "both apt-repo signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn windows_missing_dll_pair_still_reaches_the_msvc_redist_fix() {
+        // The user-visible half of the guard above: with no PATH probe result
+        // (`msvc_redist_present == None`) the keyword score alone decides, so a
+        // demoted table makes fix-15 vanish from the report entirely.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(
+            &e,
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+        );
+        let msvc = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("the MSVC redistributable fix must still be reported");
+        assert!(
+            msvc.score >= MIN_SCORE_FOR_MATCH,
+            "score was {}",
+            msvc.score
+        );
+        assert!(report.has_match());
+    }
+
+    #[test]
+    fn vllm_anchor_must_be_on_the_same_line_as_the_oom_token() {
+        // Co-occurrence anywhere is too loose: a paste that mentions vLLM on one
+        // line and an unrelated framework's OOM on another must not attribute
+        // the OOM to vLLM.
+        let report = diagnose(
+            &linux_base(),
+            "I installed vllm last week.\nToday my llama.cpp run died: CUDA out of memory",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on a different line from the vLLM mention must not match: {:?}",
+            report.matched
+        );
+        // The engine's emitted `vllm: <failing line>` keeps them on one line and
+        // still matches.
+        let anchored = diagnose(&linux_base(), "vllm: CUDA out of memory");
+        assert!(anchored.matched.iter().any(|d| d.id == "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn only_the_anchored_lines_are_scored_not_the_whole_paste() {
+        // Regression: the anchor was a boolean *gate*, after which the entire
+        // symptom was scored. Regex matching ignores line boundaries, so a
+        // benign vLLM config echo on one line unlocked full-weight scoring of
+        // another framework's OOM on a different line: `cuda out of memory`
+        // (50) + `torch.outofmemoryerror` (45) do not overlap, so both survived
+        // collapsing for 95 -- above HIGH_CONFIDENCE -- and the user got a
+        // confident "vLLM ran the GPU out of memory" verdict for a llama.cpp
+        // failure. Only the anchored lines may be scored.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the anchored config line is still a (weak) vLLM signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "an unanchored framework's OOM must not score for vLLM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+        assert!(
+            oom.evidence
+                .iter()
+                .all(|e| !e.to_lowercase().contains("out of memory")),
+            "evidence must come from the anchored line only: {:?}",
+            oom.evidence
+        );
+
+        // Same shape with the anchored line carrying no OOM token at all: the
+        // unanchored OOM must not be borrowed to reach a verdict either.
+        let report = diagnose(
+            &linux_base(),
+            "starting vllm serve on gpu 0\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on an unanchored line must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The control: once the OOM is on the anchored line, it still matches at
+        // full strength, so the scoping did not simply disable the checker.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             vllm: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM line must still match");
+        assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    /// The `fix-16-vllm-oom` score for `symptom`, or 0 when it did not match.
+    fn vllm_oom_score(symptom: &str) -> i32 {
+        diagnose(&linux_base(), symptom)
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .map_or(0, |d| d.score)
+    }
+
+    #[test]
+    fn any_line_advance_is_a_boundary_not_scoreable_text() {
+        // Regression, in two rounds.
+        //
+        // The filter first used `str::lines()`, which splits on `\n` and `\r\n`
+        // only -- a lone `\r` is ordinary text to it. Every progress bar in this
+        // ecosystem (tqdm, pip, huggingface) repaints with a bare CR, and a
+        // pasted terminal capture is the expected way to use `--symptom`, so the
+        // whole capture collapsed into one "line": the vLLM anchor matched
+        // somewhere in it and another framework's OOM elsewhere in it scored at
+        // full weight. That is
+        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
+        // one byte, and neither existing guard saw it because both use `\n`-only
+        // fixtures.
+        //
+        // Adding `\r` to the split fixed that byte and left the hole open for
+        // every other one. Measured on the round that did so: each separator
+        // below put the anchor and a llama.cpp OOM on genuinely separate
+        // rendered lines, and each scored 95 -- past a HIGH_CONFIDENCE of 75,
+        // citing the llama.cpp line's tokens as the evidence for a vLLM verdict.
+        // Hence a table rather than one test per byte: the property is "a line
+        // advance is a line advance", and enumerating it is what stops the next
+        // separator from reopening this.
+        for (label, sep) in [
+            ("LF", "\n"),
+            ("CR", "\r"),
+            ("CRLF", "\r\n"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("ESC D (IND)", "\u{1b}D"),
+            ("CSI 1 B (CUD)", "\u{1b}[1B"),
+            ("CSI H (CUP)", "\u{1b}[2;1H"),
+            ("VT", "\u{b}"),
+            ("FF", "\u{c}"),
+            ("C1 NEL", "\u{85}"),
+            ("U+2028 LINE SEPARATOR", "\u{2028}"),
+            ("U+2029 PARAGRAPH SEPARATOR", "\u{2029}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  10%{sep}vllm serve starting up{sep}\
+                 Downloading shards:  90%{sep}\
+                 llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+                 Tried to allocate 7.21 GiB.{sep}"
+            );
+            assert_eq!(
+                vllm_oom_score(&capture),
+                0,
+                "a {label}-separated llama.cpp OOM must not be attributed to vLLM"
+            );
+        }
+
+        // The control, per separator: a capture whose *anchored* segment carries
+        // the OOM must still match, so the boundary set did not simply blind the
+        // checker to every capture that contains one.
+        for (label, sep) in [
+            ("CR", "\r"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("VT", "\u{b}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  90%{sep}\
+                 vllm: torch.OutOfMemoryError: HIP out of memory{sep}"
+            );
+            let score = vllm_oom_score(&capture);
+            assert!(
+                score >= MIN_SCORE_FOR_MATCH,
+                "an anchored OOM segment must still match across {label}: score was {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_codes_inside_a_line_do_not_split_a_genuine_vllm_oom() {
+        // The other half of the boundary question, and the reason this is a
+        // grammar walk and not `char::is_control()`. A colourised logger emits
+        // SGR *inside* a line -- level name in colour, message plain -- so a
+        // splitter that treats every escape, or every control character, as a
+        // boundary cuts a real `vllm: ... torch.OutOfMemoryError` between its
+        // anchor and its error token. Measured on the one-line
+        // `is_control()`-split candidate: this case went from 95 to 0, trading
+        // the false positive above for a silent miss on the most ordinary real
+        // input there is.
+        let plain = "vllm: torch.OutOfMemoryError: HIP out of memory";
+        let coloured =
+            "\u{1b}[31mvllm: \u{1b}[1mtorch.OutOfMemoryError: HIP out of memory\u{1b}[0m";
+        assert_eq!(
+            vllm_oom_score(coloured),
+            vllm_oom_score(plain),
+            "SGR inside a line must not change the verdict"
+        );
+        let score = vllm_oom_score(coloured);
+        assert!(score >= HIGH_CONFIDENCE, "score was {score}");
+
+        // And the same line after a progress-bar repaint, which is how it
+        // actually arrives: the CR is a boundary, the SGR around it is not.
+        assert!(
+            vllm_oom_score(&format!("Loading:  90%\r{coloured}\n")) >= HIGH_CONFIDENCE,
+            "a colourised OOM after a CR repaint must still match"
+        );
+    }
+
+    #[test]
+    fn rocm_cli_s_own_low_vram_hint_is_never_a_verdict_on_its_own() {
+        // `gpu[-_]memory[-_]utilization` is both an anchor and a scoring entry,
+        // so a line that merely echoes the flag anchors itself. rocm-cli's own
+        // low-VRAM hint prints `--gpu-memory-utilization`, and users paste it
+        // back in. That must stay a weak signal, never a diagnosis: worth 20,
+        // far below MIN_SCORE_FOR_MATCH, with nothing else on the line to
+        // corroborate it.
+        let report = diagnose(&linux_base(), crate::VLLM_GPU_MEMORY_UTILIZATION_HINT);
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the flag mention stays visible as a weak signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare flag echo must not diagnose an OOM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+    }
+
+    #[test]
+    fn canonical_vllm_oom_symptom_is_diagnosable() {
+        // The engine's fallback symptom must always clear the threshold, so the
+        // `rocm diagnose` command it prints never reports nothing.
+        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
+        // And a bare framework mention the engine would reject is not diagnosable.
+        assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
+    }
+
+    #[test]
+    fn every_checker_platform_is_covered_by_its_recipe() {
+        // `render_report_text` ends a matched diagnosis with `apply with: rocm
+        // fix {id}`, and `fix::apply` then gates that id on the recipe's
+        // `applies_on` against the *running* OS. So any platform family a
+        // checker is registered for but its recipe omits is a platform where the
+        // tool names a command and then refuses to run it -- which is exactly
+        // what `fix-16-vllm-oom` did on WSL2, where the checker opts into `wsl`
+        // and the recipe was LINUX_ONLY.
+        //
+        // Only one direction is an error. A recipe may legitimately apply more
+        // widely than its checker answers (a user can reach `rocm fix <id>`
+        // directly, without a diagnosis), so this asserts containment rather
+        // than equality.
+        //
+        // No exemptions, including for the informational `info-20` entry: it is
+        // a `DIAGNOSE-ONLY` member of the same catalog, so `rocm fix` answers
+        // for it on both platforms its checker is registered for, and the
+        // `apply with:` line diagnose prints for it is live like every other.
+        for (check, families) in CHECKERS {
+            let id = check(&Examination::default(), "").id;
+            let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
+                panic!(
+                    "checker id `{id}` has no recipe in the fix catalog, so the \
+                     `apply with: rocm fix {id}` line diagnose prints is dead"
+                )
+            });
+            for family in *families {
+                assert!(
+                    applies_on.contains(family),
+                    "`{id}` is diagnosed on `{family}` but its recipe only applies on \
+                     {applies_on:?}; `rocm fix {id}` would print the plan and then exit 3 there"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
+        // fix-15, fix-16, fix-21 and info-20 live in two places: the `rocm fix`
+        // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
+        // Diagnosis. The prose *framing* legitimately differs by surface (a
+        // catalog rationale vs a diagnosis summary), but the actionable
+        // remediation must not silently diverge -- the verify command, the
+        // notes, and the executable command lines have to agree. This is the
+        // guard that they do; it caught a two-vs-three-space `verify` and a
+        // reworded note.
+        //
+        // info-20 is the same dual-representation shape even though it has
+        // nothing to run: its notes are the whole of its remedy (that
+        // HSA_OVERRIDE_GFX_VERSION is not a workaround, and that `rocm serve`
+        // already picks Vulkan), so the two copies drifting would leave one
+        // surface giving advice the other contradicts. Its empty `commands` and
+        // `verify` have to stay agreed on too, since a command appearing on one
+        // side only is how a DIAGNOSE-ONLY entry silently stops being one.
+        let vllm_oom = check_16_vllm_oom(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            VLLM_OOM_CANONICAL_SYMPTOM,
+        );
+        let msvc = check_15_msvc_redist(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_present: Some(false),
+                ..Examination::default()
+            },
+            "ImportError: DLL load failed: vcruntime140_1.dll not found",
+        );
+        let msvc_outdated = check_21_msvc_redist_outdated(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_version: "14.29.30133.0".to_owned(),
+                ..Examination::default()
+            },
+            "",
+        );
+        let unsupported_gpu = check_20_gpu_unsupported_by_rocm(
+            &Examination {
+                gpus: vec![Gpu {
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    ..Gpu::default()
+                }],
+                ..Examination::default()
+            },
+            "",
+        );
+        for diag in [vllm_oom, msvc, msvc_outdated, unsupported_gpu] {
+            assert!(
+                diag.score >= MIN_SCORE_FOR_MATCH,
+                "test setup must yield a real match for {}",
+                diag.id
+            );
+            let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
+            let (verify, notes, run_commands) =
+                crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
+                    .expect("a shared fix_id must exist in the recipe catalog");
+            assert_eq!(fix.verify, verify, "verify diverged for {}", fix.fix_id);
+            assert_eq!(
+                fix.notes,
+                notes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "notes diverged for {}",
+                fix.fix_id
+            );
+            let emitted_run = fix
+                .commands
+                .iter()
+                .map(String::as_str)
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                emitted_run, run_commands,
+                "executable command lines diverged for {}",
+                fix.fix_id
+            );
+        }
+    }
+
+    /// What the Windows event log and Lemonade print when the llama.cpp server
+    /// dies on a Visual C++ runtime that is too old.
+    const MSVC_OUTDATED_CRASH_TEXT: &str = "llama-server.exe exited with code 3221225477. \
+        Faulting application name: llama-server.exe, version: 0.0.0.0, \
+        Faulting module name: MSVCP140.dll, version: 14.29.30133.0, \
+        Exception code: 0xc0000005 (access violation)";
+
+    /// The same crash as the server's own log shows it, with no event-log line.
+    const MSVC_OUTDATED_CRASH_TEXT_SHORT: &str =
+        "llama-server failed: process exited with 0xC0000005 in MSVCP140.dll";
+
+    fn windows_with_runtime(version: &str) -> Examination {
+        Examination {
+            os_family: "windows".to_owned(),
+            msvc_redist_version: version.to_owned(),
+            ..Examination::default()
+        }
+    }
+
+    fn outdated_runtime_entry(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-21-msvc-redist-outdated")
+    }
+
+    #[test]
+    fn an_outdated_runtime_is_a_high_confidence_match_with_no_symptom() {
+        let report = diagnose(&windows_with_runtime("14.29.30133.0"), "");
+        let hit = outdated_runtime_entry(&report).expect("14.29 is below the minimum");
+        assert!(
+            hit.score >= HIGH_CONFIDENCE,
+            "no symptom needed: score {}",
+            hit.score
+        );
+        assert!(report.has_match);
+        assert!(hit.evidence.iter().any(|ev| ev.contains("14.29.30133.0")));
+    }
+
+    #[test]
+    fn the_minimum_runtime_version_is_14_40() {
+        // Pins the chosen floor. The evidence for it is on the constant.
+        assert_eq!(MSVC_REDIST_MIN_VERSION, [14, 40]);
+    }
+
+    #[test]
+    fn runtime_version_comparison_edge_cases() {
+        let min = &MSVC_REDIST_MIN_VERSION;
+        // Older.
+        assert!(msvc_redist_older_than("14.29.30133.0", min));
+        assert!(msvc_redist_older_than("14.39.99999.0", min));
+        assert!(msvc_redist_older_than("13.99", min));
+        assert!(msvc_redist_older_than("14.32.31326.0", min));
+        // Equal to the minimum is not older, in any spelling.
+        assert!(!msvc_redist_older_than("14.40", min));
+        assert!(!msvc_redist_older_than("14.40.0.0", min));
+        assert!(!msvc_redist_older_than("14.40.33810.0", min));
+        // Newer, including a major version above 14 and a four-part version.
+        assert!(!msvc_redist_older_than("14.51.36231.0", min));
+        assert!(!msvc_redist_older_than("15.0", min));
+        // Compared as numbers, not as text: 14.9 is older than 14.40.
+        assert!(msvc_redist_older_than("14.9.1.0", min));
+        assert!(!msvc_redist_older_than("14.100.0.0", min));
+        // Unknown is never old.
+        for unknown in [
+            "",
+            "   ",
+            "14",
+            "unknown",
+            "14.x.1",
+            "v14.29",
+            "14.29.beta",
+            "-1.2",
+        ] {
+            assert!(
+                !msvc_redist_older_than(unknown, min),
+                "{unknown:?} must not count as old"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unparsable_runtime_version_alone_does_not_match() {
+        for version in ["", "garbage", "14"] {
+            let report = diagnose(&windows_with_runtime(version), "");
+            assert!(
+                outdated_runtime_entry(&report).is_none(),
+                "{version:?} produced a match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_current_runtime_does_not_match_without_a_symptom() {
+        for version in ["14.40.33810.0", "14.51.36231.0"] {
+            let report = diagnose(&windows_with_runtime(version), "");
+            assert!(outdated_runtime_entry(&report).is_none(), "{version}");
+        }
+    }
+
+    #[test]
+    fn an_outdated_runtime_never_matches_off_windows() {
+        for family in ["linux", "unknown", ""] {
+            let exam = Examination {
+                os_family: family.to_owned(),
+                msvc_redist_version: "14.29.30133.0".to_owned(),
+                ..Examination::default()
+            };
+            let direct = check_21_msvc_redist_outdated(&exam, MSVC_OUTDATED_CRASH_TEXT);
+            assert_eq!(direct.score, 0, "{family:?}");
+            let report = diagnose(&exam, MSVC_OUTDATED_CRASH_TEXT);
+            assert!(outdated_runtime_entry(&report).is_none(), "{family:?}");
+        }
+        let mut wsl = linux_base();
+        wsl.is_wsl = true;
+        wsl.msvc_redist_version = "14.29.30133.0".to_owned();
+        let report = diagnose(&wsl, MSVC_OUTDATED_CRASH_TEXT);
+        assert!(outdated_runtime_entry(&report).is_none());
+    }
+
+    #[test]
+    fn the_crash_text_from_an_outdated_runtime_ranks_first() {
+        // With the runtime version known, and with nothing known about it.
+        for exam in [
+            windows_with_runtime("14.29.30133.0"),
+            windows_with_runtime(""),
+        ] {
+            for text in [MSVC_OUTDATED_CRASH_TEXT, MSVC_OUTDATED_CRASH_TEXT_SHORT] {
+                let report = diagnose(&exam, text);
+                let top = &report.matched[0];
+                assert_eq!(
+                    top.id,
+                    "fix-21-msvc-redist-outdated",
+                    "runtime {:?}, text {text:?}: {:?}",
+                    exam.msvc_redist_version,
+                    report
+                        .matched
+                        .iter()
+                        .map(|d| (&d.id, d.score))
+                        .collect::<Vec<_>>()
+                );
+                assert!(top.score >= MIN_SCORE_FOR_MATCH);
+            }
+        }
+        // The full event-log text reaches high confidence from the symptom alone.
+        let report = diagnose(&windows_with_runtime(""), MSVC_OUTDATED_CRASH_TEXT);
+        assert!(report.matched[0].score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn outdated_runtime_symptom_keywords_score_honestly() {
+        let score =
+            |text: &str| keyword_score_collapsing_overlaps(text, KEYWORDS_MSVC_REDIST_OUTDATED).0;
+        // A bare access violation code is generic and stays below the threshold,
+        // whichever way it is spelled.
+        for bare in [
+            "0xC0000005",
+            "exit code -1073741819",
+            "exit code 3221225477",
+        ] {
+            assert!(score(bare) > 0, "{bare} must be recognised");
+            assert!(score(bare) < MIN_SCORE_FOR_MATCH, "{bare} alone is generic");
+        }
+        // So does the DLL name alone.
+        assert!(score("msvcp140.dll") < MIN_SCORE_FOR_MATCH);
+        // The two together are a likely match.
+        let pair = score("crashed with 0xC0000005 in msvcp140.dll");
+        assert!(
+            (MIN_SCORE_FOR_MATCH..HIGH_CONFIDENCE).contains(&pair),
+            "{pair}"
+        );
+        // A faulting-module line is specific on its own, whatever the case, and
+        // with the exception code it is high confidence.
+        for line in [
+            "Faulting module name: MSVCP140.dll",
+            "FAULTING MODULE NAME: msvcp140.dll, version: 14.29.30133.0",
+            r"Faulting module path: C:\Windows\System32\MSVCP140.dll",
+        ] {
+            let s = score(line);
+            assert!(s >= MIN_SCORE_FOR_MATCH, "{line}: {s}");
+            assert!(s < HIGH_CONFIDENCE, "{line}: {s}");
+            assert!(score(&format!("{line} Exception code: 0xc0000005")) >= HIGH_CONFIDENCE);
+        }
+        // Another module faulting is not this failure.
+        assert!(
+            score("Faulting module name: ucrtbase.dll, Exception code: 0xc0000005")
+                < MIN_SCORE_FOR_MATCH
+        );
+    }
+
+    #[test]
+    fn an_access_violation_without_the_runtime_is_not_blamed_on_it() {
+        // A bare crash code on a machine with a current runtime stays unmatched.
+        let report = diagnose(
+            &windows_with_runtime("14.51.36231.0"),
+            "exit code 0xC0000005",
+        );
+        assert!(outdated_runtime_entry(&report).is_none_or(|d| d.score < MIN_SCORE_FOR_MATCH));
+    }
+
+    #[test]
+    fn the_outdated_runtime_remediation_covers_the_llama_server_and_stays_print_only() {
+        let report = diagnose(&windows_with_runtime("14.29.30133.0"), "");
+        let fix = outdated_runtime_entry(&report)
+            .and_then(|d| d.fix.as_ref())
+            .expect("a matched diagnosis carries a fix");
+        assert!(fix.summary.contains("llama.cpp"));
+        assert!(fix.summary.contains("Lemonade"));
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c == "winget install --id Microsoft.VCRedist.2015+.x64 --exact")
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("aka.ms/vs/17/release/vc_redist.x64.exe"))
+        );
+        assert!(fix.verify.contains("msvcp140.dll") && fix.verify.contains("FileVersion"));
+        // The plan promises it only prints. The class is checked against the
+        // catalog by `the_outdated_runtime_recipe_is_print_only_on_windows` in
+        // fix.rs, which is what makes this sentence true.
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("only prints this plan"))
+        );
+    }
+
+    #[test]
+    fn the_missing_runtime_fix_no_longer_says_only_the_hip_sdk_needs_it() {
+        let report = diagnose(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_present: Some(false),
+                ..Examination::default()
+            },
+            "",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("a missing runtime still matches");
+        let fix = hit.fix.as_ref().expect("fix");
+        assert!(fix.summary.contains("llama.cpp"), "{}", fix.summary);
+        assert!(!hit.title.contains("HIP DLLs cannot load"), "{}", hit.title);
     }
 
     #[test]

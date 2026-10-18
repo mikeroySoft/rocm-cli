@@ -4,8 +4,9 @@
 
 //! Shared type and enum definitions for the dashboard reducer: `Focus`,
 //! `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`,
-//! and the slash/plan/approval payload types. No `AppState` access — split
-//! out of `app/mod.rs` to keep the core reducer focused.
+//! `PaneFocus`, `ScrollTarget`, and the slash/plan/approval payload types. No
+//! `AppState` access — split out of `app/mod.rs` to keep the core reducer
+//! focused.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -36,6 +37,24 @@ pub struct ResolvedArgs {
     /// exit back to the launcher when the overlay is closed at its root. `None`
     /// (the default) is the normal full dashboard — every path stays unchanged.
     pub focus: Option<Focus>,
+    /// `true` when this session was opened FROM the pre-dashboard launcher
+    /// (`apps/rocm::dash::run_launcher`'s own loop — `LauncherRoute::Dashboard`
+    /// / `LauncherRoute::Chat`), which outlives this session and redraws its
+    /// own menu once it returns. The launcher's own `q`/Esc already shares
+    /// this session's quit-confirm gate (`request_quit`), backed by a fresh
+    /// registry read taken at the top of that menu pass (not a frozen,
+    /// launch-time snapshot — issue #145; see `ui::launcher::launcher_state`'s
+    /// doc comment for why that one read is a `StaticManagedRegistrySnapshot`
+    /// rather than the dashboard's own continuously-live probe), so it is the
+    /// one that actually governs process exit when `true`. This
+    /// session's own `q`/Esc/`/quit`/`/exit`/Esc-menu Quit row must then skip
+    /// its own confirm and exit immediately — otherwise it asks "May still be
+    /// serving — quit anyway?", the user says yes, control returns to the
+    /// launcher loop, and the launcher immediately asks the exact same
+    /// question again on its OWN next `q` — a prompt whose "yes" didn't
+    /// actually exit anything. `false` for a directly-launched `rocm dash` /
+    /// `rocm chat`, which owns its own quit decision outright.
+    pub launcher_hosted: bool,
     /// Chat endpoint base URL, CLI-flag value already merged over config.
     pub chat_url: Option<String>,
     /// Chat model, CLI-flag value already merged over config.
@@ -98,6 +117,32 @@ pub struct ResolvedArgs {
     /// a host whose servers had all failed showed an empty overlay and no sign
     /// that any record existed. 0 when there are none.
     pub services_past_attempts: usize,
+    /// Bin-injected live registry-read seam (issue #145): whether anything is
+    /// currently serving, and which ids a `rocm services stop <id> --yes` can
+    /// actually reach. Read live, at the moment `AppState::has_live_instance`
+    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm_body_with`
+    /// actually need an answer — never a one-shot snapshot frozen at launch
+    /// the way `services_past_attempts` is. A host whose dashboard-embedded
+    /// daemon client never connects at all (Windows) gets a correct "is
+    /// anything live" answer from this for the entire session rather than
+    /// only a launch-time guess (`has_live_instance`'s own doc comment). On a
+    /// host where the daemon does connect, a model started mid-session (e.g.
+    /// via the Serve wizard) is reflected the next time the *stop-command* or
+    /// `s`-gating questions are consulted — `has_stoppable_managed_instance_with`
+    /// and `quit_confirm_open_services_key` always read this live — but NOT
+    /// the next time "is anything serving" itself is asked: once a real
+    /// daemon snapshot has landed, `has_live_instance_with` stops consulting
+    /// this field for that question and trusts `instances` alone (its own doc
+    /// comment explains why). Injected `Some` on
+    /// every bin path, including `--demo`/`--replay`/`--chat-mock` — this is
+    /// never `None`. `--demo`/`--replay` are made safe by
+    /// `AppState::simulated` short-circuiting `has_live_instance` before
+    /// this is ever consulted; `--chat-mock` is NOT `simulated` (it mocks
+    /// only the chat completion backend, not instance state) and
+    /// deliberately IS live-read, so quitting while a real managed model
+    /// serves still warns (see dash-29). See
+    /// `registry_probe::ManagedRegistryProbe`.
+    pub managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
 }
 
 impl ResolvedArgs {
@@ -432,6 +477,82 @@ pub enum UpdateStatus {
         latest_version: String,
     },
     Error,
+}
+
+/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
+/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
+///
+/// Lives here, not in `scrollbar.rs`: `scrollbar.rs` defined this type but
+/// never used it. Moving it out, together with [`ScrollTarget`], removes
+/// `actions.rs`'s only import from `scrollbar.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    /// Browsing the Actions list (left column).
+    #[default]
+    Actions,
+    /// Inside the Details pane (right column), ready to start the operation.
+    Detail,
+}
+
+/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
+/// scrollbar track write the right offset field.
+///
+/// Lives here, not in `scrollbar.rs`: `actions.rs`'s `KeyAction::ScrollGrab`
+/// variant carries one, so the type has to be visible to `actions.rs` without
+/// `actions.rs` importing it from `scrollbar.rs`. The reverse `use` edge
+/// stays — `scrollbar.rs` still imports `KeyAction`/`handle_mouse`/
+/// `tab_bar_hit` from `actions.rs` (plus `apply_action`, under `cfg(test)`)
+/// — that's the one direct `use`-level edge this module boundary keeps.
+/// `actions.rs` still reaches `ScrollDrag` indirectly, through the
+/// `scroll_drag` field it types on `AppState` (defined in `mod.rs`, e.g.
+/// `state.scroll_drag = None`; `actions.rs` never touches the
+/// `ScrollbarHandle`/`FooterChip`-typed fields) — reading or writing a
+/// field never requires importing its type, so this
+/// move doesn't touch that coupling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// Job console vertical (`console_scroll`).
+    Console,
+    /// Job console horizontal (`console_hscroll`).
+    ConsoleH,
+    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
+    DockLogs,
+    /// Chat transcript (`chat_scroll`).
+    Chat,
+    /// Instance detail modal's launch_args/env_vars panes (`instance_detail_scroll`).
+    InstanceDetail,
+}
+
+impl ScrollTarget {
+    /// Whether this target's displayed position is tail-anchored (its track
+    /// position is the inverse of its stored offset — see `DockLogs`'s doc
+    /// comment). An exhaustive `match`, not an equality check against a
+    /// single variant: the latter would let a future tail-anchored variant
+    /// fall through to the non-inverted branch with no compiler signal.
+    pub(crate) const fn is_tail_anchored(self) -> bool {
+        match self {
+            Self::DockLogs => true,
+            Self::Console | Self::ConsoleH | Self::Chat | Self::InstanceDetail => false,
+        }
+    }
+
+    /// Every variant, in declaration order — the one list a test iterates to
+    /// mean "every `ScrollTarget`" (e.g. `scrollbar.rs`'s
+    /// `scroll_target_variants_round_trip_through_dispatch`), instead of each
+    /// call site re-typing its own copy that can silently drift from this
+    /// enum. Not itself exhaustiveness-checked against the variant list —
+    /// stable Rust has no mechanism for that without a derive macro this
+    /// crate doesn't depend on — so a new variant still needs a manual
+    /// addition here, same as any other list of all variants would.
+    /// `cfg(test)`: no non-test code needs "every target" today.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Console,
+        Self::ConsoleH,
+        Self::DockLogs,
+        Self::Chat,
+        Self::InstanceDetail,
+    ];
 }
 
 #[cfg(test)]

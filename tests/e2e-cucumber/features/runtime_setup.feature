@@ -310,10 +310,10 @@ Feature: Runtime configuration
     And the executed command carries the replacement consent
     And the execution section says the consent came from the user's --yes
 
-  # Lemonade's llama.cpp backend is pinned to the active managed ROCm SDK:
-  # first try the packaged build, then the latest build. If neither provides
-  # a verified match, installation fails rather than downloading a separate
-  # TheRock runtime using Lemonade's packaged pin.
+  # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
+  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
+  # to the newest build if the pin is too old to have shipped a matching
+  # ROCm-version asset; revert to the packaged default if neither verifies).
   # The unit tests exercise that state machine directly against injected
   # install/align steps, but nothing else asserts that `rocm engines install
   # lemonade` actually surfaces the outcome to a real user -- this is the one
@@ -333,7 +333,7 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
-  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
     When the user reinstalls the lemonade engine
@@ -377,3 +377,48 @@ Feature: Runtime configuration
     And Lemonade backend alignment is forced to fail
     When the user reinstalls lemonade with failed backend alignment
     Then the failure names the active runtime without installing a separate TheRock
+
+  # gfx90c -- the Vega iGPU in Renoir/Lucienne/Cezanne/Barcelo APUs -- has no
+  # TheRock build. It used to normalize through the loose `gfx90` arm to the
+  # data-center family `gfx90X-dcgpu`, so on a Ryzen 4000/5000 laptop a plain
+  # `rocm install sdk` resolved a data-center SDK for a mobile iGPU.
+  #
+  # The honest scenario would run on such a laptop, and there is no lane with
+  # one: no CI runner has a Vega APU, and detection reads real sysfs/WMI with no
+  # override to fake a target with (see `detect_host_gfx_target`). What is
+  # reachable from any lane is the refusal through the other door the user can
+  # open -- naming the target explicitly. The two doors do not print the same
+  # sentence (`unsupported_host_gpu_message` says "detected"; this one names
+  # where the target was asked from), but they share the wording the Thens pin
+  # and both are gated on the same `gfx_target_has_no_rocm_build`.
+  #
+  # So this scenario is evidence that the refusal reaches the user intact
+  # through the `--family` door. The detected-host door -- the one a real Ryzen
+  # 4000/5000 laptop opens -- has no end-to-end lane at all; it is covered at
+  # unit level only.
+  #
+  # The scenario is evidence about the *mapping* too, but only transitively,
+  # and only because of how the predicate is written: it answers `true` only
+  # when `normalize_therock_family` also answers `None`, so deleting the gfx90c
+  # arm there turns the refusal off at both doors at once. Were the predicate to
+  # name gfx90c on its own, the explicit door would keep refusing from its own
+  # copy of the target name and this scenario would stay green through exactly
+  # the regression it exists to catch. Both halves of that are measured, not
+  # assumed -- see the mutant list under "GPU targets with no ROCm build" in
+  # docs/testing.md. The direct, non-transitive evidence about the mapping is
+  # the unit tests, and `no_rocm_build_implies_no_therock_family` is what keeps
+  # the predicate from drifting away from it.
+  #
+  # Asserting only that the command fails would pass on the old code too: an
+  # unrecognized `--family` already fell through to host detection and failed on
+  # the no-GPU lane for an unrelated reason. So the Thens pin which refusal it
+  # is. The first catches a reopened catch-all: with the gfx90c arm gone the
+  # target resolves to `gfx90X-dcgpu` and no refusal is printed, so "no ROCm SDK
+  # build" is absent however the run then ends. The second guards the weaker
+  # failure where a refusal is printed but still dangles a family name in front
+  # of the user.
+  @id:runtime-install-sdk-refuses-unsupported-gpu-target
+  Scenario: runtime-20 - Asking for a GPU target ROCm does not build is refused outright
+    When the user dry-runs an SDK install for the gfx90c Vega iGPU
+    Then the install is refused as having no ROCm build for that GPU
+    And the refusal offers no package family to install instead
