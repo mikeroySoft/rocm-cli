@@ -825,7 +825,7 @@ fn concise_output(primary: &str, fallback: &str) -> String {
     };
     let mut concise = value.chars().take(500).collect::<String>();
     if value.chars().count() > 500 {
-        concise.push('…');
+        concise.push_str("...");
     }
     concise
 }

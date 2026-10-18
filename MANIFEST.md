@@ -357,7 +357,6 @@ repository.
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
 | proptest | 1.11.0 | MIT OR Apache-2.0 |
-| pulldown-cmark | 0.12.2 | MIT |
 | quick-xml | 0.39.4 | MIT |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
 | quinn-proto | 0.11.15 | MIT OR Apache-2.0 |
@@ -420,6 +419,7 @@ repository.
 | security-framework | 2.11.1 | MIT OR Apache-2.0 |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 |
+| self-replace | 1.5.0 | Apache-2.0 |
 | semver | 1.0.28 | MIT OR Apache-2.0 |
 | serde | 1.0.228 | MIT OR Apache-2.0 |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 |

@@ -6,13 +6,13 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build,
+    interactive_terminal, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -3393,24 +3393,51 @@ fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Opti
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
-    if let Some(value) = family_override
-        && let Some(family) = normalize_therock_family(value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "manifest".to_owned(),
-            raw_arch: family_override_raw_arch(value),
-        });
+    let env_override = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok();
+
+    // An explicitly asked-for target that ROCm publishes no build for is
+    // refused here rather than normalized. `normalize_therock_family` answers
+    // `None` for gfx90c, and `None` from this branch means "fall through", so
+    // without this the user's `--family gfx90c` would be dropped and whatever
+    // GPU this host happens to have would be installed for instead.
+    // Unrecognized spellings keep falling through to detection, which is the
+    // long-standing behavior for a typo.
+    //
+    // The guard sits inside each source's own branch, not ahead of both, so a
+    // source is only ever refused when it is actually the one being consulted:
+    // a valid `--family` must resolve even if a stale `ROCM_CLI_THEROCK_FAMILY`
+    // left over from an earlier session happens to name gfx90c, and the
+    // reverse for an env value once `--family` isn't the one in play.
+    if let Some(value) = family_override {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "--family"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "manifest".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
-    if let Some(value) = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok()
-        && let Some(family) = normalize_therock_family(&value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "env".to_owned(),
-            raw_arch: family_override_raw_arch(&value),
-        });
+    if let Some(value) = env_override.as_deref() {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "ROCM_CLI_THEROCK_FAMILY"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "env".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
@@ -3422,14 +3449,28 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    if let Some(raw_arch) = detect_host_gfx_target()
-        && let Some(family) = normalize_therock_family(&raw_arch)
+    let host_arch = detect_host_gfx_target();
+    if let Some(raw_arch) = host_arch.as_deref()
+        && let Some(family) = normalize_therock_family(raw_arch)
     {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
-            raw_arch: Some(raw_arch),
+            raw_arch: Some(raw_arch.to_owned()),
         });
+    }
+
+    // A GPU was detected that is known to have no package family: the gfx90c
+    // Vega iGPU in Renoir/Cezanne APUs. Listing the recognized families would
+    // invite installing a build for different silicon, so say plainly that
+    // there is nothing to install for this GPU. Other unmapped targets keep the
+    // generic error below, which points at `--family`.
+    if let Some(raw_arch) = host_arch.as_deref()
+        && gfx_target_has_no_rocm_build(raw_arch)
+    {
+        let message = unsupported_host_gpu_message(raw_arch);
+        let diagnostics = detect_host_gpu_diagnostics();
+        bail!("{message}\n\n{diagnostics}");
     }
 
     bail!(
@@ -3438,6 +3479,34 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
          Recognized families: {}.\n\n{}",
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
+    )
+}
+
+/// The install error for a detected GPU target that no TheRock package family
+/// covers. It deliberately does not list `--family` values: none of them was
+/// built for this GPU.
+fn unsupported_host_gpu_message(raw_arch: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
+         `rocm install sdk` has nothing to install for it.\n\
+         The GPU is detected but is not supported by ROCm; \
+         the Vulkan backend can still be used."
+    )
+}
+
+/// The install error for a target the user asked for by name that no TheRock
+/// package family covers.
+///
+/// Separate from [`unsupported_host_gpu_message`] because nothing was detected
+/// here: the user named the target, so the error names where it came from and
+/// does not claim a GPU is present. Like that message it offers no `--family`
+/// values, since none of them was built for this GPU.
+fn unsupported_requested_target_message(value: &str, source: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the GPU target `{value}` requested by \
+         {source}, so `rocm install sdk` has nothing to install for it.\n\
+         That GPU is not supported by ROCm; the Vulkan backend can still be \
+         used. Nothing was installed and no other family was substituted."
     )
 }
 
@@ -4678,7 +4747,7 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
         path,
@@ -5160,7 +5229,7 @@ try:
         # `Requires-Dist` entries carry environment markers after ';'. Only the
         # requirement itself matters here.
         requirement = raw.split(";")[0].strip()
-        # The distribution name runs up to the first specifier, extra or space —
+        # The distribution name runs up to the first specifier, extra or space -
         # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
         matched = re.match(r"[A-Za-z0-9._-]+", requirement)
         if matched is None:
@@ -7614,6 +7683,108 @@ mod tests {
     }
 
     #[test]
+    fn gfx90c_resolves_to_no_family_instead_of_the_datacenter_one() {
+        // gfx90c is the Vega iGPU in Renoir/Cezanne APUs. It used to normalize to
+        // `gfx90X-dcgpu`, so a plain `rocm install sdk` targeted data-center
+        // packages and the error listed that family as a `--family` choice.
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+    }
+
+    #[test]
+    fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
+        let message = unsupported_host_gpu_message("gfx90c");
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("Vulkan"), "{message}");
+        assert!(!message.contains("--family"), "{message}");
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "the error must not offer `{family}` for an unsupported GPU: {message}"
+            );
+        }
+    }
+
+    /// Asking for gfx90c by name must fail, not quietly install for some other
+    /// GPU.
+    ///
+    /// `normalize_therock_family("gfx90c")` is `None`, and in `resolve_family`
+    /// `None` from the override branch means "keep looking" — so before the
+    /// explicit-target guard, `--family gfx90c` was dropped on the floor and
+    /// the host's own family was installed instead. That is worse than the
+    /// data-center mapping this change removed: the user named a target and
+    /// got a different one with no warning.
+    ///
+    /// Reaching detection at all would make this test depend on the machine it
+    /// runs on, so a failure here is also the signal that the guard moved below
+    /// the branches it has to precede.
+    #[test]
+    fn requesting_gfx90c_by_name_fails_instead_of_installing_another_family() {
+        let (_root, paths) = test_paths("resolve-family-gfx90c-override");
+        let error = resolve_family(&paths, Some("gfx90c"))
+            .expect_err("--family gfx90c must not resolve to any package family");
+        let message = error.to_string();
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        assert!(
+            message.contains("no other family was substituted"),
+            "{message}"
+        );
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "asking for gfx90c must not resolve or offer `{family}`: {message}"
+            );
+        }
+    }
+
+    /// A valid `--family` must resolve even if `ROCM_CLI_THEROCK_FAMILY` is
+    /// stale and happens to name gfx90c.
+    ///
+    /// The no-build guard used to run ahead of both sources regardless of
+    /// which one would actually be consulted, so a leftover env value with no
+    /// bearing on this invocation could refuse an otherwise-valid `--family`.
+    /// The guard now lives inside each source's own branch, so it only fires
+    /// for the source actually being read.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_env = std::env::var_os("ROCM_CLI_THEROCK_FAMILY");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_FAMILY", "gfx90c");
+        }
+
+        let (_root, paths) = test_paths("resolve-family-cli-overrides-stale-env");
+        let resolution = resolve_family(&paths, Some("gfx1103"));
+
+        unsafe {
+            match old_env {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_FAMILY", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_FAMILY"),
+            }
+        }
+
+        let resolution = resolution
+            .expect("a valid --family must resolve even with an unrelated gfx90c env override set");
+        assert_eq!(resolution.family, "gfx110X-all");
+        assert_eq!(resolution.source, "manifest");
+    }
+
+    #[test]
+    fn requested_target_error_names_where_the_target_came_from() {
+        let message = unsupported_requested_target_message("gfx90c", "--family");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        // The user named it; nothing was detected, so the error must not say so.
+        assert!(!message.contains("detected"), "{message}");
+
+        let message = unsupported_requested_target_message("gfx90c", "ROCM_CLI_THEROCK_FAMILY");
+        assert!(message.contains("ROCM_CLI_THEROCK_FAMILY"), "{message}");
+    }
+
+    #[test]
     fn release_channel_prefers_stable_versions() {
         let versions = vec![
             "7.11.0".to_owned(),
@@ -8810,9 +8981,8 @@ mod tests {
     #[cfg(unix)]
     fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-cli-linked-runtimes-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-linked-runtimes-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
@@ -8825,6 +8995,14 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (root, paths, real)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_runtimes_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            linked_runtimes_paths("same-label").0
+        });
     }
 
     #[test]
@@ -9205,7 +9383,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -9223,8 +9401,7 @@ PY
 fi
 echo Python 3.12.10
 "#;
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9235,13 +9412,12 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9252,7 +9428,7 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             r#"#!/bin/sh
@@ -9272,8 +9448,7 @@ fi
 exit 1
 "#
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -10242,8 +10417,10 @@ exit 1
     #[cfg(windows)]
     #[test]
     fn install_sdk_rejects_tarball_on_windows_before_resolution() {
-        let root = workspace_test_artifact_dir()
-            .join(format!("rocm-cli-therock-test-{}", unix_time_millis()));
+        let root = workspace_test_artifact_dir().join(format!(
+            "rocm-cli-therock-test-{}",
+            crate::test_support::unique_suffix()
+        ));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -11041,9 +11218,8 @@ exit 1
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = workspace_test_artifact_dir().join(format!(
-            "rocm-cli-therock-test-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-therock-test-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         (
             root.clone(),
@@ -11053,6 +11229,11 @@ exit 1
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     fn workspace_test_artifact_dir() -> PathBuf {
@@ -11266,5 +11447,58 @@ exit 1
             !kernel_section.contains(r#"out["device_count"] ="#),
             "a kernel failure must preserve the enumerated device count"
         );
+    }
+}
+
+/// Property tests for the SDK tarball unpack, judged on the filesystem by
+/// `crate::archive_props`. Extraction is the system `tar` resolved from
+/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
+/// guarantees through `extract_tarball_and_discard_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use super::extract_tarball_and_discard_archive;
+    use crate::archive_props::{
+        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
+        tar_gz_bytes,
+    };
+
+    /// No escape, and no setuid/setgid or world-writable entry. The modes are
+    /// what the system `tar` gives an unprivileged user, so they are not
+    /// judged when this runs as root (see `Modes`).
+    #[test]
+    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let expect = Expect {
+            modes: Modes::SafeUnlessRoot,
+            no_outward_links: false,
+        };
+        note_mode_scope("therock", expect.modes);
+        run_property("therock", 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "sdk.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| {
+                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
+                },
+            )
+            .judge(expect)
+        })
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed tarball is extracted in full, into
+    /// the install root it was given. An unpack that wrote somewhere else
+    /// entirely escapes the oracle above; this catches it.
+    #[test]
+    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        run_round_trip("therock-benign", |layout, entries| {
+            let archive = layout.base.join("sdk.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
     }
 }

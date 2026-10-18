@@ -15,6 +15,10 @@
 //! place.
 
 use crate::examine::{run, which};
+#[cfg(test)]
+use crate::rocm_install::{
+    RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
+};
 use crate::{runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
@@ -211,6 +215,14 @@ const NEEDS_DEVICE_INDEX: &[Platform] = &[
         class: FixClass::NeedsArgument,
         needs: Some("--device-index"),
     },
+];
+
+/// `info-20-gpu-no-rocm-support`. Not "wsl": WSL2 reports no GPU topology, so
+/// the checker that produces this id never fires there and `rocm fix` would be
+/// claiming an answer for a host it was never asked about.
+const DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS: &[Platform] = &[
+    on("linux", FixClass::DiagnoseOnly),
+    on("windows", FixClass::DiagnoseOnly),
 ];
 
 /// A remediation recipe keyed by the stable `fix-id`.
@@ -557,7 +569,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-15-msvc-redist",
         title: "Install the MSVC 2015-2022 runtime redistributable",
-        rationale: "The HIP SDK's amdhip64_X.dll links against the MSVC 2015-2022 runtime. When vcruntime140.dll / vcruntime140_1.dll aren't on PATH, `import torch` fails with a missing-DLL error that points at vcruntime140_1.dll, not at the HIP runtime itself.",
+        rationale: "Programs built with Visual C++ need the MSVC 2015-2022 runtime. That includes the HIP SDK's amdhip64_X.dll and the llama.cpp server that Lemonade installs. When vcruntime140.dll / vcruntime140_1.dll aren't on PATH, `import torch` fails with a missing-DLL error that points at vcruntime140_1.dll, not at the HIP runtime itself.",
         commands: &[
             "# Download and install (x64):",
             "#   https://aka.ms/vs/17/release/vc_redist.x64.exe",
@@ -568,15 +580,44 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll",
         notes: &[
-            "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.",
+            "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.",
         ],
         doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
-    // The number is a stable handle, not a position: `fix-16` is reserved by the
-    // vLLM out-of-memory entry on its own branch, so this one takes 17 rather
-    // than colliding and forcing whichever lands second to rename a published id.
+    FixRecipe {
+        fix_id: "fix-16-vllm-oom",
+        title: "vLLM ran the GPU out of memory at startup",
+        rationale: "vLLM reserves a fixed fraction (~90%) of each GPU's TOTAL VRAM for its KV cache by default, regardless of the model size or how much is currently free. Two different faults surface the same OOM, and they need opposite responses. If the GPU is shared or already busy, that reservation collides with memory in use and lowering it (or moving to a less-busy GPU) is the fix. If the model genuinely does not fit in this GPU's VRAM, lowering the reservation only trades an earlier OOM for a later one -- use a smaller or quantized model instead (rocm-cli serves one model on a single GPU; it does not shard a model across GPUs).",
+        commands: &[
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,",
+            "# or steer vLLM onto a less-busy device:",
+            "rocm serve <model> --gpu-memory-utilization 0.5",
+            "rocm serve <model> --gpu <index>",
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the",
+            "# problem; pick a smaller or quantized model (single-GPU serving only).",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup",
+        notes: &[
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.",
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).",
+        ],
+        // Matches `check_16_vllm_oom`'s `["linux", "wsl"]` registration: WSL2 is
+        // the supported way to serve from a Windows host and the failure mode is
+        // just as real there, so the fix has to be runnable where the diagnosis
+        // is reachable. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        doc_url: None,
+        applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
+    // The number is a stable handle, not a position: `fix-16` is held by the
+    // vLLM out-of-memory entry above, so this one takes 17 rather than
+    // colliding and forcing whichever lands second to rename a published id.
     FixRecipe {
         fix_id: "fix-17-torch-dlpack",
         title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
@@ -713,7 +754,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "grep VERSION_ID /etc/os-release",
+        verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1",
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],
@@ -826,6 +867,67 @@ const RECIPES: &[FixRecipe] = &[
         // amdgpu module, and WSL2 ships the same 64 MB default a container does.
         // Print-only on both because every remedy above needs sudo.
         applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
+    // A new id rather than a rename of `fix-15`: that entry means "the runtime is
+    // missing", and a stable id keeps its meaning. This one is "present but too
+    // old", which has a different cause, a different symptom and a different
+    // remedy (update, not install).
+    FixRecipe {
+        fix_id: "fix-21-msvc-redist-outdated",
+        title: "Update the MSVC 2015-2022 runtime redistributable",
+        rationale: "The Visual C++ runtime in System32 is older than 14.40. Programs built with a recent Visual C++ toolset, such as the llama.cpp server that Lemonade installs, need 14.40 or newer. On an older runtime they crash with an access violation (0xC0000005) inside MSVCP140.dll, and nothing says the runtime is the cause. The runtime is present, so there is no missing-DLL error. A copy bundled with another app, such as Python, can still make a presence check pass.",
+        commands: &[
+            "# Update the runtime (x64). This needs the Windows administrator prompt, so",
+            "# the command is shown here and not run for you:",
+            "winget install --id Microsoft.VCRedist.2015+.x64 --exact",
+            "# Or download and run the installer:",
+            "#   https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            "# Then close and restart the program (or Lemonade) so it loads the new runtime.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"",
+        notes: &[
+            "The verify command prints the runtime version. It should read 14.40 or higher.",
+            "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.",
+            "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.",
+        ],
+        doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
+        applies_on: PRINT_ON_WINDOWS,
+        runner: None,
+    },
+    // The first [`FixClass::DiagnoseOnly`] member, and an `info-` id rather than
+    // a `fix-` one: the `fix-N` series names problems that have a remedy, and
+    // this entry's whole content is that there is none. The id still belongs in
+    // this catalog, because `rocm diagnose` prints `apply with: rocm fix <id>`
+    // for every cause it reports, and `rocm fix` has to answer for every id it
+    // prints -- here by naming the problem and changing nothing, which is what
+    // `Plan::Unfixable` does.
+    FixRecipe {
+        fix_id: "info-20-gpu-no-rocm-support",
+        title: "GPU has no ROCm/HIP support (Vulkan backend still works)",
+        rationale: "Every AMD GPU on this machine is a part ROCm has never shipped a runtime build for -- not one that is merely undetected. No ROCm or HIP install, driver version or environment variable changes that, so there is nothing to apply. Vulkan-based engines, which is what Lemonade runs by default, do not use ROCm and work on it.",
+        commands: &[],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "",
+        notes: &[
+            "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.",
+            // Not "`rocm serve` already picks a Vulkan engine on this host":
+            // that is a claim about the CLI's own runtime behaviour which this
+            // catalog does not decide. A configured default engine outranks
+            // `default_engine_for_host`, and Lemonade picks its llama.cpp
+            // backend itself. The matching note in `diagnose`'s `check_20` is
+            // worded the same way.
+            "To use this GPU for inference, serve with a Vulkan-capable engine. If you have set a default engine that needs ROCm, that one will not work here; `rocm serve --engine lemonade` does not need it.",
+        ],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+        ),
+        applies_on: DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS,
         runner: None,
     },
 ];
@@ -974,6 +1076,35 @@ pub(crate) fn torch_rocm_indexes_named_in<'a>(
             digits.parse().ok().map(|major| (major, c.to_owned()))
         })
         .collect()
+}
+
+/// Test-only view of a recipe's actionable remediation: its `verify` command,
+/// its `notes`, and its *executable* command lines (comment/prose lines
+/// stripped). Lets the diagnosis catalog cross-check that the Fix it emits for a
+/// shared `fix_id` has not silently diverged from this recipe.
+#[cfg(test)]
+pub(crate) fn recipe_verify_notes_and_run_commands(
+    fix_id: &str,
+) -> Option<(&'static str, &'static [&'static str], Vec<&'static str>)> {
+    find_recipe(fix_id).map(|recipe| {
+        let run_commands = recipe
+            .commands
+            .iter()
+            .copied()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>();
+        (recipe.verify, recipe.notes, run_commands)
+    })
+}
+
+/// Test-only view of the platform families a recipe is runnable on.
+///
+/// `None` when no recipe carries `fix_id`. Lets the diagnosis catalog assert
+/// that every platform a checker answers on is a platform `rocm fix` will
+/// actually act on, which `recipe_verify_notes_and_run_commands` cannot see.
+#[cfg(test)]
+pub(crate) fn recipe_applies_on(fix_id: &str) -> Option<Vec<&'static str>> {
+    find_recipe(fix_id).map(|recipe| recipe.applies_on.iter().map(|p| p.os).collect())
 }
 
 /// Whether `fix_id` names an entry in the catalog.
@@ -1254,6 +1385,20 @@ fn print_recipe(r: &FixRecipe) {
     }
 }
 
+/// What `rocm fix` says when it is handed a `rocm diagnose` ranking position
+/// (`#1`) rather than a fix-id.
+///
+/// Lifted out of [`apply`] so the wording is reachable from a test: `fail!`
+/// writes straight to the process's own stderr, which an in-process test cannot
+/// capture, so the only other way to cover these two lines would be to spawn
+/// the binary.
+fn diagnosis_position_refusal(fix_id: &str) -> [String; 2] {
+    [
+        format!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."),
+        "Use the `id:` shown against that cause - `rocm diagnose` prints an `apply with:` line you can copy.".to_owned(),
+    ]
+}
+
 /// Apply (or print) the fix identified by `fix_id`. Returns the process exit code.
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
@@ -1264,10 +1409,9 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
             // number here. It is a position in one report, not a name -- and it
             // does not line up with the catalog's `fix-N` names either, so a
             // bare "unknown id" left them with nothing to correct.
-            fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
-            fail!(
-                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
-            );
+            for line in diagnosis_position_refusal(fix_id) {
+                fail!("{line}");
+            }
         } else {
             fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
@@ -1323,9 +1467,11 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
 /// Everything `apply` does once the id has resolved to a recipe.
 ///
 /// Split out from [`apply`] so the class gate can be reached with a recipe the
-/// catalog does not contain. [`FixClass::DiagnoseOnly`] has no member today, so
-/// without this seam its branch is unreachable from any test and would sit
-/// unexercised until the first unfixable problem turns up.
+/// catalog does not contain, which keeps every class's branch reachable from a
+/// test however few entries the catalog happens to carry for it.
+/// [`FixClass::DiagnoseOnly`] had no member at all until
+/// `info-20-gpu-no-rocm-support`, the first; the seam is what exercised its
+/// branch before that, and still covers any class the catalog later empties.
 #[must_use]
 fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
     print_recipe(recipe);
@@ -1592,8 +1738,13 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
         println!("Note: clearing it in your Windows env scope does NOT affect this");
         println!("already-open shell -- close and reopen your terminal afterwards.");
     }
-    let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User");
-    let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine");
+    // A failed read here only affects this report-and-clear path, which never
+    // overwrites the whole variable (it only clears it via a dedicated
+    // `setx VAR ""`), so collapsing a failed read to "unset" preserves this
+    // function's existing behavior; it is `path_export_windows`'s
+    // read-then-overwrite-the-whole-value shape that made that collapse unsafe.
+    let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User").unwrap_or_default();
+    let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine").unwrap_or_default();
     report_and_clear_override_windows(opts, &user_val, &machine_val, |prompt| {
         confirm(prompt, opts.yes)
     })
@@ -1748,18 +1899,83 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         return 3;
     }
     let bin_dir = bin_dir.to_string_lossy().into_owned();
-    let user_path = ps_env_scope("PATH", "User");
+    path_export_windows(opts, &bin_dir, || ps_env_scope("PATH", "User"))
+}
+
+/// The literal value that will replace User-scope PATH on a non-empty
+/// existing value: `bin_dir` first, so whatever else is already on PATH
+/// cannot shadow it with a same-named binary. This matches the Linux
+/// sibling's intent (`run_path_export_linux`'s `export PATH="{bin_dir}:$PATH"`
+/// also puts `bin_dir` first) and the "Plan: prepend..." message
+/// `path_export_windows` prints next to it.
+///
+/// Kept as its own function, called from both the plan message and the
+/// value actually written, so the two can never disagree with each other the
+/// way the unfixed code did (print said "prepend", the write appended)
+/// -- see AGENTS.md section 3 on deriving a printed claim from the same
+/// value the branch acts on.
+fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
+    if user_path.is_empty() {
+        bin_dir.to_owned()
+    } else {
+        format!("{bin_dir};{user_path}")
+    }
+}
+
+/// Escapes a value for embedding inside a PowerShell single-quoted string
+/// literal. PowerShell single-quoted strings are literal, and the
+/// language's own convention for including a literal `'` in one is to
+/// double it (`''`) -- an unescaped `'` instead ends the literal early, so
+/// whatever follows on the line is parsed as separate PowerShell tokens.
+///
+/// This matters here because the value embedded into
+/// `path_export_windows`'s write script (`new_path`, built by
+/// [`windows_path_prepend`] from `bin_dir` and the real existing User PATH
+/// read back from the host) is filesystem/environment-origin data, not a
+/// literal this code controls. A path containing an apostrophe --
+/// `C:\Users\O'Brien\bin` on the real PATH, or an install root with one in
+/// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
+/// without this escape it would split the generated `-Command` script
+/// mid-statement.
+fn ps_single_quote_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Does the read/plan/write work for [`run_path_export_windows`], with the
+/// User-scope PATH read taken as an injected closure rather than calling
+/// `ps_env_scope` directly. That's what makes the "read failed" branch
+/// testable on any host -- same reason [`report_and_clear_override_windows`]
+/// takes consent as a closure.
+///
+/// A failed read (`None`) must never be treated as "PATH is empty": the
+/// write below replaces the *entire* User PATH value, so collapsing a
+/// PowerShell failure into "nothing there" would wipe the user's real PATH
+/// down to just `bin_dir`. So a failed read aborts here, before the
+/// "Plan: ..." preview and before the write is ever attempted, with a
+/// return code (`4`, matching a write failure) distinct from `0` ("nothing
+/// to do") and from `5` ("user declined").
+fn path_export_windows(
+    opts: &FixOptions,
+    bin_dir: &str,
+    read_user_path: impl FnOnce() -> Option<String>,
+) -> i32 {
+    let Some(user_path) = read_user_path() else {
+        fail!("Could not read the current User PATH; User PATH NOT changed.");
+        return 4;
+    };
     if !user_path.is_empty() && user_path.to_lowercase().contains(&bin_dir.to_lowercase()) {
         println!("User PATH already contains {bin_dir}; no change.");
         return 0;
     }
-    let new_path = if user_path.is_empty() {
-        bin_dir.clone()
-    } else {
-        format!("{user_path};{bin_dir}")
-    };
+    let new_path = windows_path_prepend(bin_dir, &user_path);
+    // Escaped once here, before either the printed preview or the real
+    // write script embeds it, so the two can never disagree about what
+    // actually gets executed (same reasoning as `windows_path_prepend`
+    // being shared, above) -- see `ps_single_quote_escape`'s doc comment
+    // for why this escape is required at all.
+    let escaped_new_path = ps_single_quote_escape(&new_path);
     println!("Plan: prepend {bin_dir} to your User PATH:");
-    println!("  setx PATH \"{new_path}\"");
+    println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
         println!("(dry-run; not executed)");
         return 0;
@@ -1767,14 +1983,23 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     if !confirm("Update User PATH?", opts.yes) {
         return 5;
     }
-    let (rc, out, err) = run("setx", &["PATH", &new_path], RUN_TIMEOUT);
+    // PowerShell's SetEnvironmentVariable, not `setx`: `setx` silently
+    // truncates values past 1024 characters while still exiting 0, which a
+    // normal-length PATH can hit even when the read above succeeded.
+    let script =
+        format!("[Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
+    let (rc, out, err) = run(
+        "powershell",
+        &["-NoProfile", "-Command", &script],
+        RUN_TIMEOUT,
+    );
     relay_output(&out, &err);
     if rc != 0 {
-        fail!("setx exited {rc}; User PATH NOT changed.");
+        fail!("PowerShell exited {rc}; User PATH NOT changed.");
         return 4;
     }
     println!(
-        "Added {bin_dir} to your User PATH. setx only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
+        "Added {bin_dir} to your User PATH. This only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
     );
     0
 }
@@ -1873,7 +2098,11 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         );
         return 0;
     };
-    let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User");
+    // Out of scope for ROCMAI-449 (that fix is specific to fix-6-path's
+    // read-then-overwrite-the-whole-PATH-value shape): a failed read here
+    // only risks re-running `setx HIP_VISIBLE_DEVICES <idx>`, which sets a
+    // single unrelated variable rather than overwriting PATH.
+    let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User").unwrap_or_default();
     if !existing.is_empty() {
         println!(
             "User scope already sets HIP_VISIBLE_DEVICES={existing:?}; remove or update it manually rather than overwriting from this command."
@@ -1906,7 +2135,14 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
 }
 
 /// Read a Windows environment variable from a given scope via PowerShell.
-fn ps_env_scope(var: &str, scope: &str) -> String {
+///
+/// Returns `None` if the read itself failed -- PowerShell missing, blocked by
+/// execution policy, or the query timing out -- which must stay distinguishable
+/// from `Some(String::new())`, meaning the read succeeded and the variable is
+/// genuinely unset/empty in that scope. Collapsing both to `""` is what let a
+/// failed PATH read look like an empty PATH to a caller that then wrote the
+/// "empty" value back out, wiping the real one (ROCMAI-449).
+fn ps_env_scope(var: &str, scope: &str) -> Option<String> {
     let script = format!("[Environment]::GetEnvironmentVariable('{var}','{scope}')");
     let (rc, out, _) = run(
         "powershell",
@@ -1914,9 +2150,9 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
         QUERY_TIMEOUT,
     );
     if rc == 0 {
-        out.trim().to_owned()
+        Some(out.trim().to_owned())
     } else {
-        String::new()
+        None
     }
 }
 
@@ -1953,10 +2189,7 @@ fn newest_rocm_install_dir_in(
     search_dirs: &[std::path::PathBuf],
     env_override: Option<&std::path::Path>,
 ) -> String {
-    first_install_path(crate::discover_rocm_installs_on_host_in(
-        search_dirs,
-        env_override,
-    ))
+    first_install_path(discover_rocm_installs_on_host_in(search_dirs, env_override))
 }
 
 #[cfg(test)]
@@ -2058,17 +2291,14 @@ mod tests {
         // the regression waits for the Windows lane to surface it. The seam
         // already takes the layout, so driving it with both discriminates on
         // every host for the cost of one loop.
-        let by_layout: Vec<(crate::RocmLayout, bool)> = [
-            (crate::RocmLayout::Siblings, "rocm-6.2.0"),
-            (crate::RocmLayout::Children, "6.2"),
+        let by_layout: Vec<(RocmLayout, bool)> = [
+            (RocmLayout::Siblings, "rocm-6.2.0"),
+            (RocmLayout::Children, "6.2"),
         ]
         .into_iter()
         .map(|(layout, decoy)| {
-            let installs = crate::discover_rocm_installs_in_layout(
-                std::slice::from_ref(&searched),
-                None,
-                layout,
-            );
+            let installs =
+                discover_rocm_installs_in_layout(std::slice::from_ref(&searched), None, layout);
             (
                 layout,
                 installs.iter().any(|install| install.path.ends_with(decoy)),
@@ -2221,9 +2451,11 @@ mod tests {
     ///
     /// The distinction this pins is 0 against 3. Exit 3 is "not applicable on
     /// this machine", which would send a caller looking for a different machine
-    /// to run the fix on; there is no such machine, because there is no fix. The
-    /// catalog has no `DIAGNOSE-ONLY` entry yet, so nothing else in the suite
-    /// reaches this branch.
+    /// to run the fix on; there is no such machine, because there is no fix.
+    /// Driven through the synthetic recipe rather than through
+    /// `info-20-gpu-no-rocm-support`, the catalog's one `DIAGNOSE-ONLY` entry,
+    /// so the exit code stays pinned to the class and not to whichever entries
+    /// happen to carry it.
     #[test]
     fn a_problem_with_no_reliable_fix_reports_success_and_does_not_look_portable() {
         let opts = FixOptions::default();
@@ -2278,33 +2510,76 @@ mod tests {
         );
     }
 
-    /// No entry is `DIAGNOSE-ONLY` on any platform.
+    /// Exactly which entries are `DIAGNOSE-ONLY`, and on which platforms.
     ///
-    /// The class ships with no member on purpose: it is what lets a
-    /// detect-but-cannot-repair failure be accepted as an entry at all. It ships
-    /// now rather than when the first member arrives because `rocm diagnose
-    /// --json` already serialises `class`, and a consumer that deserialises
-    /// that output into a fixed enum today would reject a payload carrying a
-    /// variant added later -- shipping the full set from the start means that
-    /// variant is already something callers have to tolerate. This test is the
-    /// tripwire — when it fails, the first real member has arrived, and the
-    /// scenario that was waiting for one becomes demonstrable against it rather
-    /// than staying provisional.
+    /// The class shipped with no member on purpose: it is what lets a
+    /// detect-but-cannot-repair failure be accepted as an entry at all. It
+    /// shipped before the first member arrived because `rocm diagnose --json`
+    /// already serialises `class`, and a consumer that deserialised that output
+    /// into a fixed enum would reject a payload carrying a variant added later
+    /// -- shipping the full set from the start means that variant is already
+    /// something callers have to tolerate.
+    ///
+    /// `info-20-gpu-no-rocm-support` is the first member, and this is now the
+    /// pin rather than the tripwire: the list is exact, so promoting an entry
+    /// to "there is no fix" -- the strongest thing this catalog can say about a
+    /// problem, and the one a user can do least with -- fails here until it is
+    /// written down.
     #[test]
-    fn the_catalog_has_no_diagnose_only_entry_yet() {
-        let members: Vec<&str> = RECIPES
+    fn diagnose_only_has_exactly_the_members_the_catalog_names() {
+        let members: Vec<(&str, Vec<&str>)> = RECIPES
             .iter()
             .filter(|r| {
                 r.applies_on
                     .iter()
                     .any(|p| p.class == FixClass::DiagnoseOnly)
             })
-            .map(|r| r.fix_id)
+            .map(|r| {
+                (
+                    r.fix_id,
+                    r.applies_on
+                        .iter()
+                        .filter(|p| p.class == FixClass::DiagnoseOnly)
+                        .map(|p| p.os)
+                        .collect(),
+                )
+            })
             .collect();
+        assert_eq!(
+            members,
+            vec![("info-20-gpu-no-rocm-support", vec!["linux", "windows"])],
+            "DIAGNOSE-ONLY membership changed. That is the class working as intended -- update \
+             this test, and say in the commit why the new entry has no fix."
+        );
+    }
+
+    /// The first `DIAGNOSE-ONLY` member reaches [`Plan::Unfixable`] from the
+    /// real catalog, not only from the synthetic recipe above.
+    ///
+    /// `the_class_gate_is_reached_only_after_the_platform_gate` and its sibling
+    /// both build a recipe by hand, so between them they prove the branch works
+    /// without proving anything ships through it. This runs `plan_of` on the
+    /// catalog entry itself, on each OS it is scoped to.
+    #[test]
+    fn the_catalogs_diagnose_only_entry_plans_as_unfixable() {
+        let recipe = find_recipe("info-20-gpu-no-rocm-support")
+            .expect("the informational entry is in the catalog");
+        assert_eq!(
+            recipe.os_scope(),
+            vec!["linux", "windows"],
+            "the checker is registered for linux and windows, so the recipe has to answer there"
+        );
+        for os in recipe.os_scope() {
+            assert_eq!(
+                recipe.platform(os).map(|p| p.class),
+                Some(FixClass::DiagnoseOnly),
+                "{os}: `rocm fix info-20-gpu-no-rocm-support` must name the problem and change \
+                 nothing"
+            );
+        }
         assert!(
-            members.is_empty(),
-            "{members:?} now use DIAGNOSE-ONLY. That is the class working as intended -- update \
-             this test, and demonstrate the scenario that was waiting for a member."
+            recipe.runner.is_none() && recipe.commands.is_empty() && recipe.verify.is_empty(),
+            "an entry with no fix has nothing to run, nothing to copy and nothing to verify"
         );
     }
 
@@ -2315,9 +2590,44 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 18 bare-metal/Windows entries (fix-17, fix-18 and fix-19 among them)
-        // plus the 7 WSL ones.
-        assert_eq!(count, 25, "expected 25 catalog entries");
+        // 21 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // fix-18-comgr-conflict, fix-19-shm-too-small,
+        // fix-21-msvc-redist-outdated and the informational
+        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
+        assert_eq!(count, 28, "expected 28 catalog entries");
+    }
+
+    /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
+    ///
+    /// The plan includes a `winget install` line, and says the CLI does not run
+    /// it. This is the test that makes that sentence true: no runner, and the
+    /// only platform class is print-only. Letting the CLI run the install would
+    /// need the maintainers' agreement, because it takes the Windows
+    /// administrator prompt.
+    #[test]
+    fn the_outdated_runtime_recipe_is_print_only_on_windows() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-21-msvc-redist-outdated")
+            .expect("the entry exists");
+        assert!(
+            recipe.runner.is_none(),
+            "an install must not be run for the user"
+        );
+        assert_eq!(recipe.applies_on.len(), 1);
+        assert_eq!(recipe.applies_on[0].os, "windows");
+        assert_eq!(recipe.applies_on[0].class, FixClass::PrintOnly);
+        assert!(
+            recipe
+                .commands
+                .contains(&"winget install --id Microsoft.VCRedist.2015+.x64 --exact")
+        );
+        assert!(
+            recipe
+                .notes
+                .iter()
+                .any(|n| n.contains("only prints this plan"))
+        );
     }
 
     /// Restored, not new. This PR made the `wsl` arm of the platform lookup
@@ -2335,6 +2645,14 @@ mod tests {
         // `current_os()` reports the same answer `is_wsl_host()` does on
         // whatever machine actually runs it, whether that is a bare-metal CI
         // runner, Windows, or a real WSL host.
+        //
+        // In an `e2e-test-hooks` build both calls read through the simulated
+        // host root, which another test may be setting and clearing, so hold
+        // its lock to compare two answers about the same host. Without the
+        // feature the lock is uncontended and costs nothing.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             current_os() == "wsl",
             crate::is_wsl_host(),
@@ -2362,6 +2680,43 @@ mod tests {
     /// `apply` reaches its internal-error path. The converse is deliberately
     /// not asserted: a print-only recipe may hold a runner that reports without
     /// writing, which is exactly what `fix-2-unset-override` does on Linux.
+    #[test]
+    fn the_utilization_hint_example_matches_the_recipe_command() {
+        // The shared hint carries a worked value, and `fix-16-vllm-oom` hands
+        // the user a command carrying another. They drifted once already: the
+        // docs and the recipe moved to 0.5 while the const kept recommending
+        // 0.1, so one `rocm diagnose` printed "e.g. 0.1 for a small model"
+        // directly above `rocm serve <model> --gpu-memory-utilization 0.5`.
+        // Nothing caught it -- the cross-check in `diagnose` exempts the summary
+        // as prose framing, and a line-based grep misses the const because the
+        // flag and the value sit on different continuation lines.
+        const FLAG: &str = "--gpu-memory-utilization";
+        let hint = crate::VLLM_GPU_MEMORY_UTILIZATION_HINT;
+        let example = hint
+            .split_once("e.g. ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!("the shared hint no longer carries a worked `e.g. <value>`:\n{hint}")
+            });
+        let recipe = find_recipe("fix-16-vllm-oom").expect("fix-16-vllm-oom is in the catalog");
+        let commanded = recipe
+            .commands
+            .iter()
+            .find_map(|line| line.split_once(FLAG))
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!(
+                    "fix-16-vllm-oom no longer commands `{FLAG}`:\n{:#?}",
+                    recipe.commands
+                )
+            });
+        assert_eq!(
+            example, commanded,
+            "the shared hint recommends `{FLAG} {example}` while `rocm fix fix-16-vllm-oom` \
+             commands `{FLAG} {commanded}`; both can print in a single `rocm diagnose` report"
+        );
+    }
+
     #[test]
     fn a_recipe_that_acts_has_a_runner() {
         for r in RECIPES {
@@ -2510,6 +2865,17 @@ mod tests {
                 ("fix-9-igpu-dgpu", "windows", FixClass::NeedsArgument),
             ]
         );
+        // fix-16-vllm-oom carries a workaround the user must weigh (lowering the
+        // VRAM reservation is wrong for a model that genuinely does not fit), so
+        // it is deliberately PRINT-ONLY and must never join the AUTO set.
+        let oom = find_recipe("fix-16-vllm-oom").expect("OOM recipe is in the catalog");
+        assert!(
+            oom.applies_on
+                .iter()
+                .all(|p| p.class == FixClass::PrintOnly),
+            "fix-16-vllm-oom must stay PRINT-ONLY on every platform it applies to"
+        );
+        assert!(oom.runner.is_none(), "a PRINT-ONLY recipe has no runner");
     }
 
     #[test]
@@ -2651,6 +3017,26 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+
+        // ROCMAI-543: the two lines `apply` writes to stderr on this path must
+        // be plain ASCII, or a Windows console on the OEM code page renders the
+        // punctuation as mojibake like `ΓÇö`. The exit code above says nothing
+        // about them, and `fail!` writes past any in-process capture.
+        let refusal = diagnosis_position_refusal("#1");
+        for line in &refusal {
+            assert!(
+                line.is_ascii(),
+                "the position-argument refusal must be ASCII-only (ROCMAI-543): {line}"
+            );
+        }
+        // Both halves still have to do their job: name what the user typed, and
+        // name where the real id is printed.
+        assert!(refusal[0].contains("#1"), "refusal: {refusal:?}");
+        assert!(
+            refusal[1].contains("id:") && refusal[1].contains("apply with:"),
+            "the refusal must keep pointing at the `id:`/`apply with:` lines \
+             `rocm diagnose` prints: {refusal:?}"
+        );
     }
 
     #[test]
@@ -2902,6 +3288,183 @@ mod tests {
         });
 
         assert_eq!(code, 0);
+    }
+
+    /// ROCMAI-449: a failed PATH read must never be treated as "PATH is
+    /// empty". Against the unfixed code (`ps_env_scope` collapsing any
+    /// failure to `""`), this read would look identical to a genuinely empty
+    /// PATH, and the old `run_path_export_windows` would go on to run
+    /// `setx PATH "<bin_dir>"` -- replacing the user's entire real PATH with
+    /// one entry.
+    ///
+    /// `opts.dry_run = true` is the discriminator, not `opts.yes`: on a host
+    /// without a real `powershell`/`setx` (this Mac included), the actual
+    /// write fails regardless of whether it was ever reached, so asserting
+    /// against a "the write failed" code cannot tell "aborted before the
+    /// write" apart from "attempted the write and the write itself failed"
+    /// -- both land on the same non-zero code by coincidence of this host's
+    /// missing binary. Collapsing the failed read to `""` instead falls
+    /// through to the dry-run short-circuit (which returns `0`, "preview
+    /// printed, nothing to do"), while the fix aborts at the read itself and
+    /// never reaches that branch -- so this is the one assertion that is
+    /// both host-independent and still fails against the unfixed
+    /// collapse-to-empty behavior.
+    #[test]
+    fn windows_path_read_failure_aborts_before_plan_or_write() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", || {
+            None // the read itself failed (PowerShell missing/blocked/timed out)
+        });
+
+        assert_ne!(
+            code, 0,
+            "a failed read must not be silently absorbed by the dry-run preview"
+        );
+        assert_ne!(
+            code, 5,
+            "a failed read was never offered a prompt to decline"
+        );
+    }
+
+    /// A genuinely empty User PATH (the read succeeded and returned `""`,
+    /// not a failure) must still work exactly as before: the new value is
+    /// `bin_dir` alone, with no leading or trailing separator.
+    #[test]
+    fn windows_path_prepend_on_genuinely_empty_path_is_bin_dir_alone() {
+        assert_eq!(windows_path_prepend(r"C:\ROCm\bin", ""), r"C:\ROCm\bin");
+    }
+
+    /// Per AGENTS.md section 3: a claim of outcome ("Plan: prepend...") must
+    /// be asserted together with the resulting state, not pinned as a string
+    /// on its own. `windows_path_prepend` is the single function both the
+    /// printed plan and the real write derive their value from (see its doc
+    /// comment), so calling it directly here pins both at once: the literal
+    /// value a real write would send, which is the same test that would have
+    /// failed against the unfixed `format!("{user_path};{bin_dir}")` -- that
+    /// built `"C:\Windows;C:\Other;C:\ROCm\bin"`, which does NOT start with
+    /// `bin_dir`.
+    #[test]
+    fn windows_path_prepend_on_existing_path_starts_with_bin_dir_not_ends_with_it() {
+        let bin_dir = r"C:\ROCm\bin";
+        let existing = r"C:\Windows;C:\Other";
+
+        let new_path = windows_path_prepend(bin_dir, existing);
+
+        assert_eq!(new_path, format!("{bin_dir};{existing}"));
+        assert!(
+            new_path.starts_with(bin_dir),
+            "a prepend must start with bin_dir, not end with it: got {new_path:?}"
+        );
+    }
+
+    /// `ps_single_quote_escape` must double every embedded `'`, per
+    /// PowerShell's own single-quoted-string escaping convention.
+    #[test]
+    fn ps_single_quote_escape_doubles_every_embedded_quote() {
+        assert_eq!(ps_single_quote_escape("plain"), "plain");
+        assert_eq!(ps_single_quote_escape("O'Brien"), "O''Brien");
+        assert_eq!(
+            ps_single_quote_escape("'leading and trailing'"),
+            "''leading and trailing''"
+        );
+        assert_eq!(ps_single_quote_escape("a'b'c"), "a''b''c");
+    }
+
+    /// Round 2 of ROCMAI-449: an apostrophe anywhere in the real User PATH
+    /// (e.g. `C:\Users\O'Brien\bin`, an ordinary Windows path, not a
+    /// contrived edge case) must not be able to split the generated
+    /// PowerShell `-Command` script mid-statement. Before this fix, the
+    /// write script was built as
+    /// `format!("...SetEnvironmentVariable('PATH', '{new_path}', 'User')")`
+    /// with `new_path` interpolated raw: an unescaped `'` in it would end
+    /// the literal early, and the remainder of `new_path` plus the trailing
+    /// `, 'User')` would be parsed as separate PowerShell tokens rather than
+    /// staying part of the string value.
+    ///
+    /// This builds the exact script string [`path_export_windows`]'s write
+    /// path constructs and asserts it is well-formed: every single quote in
+    /// it belongs to one of exactly three delimiter pairs (`'PATH'`,
+    /// `'<value>'`, `'User'`), so the embedded value itself must contain
+    /// zero *unescaped* quotes -- i.e. the quote count inside the value
+    /// region is exactly double the number of literal `'` characters the
+    /// unescaped input contained.
+    #[test]
+    fn write_script_escapes_apostrophe_in_real_path_value() {
+        let bin_dir = r"C:\ROCm\bin";
+        let user_path = r"C:\Users\O'Brien\bin;C:\Windows";
+
+        let new_path = windows_path_prepend(bin_dir, user_path);
+        let escaped_new_path = ps_single_quote_escape(&new_path);
+        let script =
+            format!("[Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
+
+        // The raw (unescaped) new_path must contain exactly one embedded
+        // apostrophe here (from "O'Brien"), carried over unchanged from
+        // user_path.
+        let raw_quote_count = new_path.matches('\'').count();
+        assert_eq!(raw_quote_count, 1);
+
+        // After escaping, that one embedded quote must have become two
+        // (`''`), so the escaped value contributes 2 quote characters to
+        // the script, on top of the 6 delimiter quotes from the 3
+        // single-quoted literals ('PATH', the value, 'User').
+        let script_quote_count = script.matches('\'').count();
+        assert_eq!(
+            script_quote_count,
+            6 + 2 * raw_quote_count,
+            "every embedded ' must appear as '' in the script, on top of the 3 literals' own delimiters: {script:?}"
+        );
+
+        // Concretely: the value literal must read as a single balanced
+        // '...' token with the embedded quote doubled, not end early at the
+        // first unescaped '.
+        assert!(
+            script.contains(r"'C:\ROCm\bin;C:\Users\O''Brien\bin;C:\Windows'"),
+            "escaped value literal not found intact in script: {script:?}"
+        );
+        // And the trailing ", 'User')" must stay the closing argument list,
+        // not get parsed as stray tokens after a prematurely-closed string.
+        assert!(script.ends_with(", 'User')"));
+    }
+
+    /// Regression coverage for control flow this change does not touch: an
+    /// existing User PATH that already contains `bin_dir` must short-circuit
+    /// to 0 without ever reaching the confirm gate. `FixOptions::default()`
+    /// has `yes: false` and `dry_run: false`, and `confirm()` on a
+    /// non-interactive test process always declines (code `5`), so if this
+    /// short-circuit broke and control fell through to the confirm gate,
+    /// this would observe `5` instead of `0`.
+    #[test]
+    fn windows_path_already_contains_bin_dir_short_circuits_with_no_change() {
+        let bin_dir = r"C:\ROCm\bin";
+        let code = path_export_windows(&FixOptions::default(), bin_dir, || {
+            Some(format!(r"C:\Windows;{bin_dir}"))
+        });
+
+        assert_eq!(
+            code, 0,
+            "already containing bin_dir must short-circuit before the confirm gate"
+        );
+    }
+
+    /// Regression coverage: `--dry-run` must still preview and return 0
+    /// without ever reaching the confirm gate, by the same non-interactive
+    /// discriminator as the test above (a fall-through would decline and
+    /// return 5, not 0).
+    #[test]
+    fn windows_path_dry_run_short_circuits_before_confirm() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", || Some(String::new()));
+
+        assert_eq!(code, 0, "a dry-run preview is not a decline");
     }
 
     #[test]

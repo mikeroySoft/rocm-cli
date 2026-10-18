@@ -29,9 +29,9 @@ Use this skill when answering ROCm CLI local assistant questions.
 - vLLM and Lemonade are the supported serving engines.
 - The built-in assistant is fixed to qwen (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade with `gpu_required`. Do not switch it to vLLM.
 - Installing an engine and running a model server are different states. Inspect them separately with `rocm_command` args `["engines","list"]` and `["services","list","--all"]`.
-- For general model serving, preserve an explicit engine choice. Otherwise omit `--engine` and let ROCm CLI select the configured default, then a compatible host-GPU preference, then the model recipe preference, and finally the platform default. It does not retry another engine after a failure.
-- `rocm serve` accepts `--gpu auto|<index>`. `auto` prefers a GPU that looks idle from `amd-smi` VRAM telemetry and rocm-cli service records, then the GPU with the most free memory; an index pins one GPU. Serving one model across multiple GPUs is not supported. Always use `gpu_required`; a busy, unavailable, or invalid GPU must fail without CPU fallback.
+- `rocm serve` accepts `--gpu auto|<index>` to pick the AMD GPU. `auto` (default) prefers a GPU that looks idle from VRAM telemetry (`amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is absent) and is not already used by another rocm-cli server (managed or foreground), falling back to the GPU with the most free memory; a single index pins one GPU. Serving one model across multiple GPUs is not supported. Always use `gpu_required`; a busy, unavailable, or invalid GPU must fail without CPU fallback.
 - Which engines actually run on the user's machine is stated in the host facts the CLI appends to this prompt. Answer from those facts; do not assume a platform. Never suggest CPU fallback.
+- On native Windows, vLLM serving/install live checks are skipped; tell the user to use WSL/Linux for that ROCm GPU engine and do not suggest CPU fallback.
 
 ## ComfyUI
 

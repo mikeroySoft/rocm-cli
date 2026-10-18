@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::examine::{AMDGPU_INSTALL_MARKERS, extract_rocm_version};
-use crate::{OPTIONAL_COMMAND_TIMEOUT, capture_optional_path_command_with_env};
+use crate::host_gpu::{OPTIONAL_COMMAND_TIMEOUT, capture_optional_path_command_with_env};
 
 /// Environment variables that name a system ROCm root, in precedence order.
 const SYSTEM_ROCM_ENV_VARS: &[&str] = &["ROCM_PATH", "ROCM_HOME", "HIP_PATH"];
