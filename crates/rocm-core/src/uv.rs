@@ -655,17 +655,19 @@ fn uv_download_url(version: &str, asset: &str) -> String {
 fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
     // System `tar` handles both `.tar.gz` (-xf auto-detects gzip) and `.zip` (bsdtar on
     // Windows 10+), avoiding extra archive crates in rocm-core.
-    let status = Command::new("tar")
+    let output = Command::new("tar")
         .arg("-xf")
         .arg(archive_path)
         .arg("-C")
         .arg(target_dir)
-        .status()
+        .output()
         .with_context(|| format!("failed to launch tar to extract {}", archive_path.display()))?;
-    if !status.success() {
+    if !output.status.success() {
         bail!(
-            "tar exited with {status} while extracting {}",
-            archive_path.display()
+            "tar exited with {} while extracting {}: {}",
+            output.status,
+            archive_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
@@ -1214,6 +1216,19 @@ All installed packages are compatible
             "tar failed to build the fixture: {status}"
         );
         Ok(std::fs::read(&archive)?)
+    }
+
+    /// tar's own diagnosis belongs in the error, not on the inherited stderr:
+    /// written there it bypasses the caller (and the test harness capture), and
+    /// it carries member names verbatim, non-UTF-8 bytes included.
+    #[test]
+    fn a_failed_extraction_reports_what_tar_said() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("garbage.tar.gz");
+        std::fs::write(&archive, b"not an archive").unwrap();
+        let error = format!("{:#}", extract_archive(&archive, root.path()).unwrap_err());
+        // GNU tar prefixes its diagnostics `tar:`, Windows' bsdtar `tar.exe:`.
+        assert!(error.contains("tar:") || error.contains("tar.exe:"), "{error}");
     }
 
     // Unix-only: the fake `uv` is a shell script, and Windows can only run a real
