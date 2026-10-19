@@ -1228,7 +1228,10 @@ All installed packages are compatible
         std::fs::write(&archive, b"not an archive").unwrap();
         let error = format!("{:#}", extract_archive(&archive, root.path()).unwrap_err());
         // GNU tar prefixes its diagnostics `tar:`, Windows' bsdtar `tar.exe:`.
-        assert!(error.contains("tar:") || error.contains("tar.exe:"), "{error}");
+        assert!(
+            error.contains("tar:") || error.contains("tar.exe:"),
+            "{error}"
+        );
     }
 
     // Unix-only: the fake `uv` is a shell script, and Windows can only run a real
