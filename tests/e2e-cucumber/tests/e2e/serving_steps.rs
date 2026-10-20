@@ -1311,6 +1311,15 @@ async fn assert_full_model_name(world: &mut E2eWorld) {
     );
 }
 
+#[then("Ornith appears in the model list")]
+async fn assert_ornith_in_model_list(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no CLI output");
+    assert!(
+        output.contains("ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M"),
+        "Ornith missing from model list:\n{output}"
+    );
+}
+
 #[then("the model list output contains only ASCII characters")]
 async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no CLI output");

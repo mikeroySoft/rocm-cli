@@ -435,7 +435,7 @@ impl TuiSession {
     /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
-    fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+    pub fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
         let size = PtySize {
             rows,
             cols,
