@@ -63,16 +63,18 @@ const FOREGROUND_BACKEND_FIXTURE_DIR_ENV: &str = "ROCM_E2E_FOREGROUND_BACKEND_FI
 
 /// Test-only process fixture for the foreground lifecycle scenarios.
 ///
-/// Production builds always return `None`; hook-enabled E2E builds use the
-/// directory for a backend PID handoff and an attach-ready barrier.
+/// Hook-enabled Linux E2E builds use the directory for a backend PID handoff
+/// and an attach-ready barrier.
+#[cfg(all(feature = "e2e-test-hooks", unix))]
 pub(crate) fn foreground_backend_fixture_dir() -> Option<PathBuf> {
-    #[cfg(all(feature = "e2e-test-hooks", unix))]
-    {
-        return std::env::var_os(FOREGROUND_BACKEND_FIXTURE_DIR_ENV)
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
-    }
-    #[cfg(not(all(feature = "e2e-test-hooks", unix)))]
+    std::env::var_os(FOREGROUND_BACKEND_FIXTURE_DIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Production builds do not provide the foreground lifecycle fixture.
+#[cfg(not(all(feature = "e2e-test-hooks", unix)))]
+pub(crate) const fn foreground_backend_fixture_dir() -> Option<PathBuf> {
     None
 }
 
@@ -933,23 +935,27 @@ impl AttachSignalWatcher {
                     let _ = sender.send(());
                 }
             });
-            return Ok(Self {
+            Ok(Self {
                 receiver,
                 handle,
                 thread: Some(thread),
-            });
+            })
         }
         #[cfg(not(unix))]
-        Ok(Self {})
+        {
+            Ok(Self {})
+        }
     }
 
     fn requested(&self) -> bool {
         #[cfg(unix)]
         {
-            return self.receiver.try_recv().is_ok();
+            self.receiver.try_recv().is_ok()
         }
         #[cfg(not(unix))]
-        false
+        {
+            false
+        }
     }
 }
 
