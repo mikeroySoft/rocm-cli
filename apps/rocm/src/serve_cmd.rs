@@ -669,7 +669,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+        && (std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some()
+            || crate::service_launch::foreground_backend_fixture_dir().is_some());
     if !cpu_only
         && !scripted_backend_failure
         && let Some(usable) = visible_gpu_indices.as_deref()
@@ -733,6 +734,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && crate::service_launch::foreground_backend_fixture_dir().is_none()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }

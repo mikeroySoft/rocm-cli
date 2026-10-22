@@ -56,6 +56,7 @@ yaml-edit = "0.2.3"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1.5"

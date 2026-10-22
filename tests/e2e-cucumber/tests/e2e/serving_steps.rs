@@ -2,6 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1712,5 +1716,285 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         record.get("status").and_then(serde_json::Value::as_str),
         Some("stopped"),
         "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+#[derive(Debug)]
+#[cfg(unix)]
+pub struct ForegroundServeResult {
+    status: std::process::ExitStatus,
+    elapsed: Duration,
+    stdout: String,
+    stderr: String,
+    backend_running: bool,
+    supervisor_running: bool,
+    daemon_running: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ForegroundSignal {
+    KillBackend,
+    StopParent,
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &std::path::Path, deadline: Instant) {
+    while !path.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        path.is_file(),
+        "foreground fixture did not create {} before the deadline",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn read_pid(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid PID in {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+fn first_service_supervisor_pid(world: &E2eWorld) -> u32 {
+    let services = world.app_paths().services_dir();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(&services) {
+            for entry in entries.flatten() {
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                if let Some(pid) = record
+                    .get("supervisor_pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid != 0)
+                {
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground serve did not persist a supervisor PID before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn foreground_daemon_pid(world: &E2eWorld) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = rocm_core::AutomationRuntimeState::load(&world.app_paths())
+            .expect("failed to read automation runtime state")
+            .filter(|state| state.running)
+            .map(|state| state.daemon_pid)
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground serve did not start its daemon before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn run_foreground_signal_scenario(world: &mut E2eWorld, signal: ForegroundSignal) {
+    let fixture_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("foreground-fixture");
+    std::fs::create_dir_all(&fixture_dir).expect("failed to create foreground fixture directory");
+    let backend_pid_path = fixture_dir.join("backend.pid");
+    let attached_path = fixture_dir.join("attached.ready");
+
+    let binary = crate::rocm_binary();
+    let mut command = Command::new(&binary);
+    command.args([
+        "serve",
+        "Qwen3-0.6B-GGUF",
+        "--engine",
+        "lemonade",
+        "--foreground",
+    ]);
+    world.isolate_cmd(&mut command);
+    command.env("ROCM_E2E_FOREGROUND_BACKEND_FIXTURE_DIR", &fixture_dir);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to run {binary}: {error}"));
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_path(&backend_pid_path, ready_deadline);
+    wait_for_path(&attached_path, ready_deadline);
+    let backend_pid = read_pid(&backend_pid_path);
+    let supervisor_pid = first_service_supervisor_pid(world);
+    let daemon_pid = foreground_daemon_pid(world);
+    let backend = rocm_core::ProcessIdentity::capture(backend_pid);
+    let supervisor = rocm_core::ProcessIdentity::capture(supervisor_pid);
+    let daemon = rocm_core::ProcessIdentity::capture(daemon_pid);
+
+    let target = match signal {
+        ForegroundSignal::KillBackend => backend_pid,
+        ForegroundSignal::StopParent => child.id(),
+    };
+    let signal_name = match signal {
+        ForegroundSignal::KillBackend => "KILL",
+        ForegroundSignal::StopParent => "TERM",
+    };
+    let sent = Command::new("kill")
+        .args(["-s", signal_name, &target.to_string()])
+        .status()
+        .expect("failed to run kill");
+    assert!(sent.success(), "failed to signal PID {target}");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll foreground serve") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            break child
+                .wait()
+                .expect("failed to reap timed-out foreground serve");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let elapsed = started.elapsed();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .expect("foreground stdout was not piped")
+        .read_to_string(&mut stdout)
+        .expect("failed to read foreground stdout");
+    child
+        .stderr
+        .take()
+        .expect("foreground stderr was not piped")
+        .read_to_string(&mut stderr)
+        .expect("failed to read foreground stderr");
+
+    let backend_running = matches!(
+        rocm_core::identity_state(&backend),
+        rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+    );
+    let supervisor_running = matches!(
+        rocm_core::identity_state(&supervisor),
+        rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+    );
+    let daemon_running = matches!(
+        rocm_core::identity_state(&daemon),
+        rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+    );
+
+    // A red test must not leak the fixture processes into later scenarios.
+    for identity in [&backend, &supervisor, &daemon] {
+        let _ = rocm_core::terminate_verified(
+            identity,
+            rocm_core::KillScope::Tree,
+            Duration::from_secs(1),
+            true,
+        );
+    }
+
+    world.foreground_serve_result = Some(ForegroundServeResult {
+        status,
+        elapsed,
+        stdout,
+        stderr,
+        backend_running,
+        supervisor_running,
+        daemon_running,
+    });
+}
+
+#[cfg(unix)]
+#[when("a foreground serve backend is killed with SIGKILL")]
+async fn kill_foreground_backend(world: &mut E2eWorld) {
+    run_foreground_signal_scenario(world, ForegroundSignal::KillBackend);
+}
+
+#[cfg(unix)]
+#[when("the user sends SIGTERM to a foreground serve")]
+async fn stop_foreground_parent(world: &mut E2eWorld) {
+    run_foreground_signal_scenario(world, ForegroundSignal::StopParent);
+}
+
+#[cfg(unix)]
+fn foreground_result(world: &E2eWorld) -> &ForegroundServeResult {
+    world
+        .foreground_serve_result
+        .as_ref()
+        .expect("no foreground serve result")
+}
+
+#[cfg(unix)]
+#[then("the foreground serve exits nonzero within a few seconds")]
+async fn assert_foreground_failure(world: &mut E2eWorld) {
+    let result = foreground_result(world);
+    assert!(
+        !result.status.success() && result.elapsed < Duration::from_secs(5),
+        "expected nonzero exit within 5s, got {:?} after {:?}\nstdout:\n{}\nstderr:\n{}",
+        result.status,
+        result.elapsed,
+        result.stdout,
+        result.stderr
+    );
+}
+
+#[cfg(unix)]
+#[then("the foreground serve exits zero within a few seconds")]
+async fn assert_foreground_clean_stop(world: &mut E2eWorld) {
+    let result = foreground_result(world);
+    assert!(
+        result.status.success() && result.elapsed < Duration::from_secs(5),
+        "expected zero exit within 5s, got {:?} after {:?}\nstdout:\n{}\nstderr:\n{}",
+        result.status,
+        result.elapsed,
+        result.stdout,
+        result.stderr
+    );
+}
+
+#[cfg(unix)]
+#[then("the backend SIGKILL is logged")]
+async fn assert_backend_sigkill_logged(world: &mut E2eWorld) {
+    let result = foreground_result(world);
+    let output = format!("{}\n{}", result.stdout, result.stderr);
+    assert!(
+        output.contains("signal: 9 (SIGKILL)"),
+        "expected backend SIGKILL status in output:\n{output}"
+    );
+}
+
+#[cfg(unix)]
+#[then("the foreground serve leaves no backend, supervisor, or daemon process")]
+async fn assert_foreground_processes_cleaned(world: &mut E2eWorld) {
+    let result = foreground_result(world);
+    assert!(
+        !result.backend_running && !result.supervisor_running && !result.daemon_running,
+        "orphan state after foreground exit: backend={} supervisor={} daemon={}\nstdout:\n{}\nstderr:\n{}",
+        result.backend_running,
+        result.supervisor_running,
+        result.daemon_running,
+        result.stdout,
+        result.stderr
     );
 }
