@@ -1938,7 +1938,7 @@ async fn stop_foreground_parent(world: &mut E2eWorld) {
 }
 
 #[cfg(unix)]
-fn foreground_result(world: &E2eWorld) -> &ForegroundServeResult {
+const fn foreground_result(world: &E2eWorld) -> &ForegroundServeResult {
     world
         .foreground_serve_result
         .as_ref()
