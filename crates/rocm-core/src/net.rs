@@ -45,17 +45,23 @@ pub fn format_http_base_url(host: &str, port: u16) -> String {
 
 pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
     let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
-    let authority = without_scheme.split('/').next()?.trim();
-    if authority.is_empty() {
+    let authority = without_scheme.split(['/', '?']).next()?.trim();
+    if authority.is_empty() || authority.contains('@') {
         return None;
     }
     if let Some(rest) = authority.strip_prefix('[') {
         let end = rest.find(']')?;
-        let host = rest[..end].to_owned();
+        let host = &rest[..end];
+        if host.is_empty() {
+            return None;
+        }
         let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some((host, port));
+        return Some((host.to_owned(), port));
     }
     let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
     Some((host.to_owned(), port.parse().ok()?))
 }
 
@@ -1083,6 +1089,33 @@ mod tests {
 
     use crate::test_support::{probe_test_record, workspace_test_artifact_dir};
     use std::io::{Read, Write};
+
+    #[test]
+    fn http_endpoint_parser_validates_authority_and_accepts_query() {
+        let cases = [
+            ("http://:8000/v1", None),
+            ("http://[]:8000", None),
+            ("http://user@host:80", None),
+            ("http://::1:8000", None),
+            (
+                "http://localhost:8000?x=1",
+                Some(("localhost".to_owned(), 8000)),
+            ),
+            (
+                "http://127.0.0.1:8000/v1",
+                Some(("127.0.0.1".to_owned(), 8000)),
+            ),
+            ("http://[::1]:11435/v1", Some(("::1".to_owned(), 11435))),
+        ];
+
+        for (endpoint, expected) in cases {
+            assert_eq!(
+                parse_http_endpoint(endpoint),
+                expected,
+                "endpoint: {endpoint}"
+            );
+        }
+    }
 
     #[test]
     fn openai_models_endpoint_has_model_checks_loaded_model_ids() -> Result<()> {
