@@ -244,7 +244,7 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
+const fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
@@ -297,6 +297,6 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<()> {
+const fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }

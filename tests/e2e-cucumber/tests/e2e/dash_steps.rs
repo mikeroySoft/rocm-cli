@@ -2134,16 +2134,20 @@ async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
 /// past `plan_gpu_rows`'s full-panel threshold at this height (that would need
 /// the GPU sub-panel's own area north of 65 rows), so this lands solidly in
 /// its compact one-line-per-GPU layout — the regime `gpu_compact_line` draws.
-/// `grow_rows` keeps the standard 80-column width, comfortably over the 54
-/// columns `gpu_compact_line`'s own truncation budget needs to keep the vram
-/// segment on the line (`gpu_compact_line_vram_truncation_threshold` pins
-/// that exact 54 in `hardware.rs`).
+/// The hardware panel gives the GPU column 3/5 of the width (the CPU cores
+/// column takes the rest), so the terminal must be wide enough that the GPU
+/// column's inner width clears the 54 columns `gpu_compact_line`'s truncation
+/// budget needs to keep the vram segment on the line
+/// (`gpu_compact_line_vram_truncation_threshold` pins that exact 54 in
+/// `hardware.rs`). At the standard 80 columns that column is ~48 wide and the
+/// vram segment is (correctly) dropped, so the row would never show units.
 const GPU_COMPACT_ROWS: u16 = 70;
+const GPU_COMPACT_COLS: u16 = 120;
 
 #[when("the user grows the terminal until the GPU section shows compact rows")]
 async fn grow_for_gpu_compact_rows(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.grow_rows(GPU_COMPACT_ROWS)
+    tui.resize_to(GPU_COMPACT_ROWS, GPU_COMPACT_COLS)
         .unwrap_or_else(|e| panic!("failed to resize the terminal: {e}"));
     // The demo replay's GPU telemetry lands asynchronously, same as the
     // instance table `open_instance_detail` waits on above; wait for a GPU
