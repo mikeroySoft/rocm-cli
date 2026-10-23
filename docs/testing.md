@@ -622,7 +622,8 @@ python scripts/comfyui_therock_gpu_test.py --generate-cat --output-dir .rocm-wor
 ```
 
 The live test uses `rocm comfyui install`, `rocm comfyui start`, `rocm comfyui
-status`, `rocm comfyui logs`, and `rocm comfyui stop`. It starts ComfyUI with
+status`, `rocm comfyui logs`, and `rocm comfyui stop`. The logs command accepts
+`--lines` values from 1 through 400. It starts ComfyUI with
 `--no-open-browser`, waits for `/system_stats`, verifies that
 `rocm comfyui status` says `status: running`, and stops the process it started
 unless `--keep-running` is set.
