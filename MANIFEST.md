@@ -254,7 +254,7 @@ repository.
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 |
-| jsonc-parser | 0.33.1 | MIT |
+| jsonc-parser | 0.33.2 | MIT |
 | junit-report | 0.9.0 | MIT |
 | kasuari | 0.4.12 | MIT OR Apache-2.0 |
 | keyring-core | 1.0.0 | MIT OR Apache-2.0 |
