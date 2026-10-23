@@ -20,15 +20,18 @@ use tracing::warn;
 
 const KEY_RUNNING: &str = "vllm:num_requests_running";
 const KEY_WAITING: &str = "vllm:num_requests_waiting";
-const KEY_KV_CACHE: &str = "vllm:gpu_cache_usage_perc";
+const KEY_KV_CACHE: &str = "vllm:kv_cache_usage_perc";
+const KEY_KV_CACHE_LEGACY: &str = "vllm:gpu_cache_usage_perc";
 const KEY_GEN_TOKENS: &str = "vllm:generation_tokens_total";
 // TTFT / TPOT latency histograms. We read the cumulative `_sum` (seconds) and
 // `_count` series; the runner windows successive readings into an average ms
 // (Δsum/Δcount), mirroring the `generation_tokens_total` → `gen_tps` path.
 const KEY_TTFT_SUM: &str = "vllm:time_to_first_token_seconds_sum";
 const KEY_TTFT_COUNT: &str = "vllm:time_to_first_token_seconds_count";
-const KEY_TPOT_SUM: &str = "vllm:time_per_output_token_seconds_sum";
-const KEY_TPOT_COUNT: &str = "vllm:time_per_output_token_seconds_count";
+const KEY_TPOT_SUM: &str = "vllm:inter_token_latency_seconds_sum";
+const KEY_TPOT_COUNT: &str = "vllm:inter_token_latency_seconds_count";
+const KEY_TPOT_SUM_LEGACY: &str = "vllm:time_per_output_token_seconds_sum";
+const KEY_TPOT_COUNT_LEGACY: &str = "vllm:time_per_output_token_seconds_count";
 
 #[derive(Debug, Clone)]
 pub struct VllmPrometheusCollector {
@@ -100,14 +103,16 @@ pub(crate) fn parse(text: &str) -> InstanceSample {
     let running = extract(text, KEY_RUNNING).map(|v| v.round() as u32);
     let waiting = extract(text, KEY_WAITING).map(|v| v.round() as u32);
     // vLLM reports kv-cache as 0..1; expose 0..100 to match the TUI's convention.
-    let kv = extract(text, KEY_KV_CACHE).map(|v| (v * 100.0) as f32);
+    let kv = extract(text, KEY_KV_CACHE)
+        .or_else(|| extract(text, KEY_KV_CACHE_LEGACY))
+        .map(|v| (v * 100.0) as f32);
     // Cumulative output-token counter; the runner differences it into a rate.
     let gen_tokens_total = extract(text, KEY_GEN_TOKENS);
     // Cumulative latency histograms; the runner windows them into avg ms.
     let ttft_sum_s = extract(text, KEY_TTFT_SUM);
     let ttft_count = extract(text, KEY_TTFT_COUNT);
-    let tpot_sum_s = extract(text, KEY_TPOT_SUM);
-    let tpot_count = extract(text, KEY_TPOT_COUNT);
+    let tpot_sum_s = extract(text, KEY_TPOT_SUM).or_else(|| extract(text, KEY_TPOT_SUM_LEGACY));
+    let tpot_count = extract(text, KEY_TPOT_COUNT).or_else(|| extract(text, KEY_TPOT_COUNT_LEGACY));
     if running.is_none() && waiting.is_none() && kv.is_none() && gen_tokens_total.is_none() {
         warn!("vllm metrics payload had none of the expected keys");
     }
@@ -184,6 +189,39 @@ vllm:time_to_first_token_seconds_bucket{model=\"deepseek-r1\",le=\"0.1\"} 5.0
 vllm:time_per_output_token_seconds_sum{model=\"deepseek-r1\"} 30.0
 vllm:time_per_output_token_seconds_count{model=\"deepseek-r1\"} 1500.0
 ";
+
+    const MODERN_SAMPLE: &str = "\
+# HELP vllm:kv_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model=\"deepseek-r1\"} 0.4231
+# HELP vllm:inter_token_latency_seconds Histogram of time between output tokens.
+# TYPE vllm:inter_token_latency_seconds histogram
+vllm:inter_token_latency_seconds_sum{model=\"deepseek-r1\"} 30.0
+vllm:inter_token_latency_seconds_count{model=\"deepseek-r1\"} 1500.0
+";
+
+    #[test]
+    fn parses_modern_kv_cache_and_tpot_metrics() {
+        let s = parse(MODERN_SAMPLE);
+        let kv = s.kv_cache_usage_pct.unwrap();
+        assert!((kv - 42.31).abs() < 0.01, "kv was {kv}");
+        assert_eq!(s.tpot_sum_s, Some(30.0));
+        assert_eq!(s.tpot_count, Some(1500.0));
+    }
+
+    #[test]
+    fn modern_metric_names_take_precedence_over_legacy_names() {
+        let text = format!(
+            "{MODERN_SAMPLE}vllm:gpu_cache_usage_perc 0.1\n\
+             vllm:time_per_output_token_seconds_sum 10.0\n\
+             vllm:time_per_output_token_seconds_count 500.0\n"
+        );
+        let s = parse(&text);
+        let kv = s.kv_cache_usage_pct.unwrap();
+        assert!((kv - 42.31).abs() < 0.01, "kv was {kv}");
+        assert_eq!(s.tpot_sum_s, Some(30.0));
+        assert_eq!(s.tpot_count, Some(1500.0));
+    }
 
     #[test]
     fn parses_full_sample() {
