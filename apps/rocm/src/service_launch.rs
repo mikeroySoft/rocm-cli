@@ -1358,6 +1358,223 @@ mod tests {
         Ok(())
     }
 
+    // These tests exercise real Linux child ownership without a GPU. The
+    // CLI-level SIGKILL and user-signal contract is covered by serve-27/28.
+    #[cfg(target_os = "linux")]
+    mod attached_lifecycle {
+        use std::process::Command;
+
+        use super::*;
+
+        struct TestChild(Child);
+
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn sleeping_child() -> Result<TestChild> {
+            Ok(TestChild(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            ))
+        }
+
+        fn queued_stop_watcher() -> Result<AttachSignalWatcher> {
+            let signals = signal_hook::iterator::Signals::new([] as [i32; 0])?;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender.send(())?;
+            Ok(AttachSignalWatcher {
+                receiver,
+                handle: signals.handle(),
+                thread: None,
+            })
+        }
+
+        #[test]
+        fn retained_supervisor_is_reaped_and_reports_its_exit_status() -> Result<()> {
+            for code in [0, 23] {
+                let mut child = TestChild(
+                    Command::new("sh")
+                        .args(["-c", &format!("exit {code}")])
+                        .spawn()?,
+                );
+                let pid = child.0.id();
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let status = loop {
+                    if let Some(AttachOutcome::ServerExited(Some(status))) =
+                        attached_process_exit(Some(&mut child.0), pid)?
+                    {
+                        break status;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "child was not reaped");
+                    thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(code));
+                assert!(!process_is_running(pid), "child must not remain a zombie");
+                assert_eq!(child.0.wait()?, status);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn live_supervisor_does_not_end_the_attachment() -> Result<()> {
+            let mut child = sleeping_child()?;
+            let pid = child.0.id();
+            assert_eq!(attached_process_exit(Some(&mut child.0), pid)?, None);
+            assert_eq!(attached_process_exit(None, pid)?, None);
+            assert_eq!(
+                attached_process_exit(None, 0)?,
+                Some(AttachOutcome::ServerExited(None))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn non_tty_stream_distinguishes_a_user_stop_from_a_child_exit() -> Result<()> {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let root = tempfile::tempdir()?;
+            let log_path = root.path().join("engine.log");
+            let mut child = sleeping_child()?;
+            let pid = child.0.id();
+            let watcher = queued_stop_watcher()?;
+            assert_eq!(
+                stream_attached_logs_no_tty(&log_path, pid, Some(&mut child.0), &watcher)?,
+                AttachOutcome::Stop
+            );
+            assert!(
+                child.0.try_wait()?.is_none(),
+                "streaming returns the decision; the caller owns cleanup"
+            );
+            assert!(!watcher.requested(), "the stop request must be consumed");
+
+            let watcher = AttachSignalWatcher::new()?;
+            assert!(!watcher.requested());
+            child.0.kill()?;
+            child.0.wait()?;
+            let outcome =
+                stream_attached_logs_no_tty(&log_path, pid, Some(&mut child.0), &watcher)?;
+            let AttachOutcome::ServerExited(Some(status)) = outcome else {
+                panic!("unexpected child exit must not be a clean stop: {outcome:?}");
+            };
+            assert_eq!(status.signal(), Some(9));
+            Ok(())
+        }
+
+        #[test]
+        fn log_drain_retries_a_missing_file_and_reads_appended_final_lines() -> Result<()> {
+            use std::io::{Seek as _, Write as _};
+
+            let root = tempfile::tempdir()?;
+            let log_path = root.path().join("engine.log");
+            let mut reader = None;
+            let mut stdout = io::stdout();
+            let mut line = String::new();
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, false);
+            assert!(reader.is_none());
+
+            fs::write(&log_path, "backend started\n")?;
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, true);
+            assert_eq!(
+                reader.as_mut().expect("opened log").stream_position()?,
+                fs::metadata(&log_path)?.len()
+            );
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&log_path)?,
+                "backend exited with signal: 9 (SIGKILL)"
+            )?;
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, false);
+            assert_eq!(
+                reader.as_mut().expect("retained log").stream_position()?,
+                fs::metadata(&log_path)?.len(),
+                "the final drain must read past the previous EOF"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_reaps_a_live_supervisor_and_stops_its_owned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-live");
+            paths.ensure()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let pid = child.0.id();
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+            let result = stop_attached_service(
+                &paths,
+                "missing-service",
+                pid,
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            );
+            let _ = fs::remove_dir_all(root);
+            result?;
+            assert!(!child.0.wait()?.success());
+            assert!(!daemon.0.wait()?.success());
+            assert!(!process_is_running(pid));
+            assert!(!process_is_running(daemon_identity.pid));
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_accepts_an_already_exited_supervisor_and_no_owned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-exited");
+            paths.ensure()?;
+            let mut child = TestChild(Command::new("true").spawn()?);
+            let pid = child.0.id();
+            assert!(child.0.wait()?.success());
+            let service_id = "foreground-exited";
+            ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "lemonade",
+                "fixture",
+                "fixture",
+                "127.0.0.1",
+                0, // No endpoint exists; cleanup must still persist the stop.
+                "managed",
+                pid,
+                None,
+                None,
+                None,
+            )
+            .write()?;
+            let result = stop_attached_service(&paths, service_id, pid, Some(&mut child.0), None);
+            result?;
+            let record = crate::load_managed_service(&paths, service_id)?;
+            let _ = fs::remove_dir_all(root);
+            assert_eq!(record.status, "stopped");
+            assert_eq!(record.stop_requested_unix_ms, None);
+            assert!(!process_is_running(pid));
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_without_a_child_handle_preserves_an_unowned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-no-handle");
+            paths.ensure()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let result = stop_attached_service(&paths, "missing-service", child.0.id(), None, None);
+            let _ = fs::remove_dir_all(root);
+            result?;
+            assert!(!child.0.wait()?.success());
+            assert!(!process_is_running(child.0.id()));
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon this invocation did not start must survive"
+            );
+            Ok(())
+        }
+    }
+
     #[test]
     fn serve_bind_validation_requires_public_ack() {
         validate_bind_host("127.0.0.1", false).unwrap();
