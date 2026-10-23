@@ -220,9 +220,13 @@ pub(crate) fn parse_optional_lines(args: &[String]) -> Result<usize> {
     while index < args.len() {
         if matches!(args[index].as_str(), "--lines" | "-n") {
             let value = args.get(index + 1).context("lines flag requires a value")?;
-            return value
+            let lines = value
                 .parse::<usize>()
-                .context("lines flag must be a positive number");
+                .context("lines flag must be a positive number")?;
+            if lines == 0 {
+                bail!("lines flag must be a positive number");
+            }
+            return Ok(lines);
         }
         index += 1;
     }
@@ -3714,10 +3718,7 @@ pub(crate) fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -
             if command.eq_ignore_ascii_case("comfyui")
                 && matches!(subcommand.to_ascii_lowercase().as_str(), "logs" | "log") =>
         {
-            comfyui::render_logs(
-                paths,
-                parse_optional_lines(rest).unwrap_or(DEFAULT_LOG_TAIL_LINES),
-            )
+            comfyui::render_logs(paths, parse_optional_lines(rest)?)
         }
         [command, rest @ ..]
             if command.eq_ignore_ascii_case("update")
@@ -4337,6 +4338,24 @@ mod tests {
     #[test]
     fn parse_optional_lines_rejects_a_non_numeric_value() {
         assert!(parse_optional_lines(&["--lines".to_owned(), "nope".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_optional_lines_rejects_zero() {
+        assert!(parse_optional_lines(&["--lines".to_owned(), "0".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn comfyui_logs_read_only_path_propagates_an_invalid_line_count() {
+        let (_root, paths) = test_paths("comfyui-logs-invalid-lines");
+        let args = vec![
+            "comfyui".to_owned(),
+            "logs".to_owned(),
+            "--lines".to_owned(),
+            "nope".to_owned(),
+        ];
+
+        assert!(run_rocm_read_only_in_process(&paths, &args).is_err());
     }
 
     #[test]

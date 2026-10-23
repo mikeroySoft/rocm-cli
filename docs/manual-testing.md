@@ -582,6 +582,7 @@ show the URL to open:
 rocm comfyui install --yes
 rocm comfyui start --yes --port 18188
 rocm comfyui status
+rocm comfyui logs --lines 80
 rocm comfyui stop --yes
 ```
 
@@ -590,6 +591,7 @@ Expected result:
 - ComfyUI installs without replacing the managed ROCm GPU package stack.
 - The server starts on `http://127.0.0.1:18188`.
 - Status shows the local URL and current state.
+- Logs accepts line counts from 1 through 400 and rejects 0 or 401.
 - Stop shuts down the saved process.
 
 Reinstall over a used install. Put a file in the folder `rocm comfyui

@@ -1000,6 +1000,16 @@ enum StorageCommand {
     },
 }
 
+fn parse_comfyui_log_lines(value: &str) -> Result<usize, String> {
+    let lines = value
+        .parse::<usize>()
+        .map_err(|_| "line count must be in the range 1..=400".to_owned())?;
+    if !(1..=400).contains(&lines) {
+        return Err("line count must be in the range 1..=400".to_owned());
+    }
+    Ok(lines)
+}
+
 #[derive(Subcommand, Debug)]
 enum ComfyuiCommand {
     /// Show whether ComfyUI is installed or running.
@@ -1009,8 +1019,12 @@ enum ComfyuiCommand {
     ModelsPath,
     /// Show recent ComfyUI logs.
     Logs {
-        /// Number of recent log lines to show.
-        #[arg(long, default_value_t = 80)]
+        /// Number of recent log lines to show (1..=400).
+        #[arg(
+            long,
+            default_value_t = 80,
+            value_parser = parse_comfyui_log_lines
+        )]
         lines: usize,
     },
     /// Install ComfyUI into ROCm CLI's app folder.
@@ -17079,8 +17093,16 @@ pub(crate) mod tests {
         Cli::try_parse_from(["rocm", "setup", "reset"]).expect("setup reset should parse");
         Cli::try_parse_from(["rocm", "models"]).expect("models alias should parse");
         Cli::try_parse_from(["rocm", "comfyui", "status"]).expect("comfyui status should parse");
-        Cli::try_parse_from(["rocm", "comfyui", "logs", "--lines", "3"])
-            .expect("comfyui logs should parse");
+        for lines in ["1", "400"] {
+            Cli::try_parse_from(["rocm", "comfyui", "logs", "--lines", lines])
+                .expect("comfyui logs should accept the documented line-count bounds");
+        }
+        for lines in ["0", "401"] {
+            assert!(
+                Cli::try_parse_from(["rocm", "comfyui", "logs", "--lines", lines]).is_err(),
+                "comfyui logs should reject an out-of-range line count: {lines}"
+            );
+        }
         Cli::try_parse_from(["rocm", "comfyui", "stop"]).expect("comfyui stop should parse");
         Cli::try_parse_from(["rocm", "comfy", "logs"]).expect("comfy alias should parse");
     }

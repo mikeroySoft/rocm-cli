@@ -965,7 +965,7 @@ rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run] [--yes]
 rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser] [--yes]
 rocm comfyui stop       [--yes]
 rocm comfyui status
-rocm comfyui logs       [--lines N]
+rocm comfyui logs       [--lines N]  # N must be 1..=400
 rocm comfyui models-path
 ```
 
