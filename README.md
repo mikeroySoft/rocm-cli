@@ -476,10 +476,20 @@ rather than resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
 `rocm examine` to see the arch this machine reports.
 
-For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
-torchaudio from their published dependency metadata, then validates that every
-selected framework package carries the same ROCm build identifier before it
-creates or changes a managed runtime.
+For ROCm 10, `install sdk` pins torchaudio itself, because its metadata names no
+ROCm build. When a torchaudio release has been verified on hardware for the
+requested ROCm line (the exact torchaudio the vLLM ROCm 10.x install pins for
+that line, where it pins one rather than a series), it pins that build.
+Otherwise, or when that build isn't published for the requested ROCm version on
+this Python and platform, it pins the newest build published for that ROCm
+version, and the `torchaudio_selection:` line in the plan says that build isn't
+hardware-verified, as a `Note:` in a real install's log does. Newest isn't
+always right: the index has published a CPU-only torchaudio under the same
+`+rocm` label as working builds. It stops with an error when the requested
+version publishes no torchaudio for this Python and platform. It then asks `uv`
+to resolve Torch and torchvision from their published dependency metadata
+alongside it, and validates that every selected framework package carries the
+same ROCm build identifier before it creates or changes a managed runtime.
 
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
 `install sdk` resolves the same release and nightly sources as before. It doesn't
@@ -872,7 +882,13 @@ rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--to
 Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
 omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
 controls forwarded to the request; each is independent, so omit any of them to
-use the provider's default.
+use the provider's default. In the interactive chat session (run from a
+terminal with no `--prompt` and no piped stdin), if no local engine is
+reachable and no API key/URL is configured, chat falls back to the no-key
+ChatGPT OAuth sign-in; that backend logs a warning and ignores all three flags
+(an upstream rig-core limitation, not something rocm-cli can forward around —
+see [#664](https://github.com/ROCm/rocm-cli/issues/664)). The non-interactive
+`--prompt`/piped-stdin path never reaches this fallback.
 
 ### Agent harnesses
 
