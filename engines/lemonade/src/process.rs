@@ -5,7 +5,8 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, RocmCliConfig, active_runtime_environment, format_http_base_url,
-    http_get_text_with_auth, prepend_runtime_paths, runtime_is_linux, runtime_is_windows,
+    http_get_text_with_auth, parse_http_endpoint, prepend_runtime_paths, runtime_is_linux,
+    runtime_is_windows,
 };
 use rocm_engine_protocol::EngineRecipeHint;
 use serde_json::{Value, json};
@@ -21,8 +22,8 @@ use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
 use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
 use crate::state::{
-    MAX_TAIL_READ, mark_json_status, merge_json_state, parse_http_endpoint,
-    resolve_lemonade_model_ref, terminate_pid, write_running_state,
+    MAX_TAIL_READ, mark_json_status, merge_json_state, resolve_lemonade_model_ref, terminate_pid,
+    write_running_state,
 };
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 

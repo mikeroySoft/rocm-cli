@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
     RocmCliConfig, append_audit_event, connect_tcp_stream, format_host_port,
-    managed_service_endpoint_readiness, read_http_response_bounded, unix_time_millis,
-    write_all_tcp_stream,
+    managed_service_endpoint_readiness, parse_http_endpoint, read_http_response_bounded,
+    unix_time_millis, write_all_tcp_stream,
 };
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -809,22 +809,6 @@ fn read_chunked_sse_body<R: BufRead>(
         }
     }
     Ok(())
-}
-
-fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
-    let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
-    let authority = without_scheme.split('/').next()?.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_owned();
-        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some((host, port));
-    }
-    let (host, port) = authority.rsplit_once(':')?;
-    Some((host.to_owned(), port.parse().ok()?))
 }
 
 #[cfg(test)]
