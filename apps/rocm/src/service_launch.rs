@@ -909,10 +909,9 @@ fn autostart_spawn_in_flight(
 
 /// A temporary SIGINT/SIGTERM listener for one attached serve.
 ///
-/// `signal-hook` restores its registrations when the handle closes, unlike a
-/// process-global handler that would leave later commands swallowing signals.
+/// Closing the handle removes this listener, but `signal-hook` does not restore
+/// the default signal action. The attached serve exits after cleanup.
 struct AttachSignalWatcher {
-    #[cfg(unix)]
     receiver: std::sync::mpsc::Receiver<()>,
     #[cfg(unix)]
     handle: signal_hook::iterator::Handle,
@@ -922,6 +921,7 @@ struct AttachSignalWatcher {
 
 impl AttachSignalWatcher {
     fn new() -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel();
         #[cfg(unix)]
         {
             use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -929,7 +929,6 @@ impl AttachSignalWatcher {
             let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
                 .context("failed to register foreground serve signal handlers")?;
             let handle = signals.handle();
-            let (sender, receiver) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
                 for _ in signals.forever() {
                     let _ = sender.send(());
@@ -943,19 +942,15 @@ impl AttachSignalWatcher {
         }
         #[cfg(not(unix))]
         {
-            Ok(Self {})
+            // No Unix signals on Windows. A disconnected receiver reports no
+            // request while keeping the polling interface platform-independent.
+            drop(sender);
+            Ok(Self { receiver })
         }
     }
 
     fn requested(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.receiver.try_recv().is_ok()
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        self.receiver.try_recv().is_ok()
     }
 }
 
@@ -1353,6 +1348,15 @@ fn stream_attached_logs_no_tty(
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_signal_watcher_does_not_request_a_stop() -> Result<()> {
+        let watcher = AttachSignalWatcher::new()?;
+        assert!(!watcher.requested());
+        assert!(!watcher.requested());
+        Ok(())
+    }
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {
