@@ -12230,6 +12230,8 @@ pub(crate) mod tests {
             .render_long_help()
             .to_string();
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `@id:update-report-distinguishes-feed-status` proves the CLI update
+        // feed is not configured; these assertions only pin the help wording.
         assert!(
             flat.contains("--apply installs runtime updates only"),
             "`rocm update --help` must state --apply installs runtime updates only:\n{help}"
