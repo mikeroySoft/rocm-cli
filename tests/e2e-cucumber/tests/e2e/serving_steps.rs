@@ -1832,8 +1832,10 @@ fn run_foreground_signal_scenario(world: &mut E2eWorld, signal: ForegroundSignal
     ]);
     world.isolate_cmd(&mut command);
     command.env("ROCM_E2E_FOREGROUND_BACKEND_FIXTURE_DIR", &fixture_dir);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let started = Instant::now();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to run {binary}: {error}"));
@@ -1861,6 +1863,7 @@ fn run_foreground_signal_scenario(world: &mut E2eWorld, signal: ForegroundSignal
         .status()
         .expect("failed to run kill");
     assert!(sent.success(), "failed to signal PID {target}");
+    let started = Instant::now();
 
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
