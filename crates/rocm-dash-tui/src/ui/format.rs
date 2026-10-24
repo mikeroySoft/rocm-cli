@@ -112,15 +112,15 @@ pub fn pct_opt(value: Option<f32>) -> String {
 /// Below 1000 returns the raw integer with no suffix.
 pub fn si(value: f64) -> String {
     let av = value.abs();
-    if av < 1_000.0 {
+    if (av * 10.0).round() < 10_000.0 {
         if value.fract() == 0.0 {
             format!("{}", value as i64)
         } else {
             format!("{value:.1}")
         }
-    } else if av < 1_000_000.0 {
+    } else if (av / 1_000.0 * 100.0).round() < 100_000.0 {
         format!("{:.2} k", value / 1_000.0)
-    } else if av < 1_000_000_000.0 {
+    } else if (av / 1_000_000.0 * 100.0).round() < 100_000.0 {
         format!("{:.2} M", value / 1_000_000.0)
     } else {
         format!("{:.2} B", value / 1_000_000_000.0)
@@ -143,7 +143,7 @@ pub fn bps(value: f64) -> String {
 /// Token throughput. `123.4 tok/s`, `1.23 k tok/s`. `-` when None.
 pub fn tps_opt(value: Option<f64>) -> String {
     match value {
-        Some(v) if v >= 1_000.0 => format!("{} tok/s", si(v)),
+        Some(v) if (v.abs() * 10.0).round() >= 10_000.0 => format!("{} tok/s", si(v)),
         Some(v) => format!("{v:.1} tok/s"),
         None => "-".to_string(),
     }
@@ -525,8 +525,12 @@ mod tests {
         assert_eq!(si(0.0), "0");
         assert_eq!(si(123.0), "123");
         assert_eq!(si(999.0), "999");
+        assert_eq!(si(999.96), "1.00 k");
         assert_eq!(si(1234.0), "1.23 k");
+        assert_eq!(si(999_995.0), "1.00 M");
+        assert_eq!(si(999_999.0), "1.00 M");
         assert_eq!(si(1_234_567.0), "1.23 M");
+        assert_eq!(si(999_999_999.0), "1.00 B");
         assert_eq!(si(2_500_000_000.0), "2.50 B");
     }
 
@@ -535,6 +539,7 @@ mod tests {
         assert_eq!(bps(0.0), "0/s");
         assert_eq!(bps(512.0), "512/s");
         assert!(bps(512.0).contains("/s"));
+        assert_eq!(bps(999_999.0), "1.00 M/s");
         assert_eq!(bps(1_200_000.0), "1.20 M/s");
         assert!(bps(1_200_000.0).contains("M/s"));
         assert_eq!(bps(2_500.0), "2.50 k/s");
@@ -547,7 +552,10 @@ mod tests {
     fn tps_opt_promotes_at_thousand() {
         assert_eq!(tps_opt(None), "-");
         assert_eq!(tps_opt(Some(45.6)), "45.6 tok/s");
+        assert_eq!(tps_opt(Some(999.96)), "1.00 k tok/s");
+        assert_eq!(tps_opt(Some(-999.96)), "-1.00 k tok/s");
         assert_eq!(tps_opt(Some(1500.0)), "1.50 k tok/s");
+        assert_eq!(tps_opt(Some(999_999.0)), "1.00 M tok/s");
     }
 
     #[test]
