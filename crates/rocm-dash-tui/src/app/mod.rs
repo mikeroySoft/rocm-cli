@@ -64,7 +64,6 @@ pub const HISTORY_CAP: usize = 240;
 /// How many benchmark rows to keep client-side for the bench panel.
 pub const BENCH_CAP: usize = 200;
 
-
 pub struct AppState {
     pub connect: String,
     pub conn: ConnState,
@@ -1540,7 +1539,6 @@ impl AppState {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
