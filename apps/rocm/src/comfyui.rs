@@ -2737,7 +2737,7 @@ mod tests {
         let paths = test_paths("comfyui-stale-state");
         let logs = app_root(&paths).join("logs");
         fs::create_dir_all(&logs)?;
-        let port = 0;
+        let port = unused_local_port()?;
         save_state(
             &paths,
             &ComfyUiState {
