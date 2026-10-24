@@ -1021,17 +1021,22 @@ fn stop_attached_service(
             .context("failed to reap foreground server supervisor")?;
     }
     if let Some(daemon) = spawned_daemon {
-        let outcome = rocm_core::terminate_verified(
-            daemon,
-            rocm_core::KillScope::Single,
-            Duration::from_secs(3),
-            true,
-        );
-        if !outcome.stopped() {
-            bail!(
-                "failed to clean up foreground serve daemon process {}",
-                daemon.pid
+        let still_needed = crate::load_managed_services(paths)?.iter().any(|record| {
+            record.service_id != service_id && crate::managed_service_is_live(record)
+        }) || rocm_core::RocmCliConfig::load(paths)?.automation_daemon_enabled();
+        if !still_needed {
+            let outcome = rocm_core::terminate_verified(
+                daemon,
+                rocm_core::KillScope::Single,
+                Duration::from_secs(3),
+                true,
             );
+            if !outcome.stopped() {
+                bail!(
+                    "failed to clean up foreground serve daemon process {}",
+                    daemon.pid
+                );
+            }
         }
     }
     Ok(())
@@ -1520,6 +1525,72 @@ mod tests {
             assert!(!daemon.0.wait()?.success());
             assert!(!process_is_running(pid));
             assert!(!process_is_running(daemon_identity.pid));
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_preserves_its_daemon_while_another_service_is_running() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-shared-service");
+            paths.ensure()?;
+            ManagedServiceRecord::new(
+                &paths,
+                "other-service",
+                "lemonade",
+                "fixture",
+                "fixture",
+                "127.0.0.1",
+                0,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            )
+            .write()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+
+            stop_attached_service(
+                &paths,
+                "foreground-service",
+                child.0.id(),
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            )?;
+
+            let _ = fs::remove_dir_all(root);
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon shared with another running service must survive"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_preserves_its_daemon_while_automations_are_enabled() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-automations");
+            paths.ensure()?;
+            let mut config = rocm_core::RocmCliConfig::default();
+            config.automations.daemon_enabled = true;
+            config.save(&paths)?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+
+            stop_attached_service(
+                &paths,
+                "foreground-service",
+                child.0.id(),
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            )?;
+
+            let _ = fs::remove_dir_all(root);
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon running enabled automations must survive"
+            );
             Ok(())
         }
 
