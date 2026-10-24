@@ -617,6 +617,23 @@ Expected result:
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
 
+### 4b. Dashboard Warning Details
+
+On Linux or WSL2, open `rocm dash` with telemetry warnings (or use
+`rocm dash --replay <file>` with a recorded warning snapshot).
+
+- Left-click the header warning count. The modal shows the captured warnings,
+  and later telemetry updates do not replace them.
+- At 80x24, check a snapshot with several wrapped warnings: the modal grows
+  beyond the old fixed share of the body to display all messages when they fit.
+- With more warnings than the body can hold, the title says
+  `truncated — resize`. Enlarge the terminal and confirm the remaining text
+  appears and the marker disappears once everything fits.
+- Escape and Enter each close the modal; reopen it to check both.
+
+The deterministic Linux PTY check is documented in
+[testing.md](testing.md#dashboard-warning-details).
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

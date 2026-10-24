@@ -226,6 +226,11 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
+Click the header's warning count to read the captured warnings. The modal grows
+to fit wrapped messages; if the terminal is too small, its title says
+`truncated — resize`. Resize to see more, or press Escape or Enter to close.
+Telemetry updates do not replace warnings in an open modal.
+
 Live mode reads telemetry over a Unix domain socket, so it requires Linux or
 WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
 GPU or daemon.

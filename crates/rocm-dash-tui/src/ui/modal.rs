@@ -114,9 +114,10 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 }
 
 /// Render warning messages captured when the header badge was clicked.
+///
+/// Size the popup to its wrapped content, using the whole body when needed.
+/// If the content still cannot fit, mark the title so the user can resize.
 pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
-    let popup = centered_rect(70, 60, 100, 24, area);
-    let inner = draw_popup_frame(f, popup, "Warnings · Esc/Enter close", theme);
     let lines = warnings
         .iter()
         .map(|warning| {
@@ -126,7 +127,17 @@ pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &The
             ))
         })
         .collect::<Vec<_>>();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let width = centered_width(70, 100, area);
+    let needed = popup_height_for(p.line_count(width.saturating_sub(2)));
+    let popup = centered_rect(70, 100, 100, needed, area);
+    let inner = draw_popup_frame(
+        f,
+        popup,
+        &help_title("Warnings · Esc/Enter close", needed, popup),
+        theme,
+    );
+    f.render_widget(p, inner);
 }
 
 /// Render the Help modal for the active tab.
@@ -233,7 +244,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     f.render_widget(p, inner);
 }
 
-/// Title for a content-sized help popup, marked when the content did not fit.
+/// Title for a content-sized popup, marked when the content did not fit.
 ///
 /// `needed` is the height the wrapped content asked for; `popup` is what the
 /// area could actually give it. When the popup is shorter, the tail of the
@@ -262,8 +273,8 @@ fn help_title(base: &str, needed: u16, popup: Rect) -> String {
 }
 
 /// Popup height that shows `content_rows` rows of wrapped content: the content
-/// plus the popup's top and bottom border rows. Shared by [`draw_help`] and
-/// [`draw_global_help`] so the two content-sized modals cannot drift apart.
+/// plus the popup's top and bottom border rows. Shared by the content-sized
+/// modals so their geometry cannot drift apart.
 fn popup_height_for(content_rows: usize) -> u16 {
     u16::try_from(content_rows)
         .unwrap_or(u16::MAX)
@@ -922,19 +933,53 @@ mod ported_chrome_tests {
     #[test]
     fn warning_modal_renders_all_messages() {
         let theme = Theme::from_name("default-dark");
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| {
-            draw_warnings(
-                f,
-                f.area(),
-                &["first warning".into(), "second warning".into()],
-                &theme,
+        // The 80x24 dashboard has a 3-row header and 1-row footer. These
+        // warnings wrap to 12 rows: more than the old popup's 10 inner rows,
+        // but comfortably inside the body's 18 available inner rows.
+        let warnings = (1..=6)
+            .map(|n| {
+                format!(
+                    "Warning {n}: telemetry could not read the GPU counters. \
+                     Check the device connection before retrying."
+                )
+            })
+            .collect::<Vec<_>>();
+        let painted = rows(80, 24, |f| {
+            draw_warnings(f, Rect::new(0, 3, 80, 20), &warnings, &theme);
+        });
+        let screen = painted
+            .iter()
+            .map(|row| row.trim_matches(['│', ' ']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        for warning in &warnings {
+            assert!(
+                screen.contains(warning),
+                "warning was cut off: {warning:?}\n{screen}"
             );
-        })
-        .unwrap();
-        let screen = flat(&term);
-        assert!(screen.contains("first warning"));
-        assert!(screen.contains("second warning"));
+        }
+        assert!(!screen.contains("truncated"));
+    }
+
+    #[test]
+    fn warning_modal_marks_truncation_when_messages_cannot_fit() {
+        let theme = Theme::from_name("default-dark");
+        let warnings = (1..=20)
+            .map(|n| format!("Warning {n}: telemetry unavailable"))
+            .collect::<Vec<_>>();
+        let painted = rows(80, 24, |f| {
+            draw_warnings(f, Rect::new(0, 3, 80, 20), &warnings, &theme);
+        });
+        let screen = painted.join("\n");
+        // The marker must accompany actual truncation, with all 18 available
+        // body rows used rather than only a fixed share of the body.
+        assert!(painted[3].contains("Warnings · Esc/Enter close (truncated — resize)"));
+        assert!(screen.contains(&warnings[0]));
+        assert!(painted[21].contains(&warnings[17]));
+        assert_eq!(bottom_border_row(&painted), 22);
+        assert!(!screen.contains(&warnings[18]));
+        assert!(!screen.contains(&warnings[19]));
     }
 
     #[test]

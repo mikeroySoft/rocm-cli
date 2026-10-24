@@ -27,6 +27,25 @@ Run clippy with warnings as errors:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Dashboard warning details
+
+```bash
+cargo test -p rocm-dash-tui warning_
+cargo xtask e2e -- -n 'dash-38 -'
+```
+
+The rendering regressions in
+[modal.rs](../crates/rocm-dash-tui/src/ui/modal.rs) use the dashboard's 80x20 body
+on an 80x24 terminal: six wrapped warnings must all appear, while twenty one-line
+warnings must fill the available rows and mark the title `truncated — resize`.
+The focused tests also cover snapshot retention, badge hit areas, overlay input
+ownership, and Escape/Enter dismissal.
+
+The Linux PTY scenario `@id:dash-warning-details` in
+[dash.feature](../tests/e2e-cucumber/features/dash.feature) opens a deterministic
+warning replay, clicks the badge, checks the warning text, closes the modal with
+Enter, and quits successfully. It needs no GPU.
+
 ### Tests that touch the environment
 
 `std::env::set_var` / `remove_var` change state shared by every thread in the
