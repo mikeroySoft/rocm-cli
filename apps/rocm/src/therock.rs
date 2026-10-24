@@ -7290,7 +7290,7 @@ mod tests {
     // they run. Because env is shared across all test threads, any test that spawns a
     // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
     // can fail with ENOENT while another test has temporarily narrowed `PATH`.
-    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
         FamilyResolution {
@@ -12473,7 +12473,7 @@ exit 1
 /// guarantees through `extract_tarball_and_discard_archive`.
 #[cfg(all(test, unix))]
 mod archive_properties {
-    use super::extract_tarball_and_discard_archive;
+    use super::{extract_tarball_and_discard_archive, tests::PROCESS_ENV_TEST_LOCK};
     use crate::archive_props::{
         Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
         tar_gz_bytes,
@@ -12484,6 +12484,7 @@ mod archive_properties {
     /// judged when this runs as root (see `Modes`).
     #[test]
     fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let expect = Expect {
             modes: Modes::SafeUnlessRoot,
             no_outward_links: false,
@@ -12510,6 +12511,7 @@ mod archive_properties {
     /// entirely escapes the oracle above; this catches it.
     #[test]
     fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         run_round_trip("therock-benign", |layout, entries| {
             let archive = layout.base.join("sdk.tar.gz");
             std::fs::write(&archive, tar_gz_bytes(entries))?;
