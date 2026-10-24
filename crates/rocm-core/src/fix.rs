@@ -381,14 +381,22 @@ const RECIPES: &[FixRecipe] = &[
         commands: &[
             "# Linux:",
             "echo 'export PATH=\"/opt/rocm/bin:$PATH\"' >> ~/.bashrc",
-            "# Windows:",
-            "setx PATH \"%PATH%;C:\\Program Files\\AMD\\ROCm\\<version>\\bin\"",
+            "# Windows (PowerShell):",
+            "[Environment]::SetEnvironmentVariable('PATH', 'C:\\Program Files\\AMD\\ROCm\\<version>\\bin;' + [Environment]::GetEnvironmentVariable('PATH', 'User'), 'User')",
         ],
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
         verify: "rocminfo | head -n 5 && hipcc --version",
-        notes: &[],
+        // The Windows command above is the manual-paste twin of what
+        // `path_export_windows` actually runs -- same scope, same prepend
+        // ordering -- so a user who pastes it and a user who lets `rocm fix`
+        // do it end up with the same User PATH. These notes say why it is not
+        // the `setx` one-liner a Windows user would otherwise reach for.
+        notes: &[
+            "Windows: the PowerShell line reads and rewrites the User scope only, and puts the SDK's bin dir first -- the same write `rocm fix fix-6-path` performs. Do not substitute `setx PATH \"%PATH%;...\"`: setx silently truncates the value at 1024 characters while still exiting 0, and %PATH% expands to the combined user+system PATH, so that form would copy every system entry into your User PATH.",
+            "Windows: a PATH change only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo.",
+        ],
         doc_url: None,
         applies_on: AUTO_ON_LINUX_WINDOWS_AND_WSL,
         runner: Some(run_path_export),
@@ -660,7 +668,12 @@ const RECIPES: &[FixRecipe] = &[
             "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
         doc_url: None,
-        applies_on: PRINT_ON_LINUX,
+        // Matches `check_17_torch_dlpack_cuda_variant`'s `["linux", "wsl"]`
+        // registration. vLLM is supported on WSL2 and its engine runs the same
+        // ELF import there, so the diagnosis the engine hint points at has to
+        // be reachable there too. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -1937,7 +1950,13 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
 /// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
 /// without this escape it would split the generated `-Command` script
 /// mid-statement.
-fn ps_single_quote_escape(value: &str) -> String {
+///
+/// `pub(crate)` because the same escape has to apply to the copy of this
+/// command `crate::diagnose` *prints* for the user to paste: the two are one
+/// plan on two surfaces, and a path the write survives but the printed
+/// version breaks on would be the same ROCMAI-449 bug moved from the write to
+/// the documentation.
+pub(crate) fn ps_single_quote_escape(value: &str) -> String {
     value.replace('\'', "''")
 }
 

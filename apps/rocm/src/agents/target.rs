@@ -868,6 +868,9 @@ impl Drop for TempRoot {
     }
 }
 
+// Windows has no mode bits: clearing the read-only attribute is the intended
+// way to make a cleaned-up tree deletable there.
+#[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
 fn make_tree_writable(path: &Path) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
