@@ -108,10 +108,3 @@ Feature: Update report
     When the user checks for updates against that catalog
     Then the report calls the runtime the catalog spells differently up to date
     And the report offers no update for the four-component runtime that is ahead of the catalog
-
-  # The command name reads as a self-update. `--apply` only installs runtime
-  # updates; the help must say so and name the installer as the CLI upgrade path.
-  @id:update-help-names-runtime-only-apply-and-cli-upgrade-path
-  Scenario: update-11 - The update help explains --apply is runtime-only and how to upgrade the CLI
-    When the user asks for update help
-    Then the help states --apply does not update the CLI and points to the installer

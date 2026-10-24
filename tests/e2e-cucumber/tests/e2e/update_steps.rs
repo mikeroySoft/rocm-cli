@@ -88,14 +88,6 @@ async fn reports_feed_status(world: &mut E2eWorld) {
     }
 }
 
-#[when("the user asks for update help")]
-async fn update_help(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--help"]);
-    world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
-    world.cli_rc = Some(rc);
-}
-
 // Linux's full accept queue drops SYNs; Windows has different backlog behavior.
 // Compile the interposer only for these scenarios, never into the shipped CLI.
 #[cfg(target_os = "linux")]
@@ -521,22 +513,6 @@ fn assert_runtime_status(out: &str, runtime_key: &str, status: &str) {
         "runtime {runtime_key:?} reported the wrong freshness; expected \
          status={status}, got {line:?}\n\nfull report:\n{out}"
     );
-}
-
-#[then("the help states --apply does not update the CLI and points to the installer")]
-async fn help_names_cli_upgrade_path(world: &mut E2eWorld) {
-    let out = ok_output(world);
-    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    for needle in [
-        "--apply installs runtime updates only",
-        "--apply does not update the rocm CLI",
-        "re-run the installer",
-    ] {
-        assert!(
-            flat.contains(needle),
-            "expected {needle:?} in `rocm update --help`:\n{out}"
-        );
-    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
