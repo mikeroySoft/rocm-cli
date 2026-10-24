@@ -221,6 +221,8 @@ pub struct AppState {
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
     pub last_footer_chips: Vec<FooterChip>,
+    /// Exact screen cells occupied by the warning badge in the latest frame.
+    pub last_warning_badge_area: Option<ratatui::layout::Rect>,
     /// Background-job model for operational screens (Phase 3 Wave 1). The
     /// job-bridge runtime streams `StateEvent`s into this from the event loop.
     pub jobs: rocm_dash_core::state::State,
@@ -332,6 +334,7 @@ impl AppState {
             has_received_snapshot: false,
             active_tab: ActiveTab::default(),
             modal: Modal::None,
+            last_warning_badge_area: None,
             menu_sel: 0,
             palette_sel: 0,
             options_tab: 0,

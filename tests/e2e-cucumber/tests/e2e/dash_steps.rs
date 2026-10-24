@@ -9,6 +9,7 @@
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -17,6 +18,7 @@ use crate::e2e::tui_driver::{QUIT_CONFIRM_MARKER, TermSignal, TuiSession, defaul
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+const REPLAY_WARNING: &str = "deterministic replay warning";
 
 /// The services overlay's own panel title, drawn by `draw_services_manager` on
 /// the overlay's border row. It is on screen exactly while the overlay is, so
@@ -172,6 +174,52 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     let session = TuiSession::spawn(world, &["dash", "--demo"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
     world.tui = Some(session);
+}
+
+#[when("the user opens a dashboard replay containing a warning")]
+async fn open_dashboard_warning_replay(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root");
+    let replay = root.path().join("warning.ndjson");
+    let entry = serde_json::json!({
+        "ts_us": 0,
+        "event": {
+            "kind": "snapshot",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "host": {
+                "cpu_model": "",
+                "cpu_overall_pct": 0.0,
+                "cpu_per_core_pct": [],
+                "memory_used_mb": 0,
+                "memory_total_mb": 0,
+                "swap_used_mb": 0,
+                "swap_total_mb": 0,
+                "disk_read_bps": 0,
+                "disk_write_bps": 0,
+                "net_rx_bps": 0,
+                "net_tx_bps": 0
+            },
+            "gpus": [],
+            "gpu_system_info": null,
+            "instances": [],
+            "warnings": [REPLAY_WARNING]
+        }
+    });
+    let mut replay_body = String::new();
+    for second in 0..60 {
+        let mut entry = entry.clone();
+        entry["ts_us"] = serde_json::json!(second * 1_000_000);
+        writeln!(replay_body, "{entry}").expect("failed to encode warning replay");
+    }
+    std::fs::write(&replay, replay_body).expect("failed to write warning replay");
+    let replay = replay.to_string_lossy();
+    let mut tui = TuiSession::spawn(world, &["dash", "--replay", &replay])
+        .unwrap_or_else(|e| panic!("failed to open warning replay: {e}"));
+    tui.use_detail_size()
+        .expect("failed to resize warning replay terminal");
+    world.tui = Some(tui);
 }
 
 /// The name of a child directory `dash-25` plants under the scenario's cwd;
@@ -697,6 +745,29 @@ async fn send_gpu_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+#[when("the user clicks the warning indicator")]
+async fn click_warning_indicator(world: &mut E2eWorld) {
+    let tui = session(world);
+    let screen = tui.screen_text();
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("⚠ 1"))
+        .expect("warning indicator is not visible");
+    let column = line
+        .chars()
+        .position(|character| character == '⚠')
+        .expect("warning glyph is not visible");
+    tui.send(&format!("\x1b[<0;{};{}M", column + 2, row + 1))
+        .expect("failed to click warning indicator");
+}
+
+#[when("the user closes the warning details")]
+async fn close_warning_details(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .expect("failed to close warning details");
 }
 
 /// Counterpart of `send_gpu_message` for a chat input that is already
@@ -1237,6 +1308,22 @@ async fn launcher_ctrl_c(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the warning indicator is displayed")]
+async fn warning_indicator_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .expect("warning indicator was not displayed");
+}
+
+#[then("the warning details are displayed")]
+async fn warning_details_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(REPLAY_WARNING, default_timeout())
+        .await
+        .expect("warning details were not displayed");
+}
 
 #[then("the dashboard is refused before taking over the terminal")]
 async fn dashboard_refused_before_takeover(world: &mut E2eWorld) {

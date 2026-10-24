@@ -113,6 +113,22 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
     panel::popup(f, area, title, theme)
 }
 
+/// Render warning messages captured when the header badge was clicked.
+pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
+    let popup = centered_rect(70, 60, 100, 24, area);
+    let inner = draw_popup_frame(f, popup, "Warnings · Esc/Enter close", theme);
+    let lines = warnings
+        .iter()
+        .map(|warning| {
+            Line::from(Span::styled(
+                warning.as_str(),
+                Style::default().fg(theme.warn),
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 /// Render the Help modal for the active tab.
 ///
 /// The popup is sized to the height its *wrapped* content actually needs,
@@ -887,7 +903,7 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod ported_chrome_tests {
-    use super::{draw_help, draw_logo, grey_overlay, opt_row};
+    use super::{draw_help, draw_logo, draw_warnings, grey_overlay, opt_row};
     use crate::app::ActiveTab;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
@@ -901,6 +917,24 @@ mod ported_chrome_tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn warning_modal_renders_all_messages() {
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw_warnings(
+                f,
+                f.area(),
+                &["first warning".into(), "second warning".into()],
+                &theme,
+            );
+        })
+        .unwrap();
+        let screen = flat(&term);
+        assert!(screen.contains("first warning"));
+        assert!(screen.contains("second warning"));
     }
 
     #[test]
