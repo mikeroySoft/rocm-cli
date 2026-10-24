@@ -143,7 +143,7 @@ pub fn bps(value: f64) -> String {
 /// Token throughput. `123.4 tok/s`, `1.23 k tok/s`. `-` when None.
 pub fn tps_opt(value: Option<f64>) -> String {
     match value {
-        Some(v) if (v * 10.0).round() >= 10_000.0 => format!("{} tok/s", si(v)),
+        Some(v) if (v.abs() * 10.0).round() >= 10_000.0 => format!("{} tok/s", si(v)),
         Some(v) => format!("{v:.1} tok/s"),
         None => "-".to_string(),
     }
@@ -553,6 +553,7 @@ mod tests {
         assert_eq!(tps_opt(None), "-");
         assert_eq!(tps_opt(Some(45.6)), "45.6 tok/s");
         assert_eq!(tps_opt(Some(999.96)), "1.00 k tok/s");
+        assert_eq!(tps_opt(Some(-999.96)), "-1.00 k tok/s");
         assert_eq!(tps_opt(Some(1500.0)), "1.50 k tok/s");
         assert_eq!(tps_opt(Some(999_999.0)), "1.00 M tok/s");
     }
