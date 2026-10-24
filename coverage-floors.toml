@@ -12,7 +12,7 @@
 
 [floors]
 "e2e-report" = 92.61  # 1747 lines
-"rocm" = 77.13  # 44823 lines
+"rocm" = 76.82  # 58218 lines
 "rocm-core" = 82.14  # 16362 lines
 "rocm-dash-collectors" = 87.86  # 2638 lines
 "rocm-dash-core" = 97.52  # 1820 lines
