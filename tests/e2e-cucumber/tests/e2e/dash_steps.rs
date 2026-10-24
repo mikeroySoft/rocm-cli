@@ -9,6 +9,7 @@
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -206,13 +207,12 @@ async fn open_dashboard_warning_replay(world: &mut E2eWorld) {
             "warnings": [REPLAY_WARNING]
         }
     });
-    let replay_body = (0..60)
-        .map(|second| {
-            let mut entry = entry.clone();
-            entry["ts_us"] = serde_json::json!(second * 1_000_000);
-            format!("{entry}\n")
-        })
-        .collect::<String>();
+    let mut replay_body = String::new();
+    for second in 0..60 {
+        let mut entry = entry.clone();
+        entry["ts_us"] = serde_json::json!(second * 1_000_000);
+        writeln!(replay_body, "{entry}").expect("failed to encode warning replay");
+    }
     std::fs::write(&replay, replay_body).expect("failed to write warning replay");
     let replay = replay.to_string_lossy();
     let mut tui = TuiSession::spawn(world, &["dash", "--replay", &replay])
