@@ -521,6 +521,8 @@ fn assert_runtime_status(out: &str, runtime_key: &str, status: &str) {
         "runtime {runtime_key:?} reported the wrong freshness; expected \
          status={status}, got {line:?}\n\nfull report:\n{out}"
     );
+}
+
 #[then("the help states --apply does not update the CLI and points to the installer")]
 async fn help_names_cli_upgrade_path(world: &mut E2eWorld) {
     let out = ok_output(world);
