@@ -120,6 +120,7 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
             return a;
         }
         if state.modal == Modal::None
+            && !state.has_open_overlay()
             && state
                 .last_warning_badge_area
                 .is_some_and(|area| point_in(area, me.column, me.row))
@@ -477,6 +478,26 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn warning_badge_click_is_swallowed_while_a_manager_is_open() {
+        let mut s = st();
+        s.last_warning_badge_area = Some(Rect::new(20, 1, 5, 1));
+        s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
+
+        assert_eq!(
+            resolve_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 22,
+                    row: 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &s,
+            ),
+            KeyAction::Nothing
+        );
     }
     #[test]
     fn body_clicks_are_swallowed_while_a_manager_is_open() {
