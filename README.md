@@ -558,7 +558,8 @@ package.
 
 #### Updates
 
-`update` checks for a newer ROCm package.
+`update` reports update status across surfaces. `--apply` installs TheRock
+runtime updates only; it never updates the `rocm` binary.
 
 | Flag | Description |
 | --- | --- |
@@ -668,6 +669,11 @@ downloading anything or writing into the SDK tree. The root is detected via
 `ROCM_PATH`, `ROCM_HOME`, or `HIP_PATH`, falling back to `/opt/rocm`; pass
 `--root` to override. `--activate` makes it the default runtime and completes
 first-time setup. Linux and WSL only in this release.
+
+`rocm update` reports update status for installed TheRock ROCm runtimes plus the
+CLI, engine, and model-recipe feeds. `rocm update --apply` installs runtime
+updates only; it does not update the `rocm` binary itself. To upgrade the CLI,
+re-run the installer from the Installation section.
 
 System runtimes are owned by the OS package manager: implicit `rocm update`
 skips them, while `rocm update --runtime <system-key>` directs you to your
