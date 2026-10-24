@@ -222,9 +222,9 @@ pub(crate) fn parse_optional_lines(args: &[String]) -> Result<usize> {
             let value = args.get(index + 1).context("lines flag requires a value")?;
             let lines = value
                 .parse::<usize>()
-                .context("lines flag must be a positive number")?;
-            if lines == 0 {
-                bail!("lines flag must be a positive number");
+                .context("lines flag must be in the range 1..=400")?;
+            if !(1..=400).contains(&lines) {
+                bail!("lines flag must be in the range 1..=400");
             }
             return Ok(lines);
         }
@@ -4341,21 +4341,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_optional_lines_rejects_zero() {
-        assert!(parse_optional_lines(&["--lines".to_owned(), "0".to_owned()]).is_err());
+    fn parse_optional_lines_rejects_out_of_range_values() {
+        for lines in ["0", "401"] {
+            assert!(parse_optional_lines(&["--lines".to_owned(), lines.to_owned()]).is_err());
+        }
     }
 
     #[test]
     fn comfyui_logs_read_only_path_propagates_an_invalid_line_count() {
         let (_root, paths) = test_paths("comfyui-logs-invalid-lines");
-        let args = vec![
-            "comfyui".to_owned(),
-            "logs".to_owned(),
-            "--lines".to_owned(),
-            "nope".to_owned(),
-        ];
+        for lines in ["nope", "401"] {
+            let args = vec![
+                "comfyui".to_owned(),
+                "logs".to_owned(),
+                "--lines".to_owned(),
+                lines.to_owned(),
+            ];
 
-        assert!(run_rocm_read_only_in_process(&paths, &args).is_err());
+            assert!(run_rocm_read_only_in_process(&paths, &args).is_err());
+        }
     }
 
     #[test]
