@@ -31,7 +31,7 @@ Feature: Log inspection
   # the hidden `__engine-stdio` entry point of the built-in engines, so this
   # exercises the same handler an external caller would, with planted logs only.
   @id:logs-engine-omitted-tail-uses-protocol-default
-  Scenario: 4 - Every engine returns the same number of log lines when no limit is given
+  Scenario: logs-04 - Every engine returns the same number of log lines when no limit is given
     Given a service log longer than the default tail for each built-in engine
     When each engine is asked for that service's logs without a line limit
     Then every engine returns exactly the protocol default number of lines
