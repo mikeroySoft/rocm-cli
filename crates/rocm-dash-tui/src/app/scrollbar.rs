@@ -422,7 +422,6 @@ mod tests {
 
     use super::super::test_support::st;
 
-
     #[test]
     fn warning_badge_click_opens_clicked_snapshot() {
         use rocm_dash_core::metrics::Snapshot;

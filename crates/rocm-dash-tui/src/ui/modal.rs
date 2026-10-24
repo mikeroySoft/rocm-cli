@@ -129,7 +129,6 @@ pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &The
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-
 /// Render the Help modal for the active tab.
 ///
 /// The popup is sized to the height its *wrapped* content actually needs,
