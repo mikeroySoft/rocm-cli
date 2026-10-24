@@ -987,6 +987,19 @@ cargo test -p rocm --bin rocm serve_engine_selection
 These tests verify that explicit/configured engines still win and shared model
 recipes only choose a preferred engine when no user/default engine is set.
 
+Foreground serve lifecycle scenarios:
+
+```bash
+cargo xtask e2e -- -n "serve-(27|28)"
+```
+
+`serve-27` and `serve-28` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+use a hook-enabled Linux build with a real shell process tree. They verify that
+backend `SIGKILL` makes `rocm serve --foreground` log the signal, clean up the
+backend, supervisor, and daemon, and exit nonzero within five seconds; they also
+verify that `SIGTERM` sent to `rocm serve` performs the same cleanup but exits 0.
+
 Public-endpoint authentication focused tests:
 
 ```bash

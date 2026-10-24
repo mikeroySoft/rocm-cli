@@ -165,6 +165,7 @@ pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
+        eprintln!("vLLM server exited with status {status}");
         std::process::exit(status.code().unwrap_or(1));
     }
 }

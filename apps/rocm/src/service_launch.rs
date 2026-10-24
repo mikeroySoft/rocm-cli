@@ -33,8 +33,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::ExitStatus;
+use std::process::{Child, ExitStatus};
 #[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -58,6 +57,34 @@ use crate::{
 use crate::{app_path_env_var_refs, app_path_env_var_values};
 #[cfg(not(windows))]
 use crate::{apply_app_path_env, read_optional_tail_lines};
+
+#[cfg(all(feature = "e2e-test-hooks", unix))]
+const FOREGROUND_BACKEND_FIXTURE_DIR_ENV: &str = "ROCM_E2E_FOREGROUND_BACKEND_FIXTURE_DIR";
+
+/// Test-only process fixture for the foreground lifecycle scenarios.
+///
+/// Hook-enabled Linux E2E builds use the directory for a backend PID handoff
+/// and an attach-ready barrier.
+#[cfg(all(feature = "e2e-test-hooks", unix))]
+pub(crate) fn foreground_backend_fixture_dir() -> Option<PathBuf> {
+    std::env::var_os(FOREGROUND_BACKEND_FIXTURE_DIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Production builds do not provide the foreground lifecycle fixture.
+#[cfg(not(all(feature = "e2e-test-hooks", unix)))]
+pub(crate) const fn foreground_backend_fixture_dir() -> Option<PathBuf> {
+    None
+}
+
+fn mark_foreground_backend_attached() -> Result<()> {
+    if let Some(fixture_dir) = foreground_backend_fixture_dir() {
+        fs::write(fixture_dir.join("attached.ready"), b"ready\n")
+            .context("failed to publish foreground fixture attach readiness")?;
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -304,6 +331,9 @@ enum ManagedSpawn {
     Spawned {
         record: Box<ManagedServiceRecord>,
         child_pid: u32,
+        /// Retained by the attached path so it can reap the supervisor and read
+        /// its real exit status. The background path drops it immediately.
+        child: Option<Child>,
     },
 }
 
@@ -482,18 +512,42 @@ fn spawn_managed_engine_child(
         record.requires_api_key,
     )?;
     #[cfg(windows)]
-    let child_pid = {
+    let (child_pid, child) = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
         let mut env_refs = app_path_env_var_refs(&env_values);
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
+        let child_pid = rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
+            .context("failed to launch managed engine process")?;
+        (child_pid, None)
     };
     #[cfg(not(windows))]
-    let child_pid = {
-        let mut command = managed_service_process_command(&current_exe, &serve_args);
+    let (child_pid, child) = {
+        let mut command = if let Some(fixture_dir) = foreground_backend_fixture_dir() {
+            let mut command = ProcessCommand::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    "trap 'kill -TERM \"$backend\" 2>/dev/null; wait \"$backend\" 2>/dev/null; exit 0' TERM INT\n\
+                     sleep 300 &\n\
+                     backend=$!\n\
+                     printf '%s\\n' \"$backend\" > \"$1\"\n\
+                     wait \"$backend\"\n\
+                     status=$?\n\
+                     if [ \"$status\" -eq 137 ]; then\n\
+                       echo 'Error: scripted backend exited with status signal: 9 (SIGKILL)' >&2\n\
+                     else\n\
+                       echo \"Error: scripted backend exited with status code: $status\" >&2\n\
+                     fi\n\
+                     exit 1",
+                )
+                .arg("rocm-e2e-foreground-backend")
+                .arg(fixture_dir.join("backend.pid"));
+            command
+        } else {
+            managed_service_process_command(&current_exe, &serve_args)
+        };
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
         detach_background_command(&mut command);
@@ -518,7 +572,7 @@ fn spawn_managed_engine_child(
                 managed_engine_startup_failure_detail(status, &record.log_path)
             );
         }
-        child_pid
+        (child_pid, Some(child))
     };
     // The child is both roles until the engine state file names a separate
     // server process. Each role gets its own token, captured while the child is
@@ -533,6 +587,7 @@ fn spawn_managed_engine_child(
     Ok(ManagedSpawn::Spawned {
         record: Box::new(record),
         child_pid,
+        child,
     })
 }
 
@@ -571,7 +626,9 @@ pub(crate) fn start_managed_service(
         require_api_key,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
-        ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
+        ManagedSpawn::Spawned {
+            record, child_pid, ..
+        } => (*record, child_pid),
     };
     // The claiming service record is now persisted, so the selected GPU is
     // visible to any concurrent auto-selection. Release the launch lock before
@@ -702,16 +759,18 @@ fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
 /// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
 /// propagated; setup errors (path discovery, stdio attach) still return `Err`.
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
-    ensure_background_helper_running_quiet(false)
+    ensure_background_helper_running_quiet(false).map(|_| ())
 }
 
 /// As [`ensure_background_helper_running`], but suppresses the stdout status line
 /// when `quiet` is set. The interactive `rocm serve` summary path uses `quiet` so
 /// the daemon-spawn note does not appear above the deployment summary table.
-pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
+pub(crate) fn ensure_background_helper_running_quiet(
+    quiet: bool,
+) -> Result<Option<rocm_core::ProcessIdentity>> {
     let paths = AppPaths::discover()?;
     if background_helper_already_running(&paths)? {
-        return Ok(());
+        return Ok(None);
     }
 
     // The check above and the spawn below are a TOCTOU window: two concurrent
@@ -722,7 +781,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
     // already-running case lock-free.
     let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
     if background_helper_already_running(&paths)? {
-        return Ok(());
+        return Ok(None);
     }
 
     // The lock alone does not close the window: the spawned daemon does not
@@ -738,7 +797,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         AUTOSTART_CLAIM_TTL_MS,
         rocm_core::process_is_running,
     ) {
-        return Ok(());
+        return Ok(None);
     }
 
     let exe = managed_service_launcher_path()
@@ -759,7 +818,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         apply_app_path_env(&mut command, &paths);
         command.spawn().map(|child| child.id())
     };
-    match spawn_result {
+    let spawned = match spawn_result {
         Ok(daemon_pid) => {
             // Record the claim before returning (and thus releasing the lock) so a
             // concurrent holder in the spawn→publish window defers. Best-effort: a
@@ -774,13 +833,15 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
             if !quiet {
                 println!("  helper: started background automation daemon");
             }
+            Some(rocm_core::ProcessIdentity::capture(daemon_pid))
         }
         Err(error) if !quiet => {
             println!("  helper: could not start background automation daemon: {error}");
+            None
         }
-        Err(_) => {}
-    }
-    Ok(())
+        Err(_) => None,
+    };
+    Ok(spawned)
 }
 
 /// How long an autostart claim is honoured before it is treated as stale even if
@@ -846,23 +907,144 @@ fn autostart_spawn_in_flight(
     })
 }
 
-/// What ended an attached (`--verbose`/`--foreground`) streaming session. Kept
-/// as a plain enum, separate from any terminal I/O, so the follow-up action
-/// (detach note vs. stop the server) is unit-testable without a TTY.
+/// A temporary SIGINT/SIGTERM listener for one attached serve.
+///
+/// Closing the handle removes this listener, but `signal-hook` does not restore
+/// the default signal action. The attached serve exits after cleanup.
+struct AttachSignalWatcher {
+    receiver: std::sync::mpsc::Receiver<()>,
+    #[cfg(unix)]
+    handle: signal_hook::iterator::Handle,
+    #[cfg(unix)]
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AttachSignalWatcher {
+    fn new() -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        #[cfg(unix)]
+        {
+            use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+            let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+                .context("failed to register foreground serve signal handlers")?;
+            let handle = signals.handle();
+            let thread = std::thread::spawn(move || {
+                for _ in signals.forever() {
+                    let _ = sender.send(());
+                }
+            });
+            Ok(Self {
+                receiver,
+                handle,
+                thread: Some(thread),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // No Unix signals on Windows. A disconnected receiver reports no
+            // request while keeping the polling interface platform-independent.
+            drop(sender);
+            Ok(Self { receiver })
+        }
+    }
+
+    fn requested(&self) -> bool {
+        self.receiver.try_recv().is_ok()
+    }
+}
+
+impl Drop for AttachSignalWatcher {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            self.handle.close();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// What ended an attached (`--verbose`/`--foreground`) streaming session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachOutcome {
     /// Ctrl-D: leave the server running and hand the terminal back.
     Detach,
-    /// Ctrl-C: stop the server, then hand the terminal back.
+    /// Ctrl-C, SIGINT, or SIGTERM: stop the server, then hand the terminal back.
     Stop,
-    /// The engine process exited on its own while we were streaming its log.
-    ServerExited,
+    /// The engine supervisor exited on its own while logs were streaming.
+    ServerExited(Option<ExitStatus>),
+}
+
+fn stop_attached_service(
+    paths: &AppPaths,
+    service_id: &str,
+    child_pid: u32,
+    mut child: Option<&mut Child>,
+    spawned_daemon: Option<&rocm_core::ProcessIdentity>,
+) -> Result<()> {
+    let child_identity = rocm_core::ProcessIdentity::capture(child_pid);
+    match run_internal_sandbox_tool(
+        paths,
+        SandboxToolArg::StopServer,
+        Some(service_id.to_owned()),
+        true,
+    ) {
+        Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
+        Err(error) => println!("  note: {error}"),
+    }
+    let child_running = match child.as_deref_mut() {
+        Some(child) => child
+            .try_wait()
+            .context("failed to poll foreground server supervisor during cleanup")?
+            .is_none(),
+        None => matches!(
+            rocm_core::identity_state(&child_identity),
+            rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+        ),
+    };
+    if child_running {
+        let outcome = rocm_core::terminate_verified(
+            &child_identity,
+            rocm_core::KillScope::Tree,
+            Duration::from_secs(3),
+            true,
+        );
+        if !outcome.stopped() {
+            bail!("failed to clean up foreground server process tree {child_pid}");
+        }
+    }
+    if let Some(child) = child {
+        child
+            .wait()
+            .context("failed to reap foreground server supervisor")?;
+    }
+    if let Some(daemon) = spawned_daemon {
+        let still_needed = crate::load_managed_services(paths)?.iter().any(|record| {
+            record.service_id != service_id && crate::managed_service_is_live(record)
+        }) || rocm_core::RocmCliConfig::load(paths)?.automation_daemon_enabled();
+        if !still_needed {
+            let outcome = rocm_core::terminate_verified(
+                daemon,
+                rocm_core::KillScope::Single,
+                Duration::from_secs(3),
+                true,
+            );
+            if !outcome.stopped() {
+                bail!(
+                    "failed to clean up foreground serve daemon process {}",
+                    daemon.pid
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Attached serve path for `--verbose`/`--foreground`: spawn the engine as a
-/// detached managed child (the same child the background path spawns) and stream
-/// its log in this terminal. Unlike the old in-process foreground, the server
-/// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
+/// detached managed child and stream its log in this terminal. Ctrl-D detaches;
+/// Ctrl-C/SIGINT/SIGTERM stop it. An unprompted supervisor exit is an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_attached_service(
     engine: &str,
@@ -895,15 +1077,9 @@ pub(crate) fn run_attached_service(
         resolve.engine_recipe.as_ref(),
         require_api_key,
     )?;
-    // The claiming record is persisted (or an existing service was found), so the
-    // selected GPU is now visible to concurrent auto-selection. Release the launch
-    // lock before streaming logs, which blocks for the whole attached session.
     drop(launch_lock);
 
-    let (service_id, log_path, child_pid) = match spawn {
-        // A server for this engine+model is already live. Don't fight it for the
-        // port — point the user at the existing one instead of tailing a log we
-        // did not start.
+    let (service_id, log_path, child_pid, mut child) = match spawn {
         ManagedSpawn::AlreadyRunning(report) => {
             println!("model already being served");
             println!("  service_id: {}", report.service_id);
@@ -917,35 +1093,46 @@ pub(crate) fn run_attached_service(
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
-        ManagedSpawn::Spawned { record, child_pid } => {
-            (service_id.to_owned(), record.log_path.clone(), child_pid)
-        }
+        ManagedSpawn::Spawned {
+            record,
+            child_pid,
+            child,
+        } => (
+            service_id.to_owned(),
+            record.log_path.clone(),
+            child_pid,
+            child,
+        ),
     };
 
-    // The child is a managed service that outlives this session once detached, so
-    // it needs the same supervision the background path gives it: the daemon
-    // health-checks and auto-recovers managed servers, reconciles a self-exited
-    // server's record, and feeds the dashboard. Match the background ordering
-    // (spawn, then ensure the helper) and keep it quiet so no status line breaks
-    // into the log stream.
-    ensure_background_helper_running_quiet(true)?;
+    // Keep the daemon for an explicit detach, but stop it with the foreground
+    // process when this invocation created it and the attached session ends.
+    let spawned_daemon = ensure_background_helper_running_quiet(true)?;
 
-    // The resolution detail (model, engine, runtime, GPU, warnings) was already
-    // printed as the "serve plan" block in `serve()`; extend it with the launch
-    // coordinates and the streaming hint rather than repeating it.
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
     if let Some(key) = endpoint_api_key {
-        // Same intentional one-time key display as `print_managed_launch_plain`
-        // above; see its rationale for why the tag below is currently inert.
+        // Same intentional one-time key display as `print_managed_launch_plain`.
         // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }
     println!("  streaming engine logs - Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
-    let outcome = stream_attached_logs(&log_path, child_pid)?;
+    let outcome = match stream_attached_logs(&log_path, child_pid, child.as_mut()) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            stop_attached_service(
+                &paths,
+                &service_id,
+                child_pid,
+                child.as_mut(),
+                spawned_daemon.as_ref(),
+            )?;
+            return Err(error);
+        }
+    };
     println!();
 
     match outcome {
@@ -968,20 +1155,13 @@ pub(crate) fn run_attached_service(
         }
         AttachOutcome::Stop => {
             println!("stopping server...");
-            match run_internal_sandbox_tool(
+            stop_attached_service(
                 &paths,
-                SandboxToolArg::StopServer,
-                Some(service_id.clone()),
-                true,
-            ) {
-                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
-                Err(error) => {
-                    // Best-effort direct signal so Ctrl-C never leaves the model
-                    // orphaned when the sandbox stop path fails.
-                    let _ = rocm_core::terminate_process_tree(child_pid);
-                    println!("  note: {error}");
-                }
-            }
+                &service_id,
+                child_pid,
+                child.as_mut(),
+                spawned_daemon.as_ref(),
+            )?;
             record_cli_audit_event(
                 &paths,
                 "service",
@@ -992,17 +1172,25 @@ pub(crate) fn run_attached_service(
             );
             Ok(())
         }
-        AttachOutcome::ServerExited => {
-            println!("server process exited");
+        AttachOutcome::ServerExited(status) => {
+            let status =
+                status.map_or_else(|| "unknown status".to_owned(), |status| status.to_string());
+            println!("server process exited unexpectedly with status {status}");
             println!("  service_id: {service_id}");
             println!("  recent logs: rocm logs {service_id}");
-            Ok(())
+            stop_attached_service(
+                &paths,
+                &service_id,
+                child_pid,
+                child.as_mut(),
+                spawned_daemon.as_ref(),
+            )?;
+            bail!("foreground server process exited unexpectedly with status {status}")
         }
     }
 }
 
-/// Restores cooked terminal mode when dropped, so [`stream_attached_logs`] leaves
-/// the terminal usable on every exit path (normal return, `?` error, or panic).
+/// Restores cooked terminal mode when dropped.
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
@@ -1011,9 +1199,6 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Map a key press (control modifier + lowercased character) to the attach
-/// action it triggers, if any. Factored out of the raw-mode reader loop so the
-/// Ctrl-D/Ctrl-C mapping is unit-testable without a terminal.
 const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
     if !ctrl {
         return None;
@@ -1025,32 +1210,71 @@ const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
     }
 }
 
-/// Follow `log_path` in the terminal until the user presses Ctrl-D (detach) or
-/// Ctrl-C (stop), or the engine process exits. Uses crossterm raw mode to
-/// capture the keys directly (in raw mode Ctrl-C does not raise SIGINT, so we see
-/// it as a key event). When stdin is not a TTY (piped/CI), keystroke capture is
-/// impossible, so we follow the log until the process exits instead.
-fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+fn attached_process_exit(
+    child: Option<&mut Child>,
+    child_pid: u32,
+) -> Result<Option<AttachOutcome>> {
+    if let Some(child) = child {
+        return child
+            .try_wait()
+            .context("failed to poll foreground server supervisor")
+            .map(|status| status.map(|status| AttachOutcome::ServerExited(Some(status))));
+    }
+    Ok((!process_is_running(child_pid)).then_some(AttachOutcome::ServerExited(None)))
+}
+
+fn drain_attached_log(
+    log_path: &Path,
+    log_reader: &mut Option<io::BufReader<fs::File>>,
+    stdout: &mut io::Stdout,
+    line: &mut String,
+    raw_mode: bool,
+) {
+    if log_reader.is_none() {
+        *log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
+    }
+    if let Some(reader) = log_reader.as_mut() {
+        loop {
+            line.clear();
+            match reader.read_line(line) {
+                Ok(0) => break,
+                Ok(_) if raw_mode => {
+                    let _ = write!(stdout, "{}\r\n", line.trim_end_matches('\n'));
+                    let _ = stdout.flush();
+                }
+                Ok(_) => {
+                    let _ = write!(stdout, "{line}");
+                    let _ = stdout.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Follow `log_path` until the user detaches/stops or the retained child exits.
+fn stream_attached_logs(
+    log_path: &Path,
+    child_pid: u32,
+    mut child: Option<&mut Child>,
+) -> Result<AttachOutcome> {
     use std::io::IsTerminal as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
+    let signal_watcher = AttachSignalWatcher::new()?;
+    mark_foreground_backend_attached()?;
+
     if !std::io::stdin().is_terminal() {
-        return stream_attached_logs_no_tty(log_path, child_pid);
+        return stream_attached_logs_no_tty(log_path, child_pid, child, &signal_watcher);
     }
 
-    // Enter raw mode *before* spawning the key reader. In raw mode Ctrl-C arrives
-    // as a key event instead of SIGINT; if the reader started first, a Ctrl-C in
-    // that window would kill the CLI outright (leaving the detached child alive
-    // but printing no detach/stop message). The guard restores cooked mode on
-    // every exit path (normal return, `?` error, panic).
     crossterm::terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
     let _raw_guard = RawModeGuard;
 
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<AttachOutcome>();
-
     let reader_stop = Arc::clone(&stop);
     let reader = thread::spawn(move || {
         use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -1080,34 +1304,19 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
     });
 
     let mut stdout = io::stdout();
-    let mut log_reader: Option<io::BufReader<fs::File>> = None;
+    let mut log_reader = None;
     let mut line = String::new();
     let outcome = loop {
-        if log_reader.is_none() {
-            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
+        drain_attached_log(log_path, &mut log_reader, &mut stdout, &mut line, true);
+        if signal_watcher.requested() {
+            break AttachOutcome::Stop;
         }
-        if let Some(reader) = log_reader.as_mut() {
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        // Raw mode disables the terminal's own \n -> \r\n
-                        // translation, so emit an explicit carriage return to
-                        // keep the log left-aligned instead of stair-stepping.
-                        let _ = write!(stdout, "{}\r\n", line.trim_end_matches('\n'));
-                        let _ = stdout.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
+        if let Ok(outcome) = rx.try_recv() {
+            break outcome;
         }
-
-        if let Ok(signal) = rx.try_recv() {
-            break signal;
-        }
-        if !process_is_running(child_pid) {
-            break AttachOutcome::ServerExited;
+        if let Some(outcome) = attached_process_exit(child.as_deref_mut(), child_pid)? {
+            drain_attached_log(log_path, &mut log_reader, &mut stdout, &mut line, true);
+            break outcome;
         }
         thread::sleep(Duration::from_millis(150));
     };
@@ -1117,32 +1326,24 @@ fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome
     Ok(outcome)
 }
 
-/// Non-interactive fallback for [`stream_attached_logs`]: no keystroke capture,
-/// so just follow the log until the (detached) engine process exits. A Ctrl-C
-/// here delivers SIGINT to this process and leaves the managed server running.
-fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
+/// Non-interactive fallback: external SIGINT/SIGTERM requests a clean stop.
+fn stream_attached_logs_no_tty(
+    log_path: &Path,
+    child_pid: u32,
+    mut child: Option<&mut Child>,
+    signal_watcher: &AttachSignalWatcher,
+) -> Result<AttachOutcome> {
     let mut stdout = io::stdout();
-    let mut log_reader: Option<io::BufReader<fs::File>> = None;
+    let mut log_reader = None;
     let mut line = String::new();
     loop {
-        if log_reader.is_none() {
-            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
+        drain_attached_log(log_path, &mut log_reader, &mut stdout, &mut line, false);
+        if signal_watcher.requested() {
+            return Ok(AttachOutcome::Stop);
         }
-        if let Some(reader) = log_reader.as_mut() {
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = write!(stdout, "{line}");
-                        let _ = stdout.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        if !process_is_running(child_pid) {
-            return Ok(AttachOutcome::ServerExited);
+        if let Some(outcome) = attached_process_exit(child.as_deref_mut(), child_pid)? {
+            drain_attached_log(log_path, &mut log_reader, &mut stdout, &mut line, false);
+            return Ok(outcome);
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -1152,6 +1353,298 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_signal_watcher_does_not_request_a_stop() -> Result<()> {
+        let watcher = AttachSignalWatcher::new()?;
+        assert!(!watcher.requested());
+        assert!(!watcher.requested());
+        Ok(())
+    }
+
+    // These tests exercise real Linux child ownership without a GPU. The
+    // CLI-level SIGKILL and user-signal contract is covered by serve-27/28.
+    #[cfg(target_os = "linux")]
+    mod attached_lifecycle {
+        use std::process::Command;
+
+        use super::*;
+
+        struct TestChild(Child);
+
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn sleeping_child() -> Result<TestChild> {
+            Ok(TestChild(
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            ))
+        }
+
+        fn queued_stop_watcher() -> Result<AttachSignalWatcher> {
+            let signals = signal_hook::iterator::Signals::new([] as [i32; 0])?;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender.send(())?;
+            Ok(AttachSignalWatcher {
+                receiver,
+                handle: signals.handle(),
+                thread: None,
+            })
+        }
+
+        #[test]
+        fn retained_supervisor_is_reaped_and_reports_its_exit_status() -> Result<()> {
+            for code in [0, 23] {
+                let mut child = TestChild(
+                    Command::new("sh")
+                        .args(["-c", &format!("exit {code}")])
+                        .spawn()?,
+                );
+                let pid = child.0.id();
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let status = loop {
+                    if let Some(AttachOutcome::ServerExited(Some(status))) =
+                        attached_process_exit(Some(&mut child.0), pid)?
+                    {
+                        break status;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "child was not reaped");
+                    thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(code));
+                assert!(!process_is_running(pid), "child must not remain a zombie");
+                assert_eq!(child.0.wait()?, status);
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn live_supervisor_does_not_end_the_attachment() -> Result<()> {
+            let mut child = sleeping_child()?;
+            let pid = child.0.id();
+            assert_eq!(attached_process_exit(Some(&mut child.0), pid)?, None);
+            assert_eq!(attached_process_exit(None, pid)?, None);
+            assert_eq!(
+                attached_process_exit(None, 0)?,
+                Some(AttachOutcome::ServerExited(None))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn non_tty_stream_distinguishes_a_user_stop_from_a_child_exit() -> Result<()> {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let root = tempfile::tempdir()?;
+            let log_path = root.path().join("engine.log");
+            let mut child = sleeping_child()?;
+            let pid = child.0.id();
+            let watcher = queued_stop_watcher()?;
+            assert_eq!(
+                stream_attached_logs_no_tty(&log_path, pid, Some(&mut child.0), &watcher)?,
+                AttachOutcome::Stop
+            );
+            assert!(
+                child.0.try_wait()?.is_none(),
+                "streaming returns the decision; the caller owns cleanup"
+            );
+            assert!(!watcher.requested(), "the stop request must be consumed");
+
+            let watcher = AttachSignalWatcher::new()?;
+            assert!(!watcher.requested());
+            child.0.kill()?;
+            child.0.wait()?;
+            let outcome =
+                stream_attached_logs_no_tty(&log_path, pid, Some(&mut child.0), &watcher)?;
+            let AttachOutcome::ServerExited(Some(status)) = outcome else {
+                panic!("unexpected child exit must not be a clean stop: {outcome:?}");
+            };
+            assert_eq!(status.signal(), Some(9));
+            Ok(())
+        }
+
+        #[test]
+        fn log_drain_retries_a_missing_file_and_reads_appended_final_lines() -> Result<()> {
+            use std::io::{Seek as _, Write as _};
+
+            let root = tempfile::tempdir()?;
+            let log_path = root.path().join("engine.log");
+            let mut reader = None;
+            let mut stdout = io::stdout();
+            let mut line = String::new();
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, false);
+            assert!(reader.is_none());
+
+            fs::write(&log_path, "backend started\n")?;
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, true);
+            assert_eq!(
+                reader.as_mut().expect("opened log").stream_position()?,
+                fs::metadata(&log_path)?.len()
+            );
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&log_path)?,
+                "backend exited with signal: 9 (SIGKILL)"
+            )?;
+            drain_attached_log(&log_path, &mut reader, &mut stdout, &mut line, false);
+            assert_eq!(
+                reader.as_mut().expect("retained log").stream_position()?,
+                fs::metadata(&log_path)?.len(),
+                "the final drain must read past the previous EOF"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_reaps_a_live_supervisor_and_stops_its_owned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-live");
+            paths.ensure()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let pid = child.0.id();
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+            let result = stop_attached_service(
+                &paths,
+                "missing-service",
+                pid,
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            );
+            let _ = fs::remove_dir_all(root);
+            result?;
+            assert!(!child.0.wait()?.success());
+            assert!(!daemon.0.wait()?.success());
+            assert!(!process_is_running(pid));
+            assert!(!process_is_running(daemon_identity.pid));
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_preserves_its_daemon_while_another_service_is_running() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-shared-service");
+            paths.ensure()?;
+            ManagedServiceRecord::new(
+                &paths,
+                "other-service",
+                "lemonade",
+                "fixture",
+                "fixture",
+                "127.0.0.1",
+                0,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            )
+            .write()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+
+            stop_attached_service(
+                &paths,
+                "foreground-service",
+                child.0.id(),
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            )?;
+
+            let _ = fs::remove_dir_all(root);
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon shared with another running service must survive"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_preserves_its_daemon_while_automations_are_enabled() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-automations");
+            paths.ensure()?;
+            let mut config = rocm_core::RocmCliConfig::default();
+            config.automations.daemon_enabled = true;
+            config.save(&paths)?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let daemon_identity = rocm_core::ProcessIdentity::capture(daemon.0.id());
+
+            stop_attached_service(
+                &paths,
+                "foreground-service",
+                child.0.id(),
+                Some(&mut child.0),
+                Some(&daemon_identity),
+            )?;
+
+            let _ = fs::remove_dir_all(root);
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon running enabled automations must survive"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_accepts_an_already_exited_supervisor_and_no_owned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-exited");
+            paths.ensure()?;
+            let mut child = TestChild(Command::new("true").spawn()?);
+            let pid = child.0.id();
+            assert!(child.0.wait()?.success());
+            let service_id = "foreground-exited";
+            ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "lemonade",
+                "fixture",
+                "fixture",
+                "127.0.0.1",
+                0, // No endpoint exists; cleanup must still persist the stop.
+                "managed",
+                pid,
+                None,
+                None,
+                None,
+            )
+            .write()?;
+            let result = stop_attached_service(&paths, service_id, pid, Some(&mut child.0), None);
+            result?;
+            let record = crate::load_managed_service(&paths, service_id)?;
+            let _ = fs::remove_dir_all(root);
+            assert_eq!(record.status, "stopped");
+            assert_eq!(record.stop_requested_unix_ms, None);
+            assert!(!process_is_running(pid));
+            Ok(())
+        }
+
+        #[test]
+        fn cleanup_without_a_child_handle_preserves_an_unowned_daemon() -> Result<()> {
+            let (root, paths) = test_paths("foreground-cleanup-no-handle");
+            paths.ensure()?;
+            let mut child = sleeping_child()?;
+            let mut daemon = sleeping_child()?;
+            let result = stop_attached_service(&paths, "missing-service", child.0.id(), None, None);
+            let _ = fs::remove_dir_all(root);
+            result?;
+            assert!(!child.0.wait()?.success());
+            assert!(!process_is_running(child.0.id()));
+            assert!(
+                daemon.0.try_wait()?.is_none(),
+                "a daemon this invocation did not start must survive"
+            );
+            Ok(())
+        }
+    }
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {
