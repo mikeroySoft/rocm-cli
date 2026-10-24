@@ -271,3 +271,11 @@ Feature: ComfyUI install reports progress and makes failures actionable
     When the user reinstalls ComfyUI
     Then the reinstall fails saying the download is not a ComfyUI release, and does not keep it
     And the existing ComfyUI code and the user's files are untouched
+
+  # The renderer defensively clamps a line count, but values supplied by users
+  # must be rejected before reaching it so the requested behavior is not
+  # silently changed. This scenario exercises clap through the real CLI.
+  @id:comfyui-logs-rejects-out-of-range-lines
+  Scenario: comfyui-14 - ComfyUI logs rejects line counts outside its documented range
+    When the user requests ComfyUI logs with out-of-range line counts
+    Then every ComfyUI logs request fails and names the valid line-count range

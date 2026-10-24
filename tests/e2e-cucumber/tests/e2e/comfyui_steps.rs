@@ -343,6 +343,36 @@ async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
     // second call, unlike `comfyui-01`, which fails before reaching it.
 }
 
+#[when("the user requests ComfyUI logs with out-of-range line counts")]
+async fn request_comfyui_logs_with_out_of_range_lines(world: &mut E2eWorld) {
+    world.cli_outputs = Some(
+        ["0", "401"]
+            .into_iter()
+            .map(|lines| {
+                let (stdout, stderr, rc) =
+                    crate::run_rocm(world, &["comfyui", "logs", "--lines", lines]);
+                format!("lines={lines} rc={rc}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+            })
+            .collect(),
+    );
+}
+
+#[then("every ComfyUI logs request fails and names the valid line-count range")]
+async fn comfyui_logs_requests_fail_with_range(world: &mut E2eWorld) {
+    let results = world.cli_outputs.as_ref().expect("log request results");
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert!(
+            !result.contains("rc=0\n"),
+            "out-of-range log request succeeded:\n{result}"
+        );
+        assert!(
+            result.contains("1..=400"),
+            "log request error did not name the valid range:\n{result}"
+        );
+    }
+}
+
 #[when("the user installs ComfyUI")]
 async fn install_comfyui(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
