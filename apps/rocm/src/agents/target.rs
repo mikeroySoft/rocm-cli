@@ -884,11 +884,7 @@ fn make_tree_writable(path: &Path) {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
         }
-        #[cfg(windows)]
-        #[expect(
-            clippy::permissions_set_readonly_false,
-            reason = "Windows readonly attributes do not change Unix access modes"
-        )]
+        #[cfg(not(unix))]
         {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);
@@ -905,11 +901,7 @@ fn make_tree_writable(path: &Path) {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         }
-        #[cfg(windows)]
-        #[expect(
-            clippy::permissions_set_readonly_false,
-            reason = "Windows readonly attributes do not change Unix access modes"
-        )]
+        #[cfg(not(unix))]
         {
             let mut permissions = metadata.permissions();
             permissions.set_readonly(false);

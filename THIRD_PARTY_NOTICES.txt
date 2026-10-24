@@ -11410,7 +11410,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - jsonc-parser 0.33.2 <https://github.com/dprint/jsonc-parser>
+  - jsonc-parser 0.33.1 <https://github.com/dprint/jsonc-parser>
 
 The MIT License (MIT)
 
