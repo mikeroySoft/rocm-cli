@@ -146,6 +146,9 @@ This produces the two binaries under `target/release/`:
 - `rocm`: the CLI and interactive interfaces
 - `rocmd`: the background telemetry daemon used by the dashboard
 
+The `rocmd mcp-server` stdio interface is experimental and has no
+protocol-version compatibility guarantee.
+
 Run without installing:
 
 ```bash
