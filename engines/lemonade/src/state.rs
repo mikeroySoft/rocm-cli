@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, format_http_base_url};
+use rocm_core::{AppPaths, format_http_base_url, parse_http_endpoint};
 use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineDeviceAvailability, EngineRecipeHint,
     GpuSelection,
@@ -271,19 +271,6 @@ pub(crate) fn terminate_pid(pid: u32, _force: bool) -> bool {
 pub(crate) fn free_local_port() -> Result<u16> {
     let listener = TcpListener::bind((DEFAULT_HOST, 0)).context("failed to reserve local port")?;
     Ok(listener.local_addr()?.port())
-}
-
-pub(crate) fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
-    let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
-    let authority = without_scheme.split('/').next()?.trim();
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_owned();
-        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some((host, port));
-    }
-    let (host, port) = authority.rsplit_once(':')?;
-    Some((host.to_owned(), port.parse().ok()?))
 }
 
 pub(crate) fn normalize_device_policy(policy: Option<DevicePolicy>) -> Result<DevicePolicy> {
