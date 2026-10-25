@@ -279,14 +279,20 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
-While the log stream is attached, verify detach and stop behave differently:
+While the log stream is attached, verify detach, user stop, and backend failure
+behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
   "detached - server still running" note with the service id. Confirm the server
   is still up: `rocm services` lists it and the endpoint still answers a chat
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
-- Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
-  `rocm services` no longer lists it as running.
+- Re-run the serve command and press `Ctrl+C`, or send `SIGTERM` to the `rocm
+  serve` PID. The command exits 0, the server shuts down, and `rocm services` no
+  longer lists it as running.
+- Re-run the serve command, locate its backend child, and send that child
+  `SIGKILL`. Within a few seconds, `rocm serve` prints the backend exit signal,
+  exits nonzero, and leaves neither the backend nor its foreground supervisor
+  running.
 
 ## 4. Local Server Records
 

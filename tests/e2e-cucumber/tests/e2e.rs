@@ -173,6 +173,9 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// Result of a real foreground-serve process lifecycle scenario.
+    #[cfg(unix)]
+    pub foreground_serve_result: Option<e2e::serving_steps::ForegroundServeResult>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -328,6 +331,8 @@ impl Default for E2eWorld {
             skill_symptom: None,
             recorded_process: None,
             dash_report_refused: None,
+            #[cfg(unix)]
+            foreground_serve_result: None,
         }
     }
 }

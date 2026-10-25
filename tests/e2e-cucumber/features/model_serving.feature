@@ -346,3 +346,19 @@ Feature: Model serving
   Scenario: serve-26 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # Foreground supervision lifecycle (#73). A hook-enabled Linux build replaces
+  # the GPU backend with a real shell process tree, so the scenarios can signal
+  # actual PIDs while remaining deterministic and GPU-independent.
+  @id:serve-foreground-backend-death @requires-no-gpu @requires-os:linux
+  Scenario: serve-27 - Foreground serving fails and cleans up when its backend is killed
+    When a foreground serve backend is killed with SIGKILL
+    Then the foreground serve exits nonzero within a few seconds
+    And the backend SIGKILL is logged
+    And the foreground serve leaves no backend, supervisor, or daemon process
+
+  @id:serve-foreground-user-stop @requires-no-gpu @requires-os:linux
+  Scenario: serve-28 - A user signal cleanly stops foreground serving
+    When the user sends SIGTERM to a foreground serve
+    Then the foreground serve exits zero within a few seconds
+    And the foreground serve leaves no backend, supervisor, or daemon process

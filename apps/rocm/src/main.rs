@@ -480,8 +480,9 @@ rocm model --verbose"
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
-    /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
-    /// `rocm services`.
+    /// server running, or Ctrl-C to stop it. SIGINT and SIGTERM also stop it cleanly.
+    /// An unexpected server exit is reported as an error. Inspect or stop servers later
+    /// with `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
@@ -512,7 +513,8 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
         port: u16,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
-        /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
+        /// detach and leave it running, Ctrl-C/SIGINT/SIGTERM to stop). An
+        /// unexpected server exit makes the command fail. Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
         foreground: bool,
         /// Keep the server managed by ROCm CLI.

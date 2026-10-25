@@ -846,7 +846,11 @@ can:
 
 - Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
   the server keeps running. Manage it afterward with `rocm services`.
-- Press **Ctrl-C** to stop the server instead.
+- Press **Ctrl-C**, or send `SIGINT`/`SIGTERM` to `rocm serve`, to stop the server
+  and exit successfully.
+
+If the server exits unexpectedly, `rocm serve` prints its exit status or signal,
+cleans up its child processes, and exits nonzero.
 
 `--managed` is the explicit form of the default background behavior.
 `--no-smoke-test` skips the post-startup inference probe.
