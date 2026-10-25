@@ -103,6 +103,8 @@ pub(crate) enum Command {
         message: Option<String>,
     },
     McpServer,
+    // Keep these direct MCP helpers hidden: they are an internal, unversioned
+    // integration surface, not supported user commands.
     #[command(hide = true)]
     McpToolsJson,
     #[command(hide = true)]
