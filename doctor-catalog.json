@@ -241,11 +241,32 @@
       "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
     },
     {
+      "id": "fix-16-vllm-oom",
+      "title": "vLLM ran the GPU out of memory at startup",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
       "id": "fix-17-torch-dlpack",
       "title": "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
       "platforms": [
         {
           "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
           "class": "print-only"
         }
       ],
@@ -377,6 +398,38 @@
       "needs_sudo": true,
       "needs_reboot": false,
       "needs_relogin": false
+    },
+    {
+      "id": "fix-21-msvc-redist-outdated",
+      "title": "Update the MSVC 2015-2022 runtime redistributable",
+      "platforms": [
+        {
+          "os": "windows",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    },
+    {
+      "id": "info-20-gpu-no-rocm-support",
+      "title": "GPU has no ROCm/HIP support (Vulkan backend still works)",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "diagnose-only"
+        },
+        {
+          "os": "windows",
+          "class": "diagnose-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
     }
   ],
   "exit_codes": {

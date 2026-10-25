@@ -825,7 +825,7 @@ fn concise_output(primary: &str, fallback: &str) -> String {
     };
     let mut concise = value.chars().take(500).collect::<String>();
     if value.chars().count() > 500 {
-        concise.push('…');
+        concise.push_str("...");
     }
     concise
 }
@@ -868,6 +868,9 @@ impl Drop for TempRoot {
     }
 }
 
+// Windows has no mode bits: clearing the read-only attribute is the intended
+// way to make a cleaned-up tree deletable there.
+#[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
 fn make_tree_writable(path: &Path) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;

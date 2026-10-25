@@ -6,11 +6,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_PORT, normalize_runtime_path_for_host, runtime_is_linux};
 use rocm_engine_protocol::{
-    DetectRequest, DetectResponse, DevicePolicy, EndpointRequest, EndpointResponse,
-    EngineCapabilities, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,
-    HealthcheckRequest, HealthcheckResponse, InstallRequest, InstallResponse, LaunchRequest,
-    LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest, ResolveModelResponse,
-    StopRequest, StopResponse,
+    DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy, EndpointRequest,
+    EndpointResponse, EngineCapabilities, EngineMethod, EngineRequestEnvelope,
+    EngineResponseEnvelope, HealthcheckRequest, HealthcheckResponse, InstallRequest,
+    InstallResponse, LaunchRequest, LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest,
+    ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +24,8 @@ mod install;
 mod process;
 mod runtime_dir;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 // Re-exported so this stays reachable at its pre-split crate-root path —
 // `backend_alignment` is a private module, but this constant was `pub` at
@@ -40,7 +42,7 @@ pub(crate) const LLAMACPP_RECIPE: &str = "llamacpp";
 pub(crate) const ROCM_BACKEND_NAME: &str = "rocm";
 #[cfg(feature = "e2e-test-hooks")]
 const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
-const DEFAULT_LOG_TAIL_LINES: usize = 200;
+
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -769,7 +771,7 @@ fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
         recent_lines: if files.log_path.is_file() {
-            crate::state::tail_lines(&files.log_path, limit)?
+            rocm_core::tail_lines(&files.log_path, limit, crate::state::MAX_TAIL_READ)?
         } else {
             Vec::new()
         },

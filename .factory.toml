@@ -22,3 +22,11 @@ exclusive = true
 
 [leak_scan]
 exclude = [".agents", "skills", "skills-lock.json", "scripts/agent_gate.py"]
+
+[dispatch]
+# REVISE -> worker -> re-review cycles before a ticket escalates (matches mikeroySoft/factory).
+review_rounds = 3
+
+[manager]
+# Manager resolution rounds on an escalation before it reaches a human (matches mikeroySoft/factory).
+rounds = 3
