@@ -660,7 +660,7 @@ rocm logs --search error timeout")]
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
     ///
     /// Click the header warning count for captured details. The modal grows to fit;
-    /// "truncated — resize" means more space is needed. Escape or Enter closes it.
+    /// "truncated -- resize" means more space is needed. Escape or Enter closes it.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
