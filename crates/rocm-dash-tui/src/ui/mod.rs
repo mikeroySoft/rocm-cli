@@ -122,7 +122,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     state.last_footer_chips = footer_chips;
 
     // Modal overlay (rendered last so it sits on top of the body).
-    match state.modal {
+    match &state.modal {
         Modal::None => {}
         Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
         // Observe folds the telemetry tabs; its detail modal is the instance
@@ -140,6 +140,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
         Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::Warnings(warnings) => modal::draw_warnings(f, body, warnings, &theme),
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -575,7 +576,7 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
     Some((left, center_outer, right))
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn draw_header(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     // In demo/replay the data is not live, so never present the session as
     // "connected" to a real daemon — the Connected case shows a simulated label
     // instead, and the SIMULATED DATA chip below makes the state unmistakable.
@@ -620,10 +621,15 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(status_text, Style::default().fg(status_color)));
     let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
+    let mut warning_geometry = None;
     if warning_count > 0 {
         spans.push(Span::raw("   "));
+        let label = format!(" ⚠ {warning_count} ");
+        let x = spans.iter().map(Span::width).sum::<usize>();
+        let width = Span::raw(label.clone()).width();
+        warning_geometry = Some((x, width));
         spans.push(Span::styled(
-            format!(" ⚠ {warning_count} "),
+            label,
             Style::default()
                 .bg(theme.warn)
                 .fg(theme.surface_2)
@@ -669,6 +675,17 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ));
     let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
     f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
+    state.last_warning_badge_area = warning_geometry
+        .map(|(x, width)| {
+            Rect::new(
+                inner.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
+                inner.y,
+                u16::try_from(width).unwrap_or(u16::MAX),
+                1,
+            )
+            .intersection(inner)
+        })
+        .filter(|area| !area.is_empty());
 }
 
 /// One footer-legend segment: a key chip (optionally clickable) or plain text.
@@ -982,6 +999,54 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+
+    #[test]
+    fn warning_badge_hit_area_is_clipped_to_visible_header() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::metrics::Snapshot;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.latest = Some(Snapshot {
+            warnings: vec!["warning".into()],
+            ..Snapshot::default()
+        });
+
+        let backend = TestBackend::new(200, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_header(f, f.area(), &mut state, &theme))
+            .unwrap();
+        let full = state.last_warning_badge_area.unwrap();
+
+        let backend = TestBackend::new(full.right(), 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_header(f, f.area(), &mut state, &theme))
+            .unwrap();
+        let warning_cell = |x| {
+            term.backend()
+                .buffer()
+                .cell((x, full.y))
+                .unwrap()
+                .style()
+                .bg
+                == Some(theme.warn)
+        };
+        let first = (0..full.right()).find(|&x| warning_cell(x)).unwrap();
+        let width = (first..full.right())
+            .take_while(|&x| warning_cell(x))
+            .count() as u16;
+        assert_eq!(
+            state.last_warning_badge_area,
+            Some(Rect::new(first, full.y, width, 1))
+        );
+
+        let backend = TestBackend::new(full.x + 1, 3);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_header(f, f.area(), &mut state, &theme))
+            .unwrap();
+        assert_eq!(state.last_warning_badge_area, None);
     }
 
     #[test]

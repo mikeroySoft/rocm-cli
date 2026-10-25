@@ -462,6 +462,8 @@ pub enum Modal {
     Options,
     /// Global 2-column keyboard reference (distinct from the contextual `?`).
     GlobalHelp,
+    /// Warning messages captured when the header badge was clicked.
+    Warnings(Vec<String>),
 }
 
 /// Reduction of a completed `rocm update --json` check, for the Home tab's
