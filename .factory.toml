@@ -8,17 +8,20 @@ upstream = "upstream"
 name = "clippy"
 run = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 exclusive = true
+timeout_secs = 1200
 
 [[gate.check]]
 name = "tests"
 run = ["cargo", "test", "--workspace", "--all-targets"]
 exclusive = true
+timeout_secs = 1800
 
 [[gate.check]]
 name = "smoke"
 # Upstream sync gates a detached candidate destined for main; supply its intended ref.
-run = ["env", "ROCM_CLI_RELEASE_REF=main", "python3", "scripts/smoke_local.py"]
+run = ["env", "ROCM_CLI_RELEASE_REF=main", "python3", "scripts/smoke_local.py", "--skip-build"]
 exclusive = true
+timeout_secs = 1200
 
 [leak_scan]
 exclude = [".agents", "skills", "skills-lock.json", "scripts/agent_gate.py"]

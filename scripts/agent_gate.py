@@ -77,7 +77,16 @@ def check_tests() -> tuple[bool, str]:
 
 
 def check_smoke() -> tuple[bool, str]:
-    return run([sys.executable, "scripts/smoke_local.py"])
+    cmd = [sys.executable, "scripts/smoke_local.py"]
+    root = Path(__file__).resolve().parents[1]
+    debug_dir = root / "target" / "debug"
+    bin_names = ["rocm", "rocmd", "rocm-engine-lemonade", "rocm-engine-vllm"]
+    if all(
+        (debug_dir / (f"{name}.exe" if sys.platform == "win32" else name)).is_file()
+        for name in bin_names
+    ):
+        cmd.append("--skip-build")
+    return run(cmd)
 
 
 def check_leaks(base: str) -> tuple[bool, str]:

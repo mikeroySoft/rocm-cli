@@ -42,29 +42,41 @@ def resolve_cargo() -> str:
     fail("missing required command: cargo")
 
 
+DEFAULT_TIMEOUT = 120
+
+
 def run(
     label: str,
     argv: list[str],
     *,
     env: dict[str, str],
     expect_failure: bool = False,
+    timeout: int | None = None,
 ) -> str:
     print(f"smoke: {label}")
-    completed = subprocess.run(
-        argv,
-        cwd=repo_root(),
-        # No smoke command takes input, and `rocm chat` without `--prompt` now
-        # reads a piped stdin to EOF: inheriting this script's stdin would make
-        # it hang whenever the harness running the smoke keeps a pipe open.
-        # Hand every child /dev/null so the gate does not depend on how it was
-        # launched (same reason as `vllm_therock_gpu_test.py`).
-        stdin=subprocess.DEVNULL,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+    effective_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo_root(),
+            # No smoke command takes input, and `rocm chat` without `--prompt` now
+            # reads a piped stdin to EOF: inheriting this script's stdin would make
+            # it hang whenever the harness running the smoke keeps a pipe open.
+            # Hand every child /dev/null so the gate does not depend on how it was
+            # launched (same reason as `vllm_therock_gpu_test.py`).
+            stdin=subprocess.DEVNULL,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        fail(f"{label} timed out after {effective_timeout}s:\n{out}")
     output = completed.stdout.strip()
     if output:
         print(output)
@@ -127,6 +139,10 @@ def isolated_env(smoke_root: Path) -> dict[str, str]:
     env["ROCM_CLI_CONFIG_DIR"] = str(smoke_root / "rocm-config")
     env["ROCM_CLI_DATA_DIR"] = str(smoke_root / "rocm-data")
     env["ROCM_CLI_CACHE_DIR"] = str(smoke_root / "rocm-cache")
+    if "CARGO_HOME" not in env:
+        env["CARGO_HOME"] = str(Path.home() / ".cargo")
+    if "RUSTUP_HOME" not in env:
+        env["RUSTUP_HOME"] = str(Path.home() / ".rustup")
     if platform.system() == "Windows":
         env["APPDATA"] = str(smoke_root / "appdata")
         env["LOCALAPPDATA"] = str(smoke_root / "localappdata")
@@ -141,6 +157,8 @@ def isolated_env(smoke_root: Path) -> dict[str, str]:
 def binary_paths(
     root: Path, profile: str, target_dir: Path | None = None
 ) -> dict[str, Path]:
+    if target_dir is None and "CARGO_TARGET_DIR" in os.environ:
+        target_dir = Path(os.environ["CARGO_TARGET_DIR"])
     binary_dir = (target_dir if target_dir is not None else root / "target") / profile
     return {
         "rocm": binary_dir / exe_name("rocm"),
@@ -151,29 +169,59 @@ def binary_paths(
 
 
 def main() -> int:
+    global DEFAULT_TIMEOUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--target-dir", type=Path)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help="per-command timeout in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--build-timeout",
+        type=int,
+        default=600,
+        help="cargo build timeout in seconds (default: 600)",
+    )
     args = parser.parse_args()
+    DEFAULT_TIMEOUT = args.timeout
 
     root = repo_root()
     profile = "release" if args.profile == "release" else "debug"
-    smoke_root = root / "target" / "smoke-local"
-    env = isolated_env(smoke_root)
-
-    if not args.skip_build:
-        cargo = resolve_cargo()
-        run(
-            "build workspace all targets",
-            [cargo, "build", "--workspace", "--all-targets"],
-            env=env,
-        )
 
     target_dir = args.target_dir
+    if target_dir is None and "CARGO_TARGET_DIR" in os.environ:
+        target_dir = Path(os.environ["CARGO_TARGET_DIR"])
     if target_dir is not None and not target_dir.is_absolute():
         target_dir = root / target_dir
+
     paths = binary_paths(root, profile, target_dir)
+
+    target_base = target_dir if target_dir is not None else root / "target"
+    smoke_root = target_base / "smoke-local"
+    env = isolated_env(smoke_root)
+
+    should_build = not args.skip_build
+    if args.skip_build and not all(p.is_file() for p in paths.values()):
+        should_build = True
+
+    if should_build:
+        cargo = resolve_cargo()
+        build_cmd = [cargo, "build", "--workspace", "--bins"]
+        if profile == "release":
+            build_cmd.append("--release")
+        if target_dir is not None:
+            build_cmd.extend(["--target-dir", str(target_dir)])
+        run(
+            f"build workspace bins ({profile})",
+            build_cmd,
+            env=env,
+            timeout=args.build_timeout,
+        )
+
     for name, path in paths.items():
         if not path.is_file():
             fail(f"missing smoke binary {name}: {path}")
