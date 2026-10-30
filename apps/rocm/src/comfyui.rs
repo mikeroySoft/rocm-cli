@@ -2302,7 +2302,7 @@ mod tests {
     use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     fn unused_local_port() -> Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -3405,17 +3405,30 @@ mod tests {
         Ok(())
     }
 
-    fn test_paths(name: &str) -> AppPaths {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rocm-cli-{name}-{nonce}"));
-        AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
+    struct TestPaths {
+        paths: AppPaths,
+        _root: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestPaths {
+        type Target = AppPaths;
+
+        fn deref(&self) -> &Self::Target {
+            &self.paths
         }
+    }
+
+    fn test_paths(name: &str) -> TestPaths {
+        let root = tempfile::Builder::new()
+            .prefix(&format!("rocm-cli-{name}-"))
+            .tempdir()
+            .expect("create test fixture root");
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        TestPaths { paths, _root: root }
     }
 
     #[test]
@@ -3582,7 +3595,7 @@ mod tests {
         Ok(())
     }
 
-    fn reinstall_fixture(name: &str) -> Result<(AppPaths, RocmCliConfig, PathBuf)> {
+    fn reinstall_fixture(name: &str) -> Result<(TestPaths, RocmCliConfig, PathBuf)> {
         let paths = test_paths(name);
         let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
         write_runtime_manifest(&paths, &runtime)?;
@@ -3600,12 +3613,6 @@ mod tests {
             runtime_id: None,
             reinstall: true,
             dry_run,
-        }
-    }
-
-    fn remove_test_root(paths: &AppPaths) {
-        if let Some(root) = paths.data_dir.parent() {
-            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -3650,7 +3657,6 @@ mod tests {
             "an archive that cannot be unpacked must not be reused by the next attempt"
         );
         assert_staging_folder_empty(&app_root)?;
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3687,7 +3693,6 @@ mod tests {
             "an archive that is not a ComfyUI release must not be reused"
         );
         assert_staging_folder_empty(&app_root)?;
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3770,7 +3775,6 @@ mod tests {
         // The release was unpacked into a staging folder; nothing of it is
         // left there once it is installed.
         assert_staging_folder_empty(&app_root)?;
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3805,7 +3809,6 @@ mod tests {
         assert!(!rendered.contains("interrupted"), "{rendered}");
         assert_user_files_intact(&source);
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3835,7 +3838,6 @@ mod tests {
         assert!(!command.contains("--reinstall"), "{command}");
         assert!(!rendered.contains("  reinstall:"), "{rendered}");
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3859,7 +3861,6 @@ mod tests {
         assert!(!rendered.contains("  reinstall:"), "{rendered}");
         assert!(!rendered.contains("  keeps:"), "{rendered}");
         assert!(!source.exists(), "a dry run creates nothing");
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3889,7 +3890,6 @@ mod tests {
         assert!(!source_swap::swap_interrupted(&source));
         assert_user_files_intact(&source);
         assert_staging_folder_empty(&app_root)?;
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -3944,7 +3944,6 @@ mod tests {
             "{error:#}"
         );
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4016,7 +4015,6 @@ mod tests {
         ensure_source_is_startable(&manifest)?;
         assert!(!render_status(&paths, &config)?.contains("interrupted"));
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4047,7 +4045,6 @@ mod tests {
             format!("{error:#}").contains("failed to extract"),
             "a stale state must not block the reinstall: {error:#}"
         );
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4076,7 +4073,6 @@ mod tests {
             format!("{error:#}").contains("failed to extract"),
             "a ComfyUI running from another folder must not block the reinstall: {error:#}"
         );
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4218,7 +4214,6 @@ mod tests {
             "after `stop` the reinstall must no longer be refused: {error:#}"
         );
         drop(listener);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4242,7 +4237,6 @@ mod tests {
             // `a_reinstall_that_fails_after_the_swap_started_names_the_install_that_finishes_it`.
             eprintln!("skipped: running as root, so a read-only folder cannot make a removal fail");
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
-            remove_test_root(&paths);
             return Ok(());
         }
 
@@ -4285,7 +4279,6 @@ mod tests {
         let manifest = load_manifest(&paths)?.context("manifest")?;
         ensure_source_is_startable(&manifest)?;
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4363,7 +4356,6 @@ mod tests {
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
         ensure_source_is_startable(&load_manifest(&paths)?.context("manifest")?)?;
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4418,7 +4410,6 @@ mod tests {
         assert!(!source_swap::swap_interrupted(&source));
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4477,7 +4468,6 @@ mod tests {
         ensure_source_is_startable(&manifest)?;
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4526,7 +4516,6 @@ mod tests {
             "{message}"
         );
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4601,7 +4590,6 @@ mod tests {
             "old main",
             "a plain install reuses the existing code"
         );
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4637,14 +4625,13 @@ mod tests {
             format!("{error:#}").contains("failed to extract"),
             "an unreadable state must not block the reinstall: {error:#}"
         );
-        remove_test_root(&paths);
         Ok(())
     }
 
     /// An installed ComfyUI with a saved state for the given process and
     /// port, as `start` leaves it.
     #[cfg(unix)]
-    fn installed_with_state(name: &str, pid: u32, port: u16) -> Result<(AppPaths, String)> {
+    fn installed_with_state(name: &str, pid: u32, port: u16) -> Result<(TestPaths, String)> {
         let (paths, config, app_root) = reinstall_fixture(name)?;
         let source = source_path_from_app_root(&app_root);
         plant_installable_release(&paths, &app_root)?;
@@ -4687,7 +4674,6 @@ mod tests {
         // What the answer claims: the URL answers.
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
         drop(listener);
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4707,7 +4693,7 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        let (answer, status, paths) = result?;
+        let (answer, status, _paths) = result?;
         assert!(answer.contains("Running: starting\n"), "{answer}");
         // `status` says `note: starting` under `Running`; the tool summary
         // sums that up as its running state, not as a note.
@@ -4718,7 +4704,6 @@ mod tests {
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(!answer.contains("URL:"), "{answer}");
         assert!(!answer.contains("comfyui start"), "{answer}");
-        remove_test_root(&paths);
         Ok(())
     }
 
@@ -4761,7 +4746,6 @@ mod tests {
         );
         assert!(!with_record.contains("  replaces:"), "{with_record}");
         assert_user_files_intact(&source);
-        remove_test_root(&paths);
         Ok(())
     }
 }
