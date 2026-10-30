@@ -2302,6 +2302,7 @@ mod tests {
     use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::time::SystemTime;
 
     fn unused_local_port() -> Result<u16> {
