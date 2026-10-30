@@ -3419,6 +3419,23 @@ mod tests {
     }
 
     #[test]
+    fn test_paths_root_is_removed_when_guard_drops() -> Result<()> {
+        let paths = test_paths("comfyui-hygiene");
+        let root = paths
+            .data_dir
+            .parent()
+            .context("test data directory has no parent")?
+            .to_path_buf();
+        fs::create_dir_all(&paths.data_dir)?;
+        fs::write(paths.data_dir.join("fixture"), "test")?;
+
+        drop(paths);
+
+        assert!(!root.exists(), "test fixture root was not removed");
+        Ok(())
+    }
+
+    #[test]
     fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
         // A multi-chunk body (the streaming downloader reads in 64 KiB
         // chunks) so a single callback firing wouldn't already satisfy the
